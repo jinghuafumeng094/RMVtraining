@@ -9,7 +9,11 @@ option(ENABLE_WEB_DEBUG "Build the scalar Web Debug dashboard" ON)
 option(BUILD_TESTING "Build the starter-project tests" ON)
 
 find_package(Eigen3 REQUIRED)
-find_package(OpenCV 4 REQUIRED COMPONENTS core)
+# core    : cv::Mat 等基础类型
+# imgproc : cv::cvtColor 等图像处理
+# videoio : cv::VideoCapture / VideoWriter 取流
+# calib3d : cv::solvePnP 位姿解算（第四课用）
+find_package(OpenCV 4 REQUIRED COMPONENTS core imgproc videoio calib3d)
 find_package(Threads REQUIRED)
 
 add_subdirectory(serialPort)
