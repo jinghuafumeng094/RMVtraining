@@ -13,7 +13,12 @@ find_package(Eigen3 REQUIRED)
 # imgproc : cv::cvtColor 等图像处理
 # videoio : cv::VideoCapture / VideoWriter 取流
 # calib3d : cv::solvePnP 位姿解算（第四课用）
-find_package(OpenCV 4 REQUIRED COMPONENTS core imgproc videoio calib3d)
+find_package(OpenCV 4 REQUIRED COMPONENTS 
+	core imgproc videoio calib3d
+	objdetect
+	ml
+	imgcodecs
+)
 find_package(Threads REQUIRED)
 
 add_subdirectory(serialPort)
@@ -32,6 +37,7 @@ add_library(training_core STATIC
     src/AppSupport.cpp
     src/AutoAimTypes.cpp
     student/src/StudentTasks.cpp
+    student/src/ArmorDetector.cpp
 )
 target_include_directories(training_core
     PUBLIC
@@ -59,5 +65,8 @@ if(BUILD_TESTING)
     add_executable(test_scaffold tests/test_scaffold.cpp)
     target_link_libraries(test_scaffold PRIVATE training_core)
     add_test(NAME scaffold_safety COMMAND test_scaffold)
+    add_executable(test_armor_detect tests/test_armor_detect.cpp)
+    target_link_libraries(test_armor_detect PRIVATE training_core)
+    add_test(NAME armor_detect_geometry COMMAND test_armor_detect)
     add_test(NAME cli_help COMMAND rmv_training --help)
 endif()
