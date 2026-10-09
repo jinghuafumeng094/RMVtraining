@@ -102,14 +102,25 @@ int main() {
         assert(armor::buildColorMask(empty, TeamColor::Blue).empty());
     }
 
-    // BGRA 也要收：有些采集后端给的是四通道，不该让调用方先去转一道。
+    // 归一化只做一处：buildColorMask 只收三通道 BGR，
+    // 四通道由 detectArmors 在入口转掉。
+    //
+    // 这两条合起来钉的是一个**约定**：BGRA 的处理必须留在入口那一层。
+    // 谁要是把 BGRA 分支加回 buildColorMask（或者删掉入口那一段），立刻红。
+    // 分开写是因为它们各自会以不同的方式坏掉：
+    // 上面那条坏在"函数被喂了它不该管的东西"，下面那条坏在"入口没兜住"。
     {
         cv::Mat bgra;
         cv::cvtColor(image, bgra, cv::COLOR_BGR2BGRA);
-        const cv::Mat mask = armor::buildColorMask(bgra, TeamColor::Blue);
-        assert(!mask.empty());
-        assert(mask.at<unsigned char>(100, 100) == 255);
-        assert(mask.at<unsigned char>(100, 220) == 0);
+        assert(armor::buildColorMask(bgra, TeamColor::Blue).empty());
+
+        // 但走完整入口时，BGRA 必须照样能检测出板子
+        cv::Mat plate_bgra;
+        cv::cvtColor(makeBluePlate(), plate_bgra, cv::COLOR_BGR2BGRA);
+        const std::vector<ArmorDetection> found =
+            armor::detectArmors(plate_bgra, TeamColor::Blue);
+        assert(found.size() == 1);
+        assert(found[0].size == ArmorSize::Small);
     }
 
     // =======================================================================
@@ -187,6 +198,49 @@ int main() {
         cv::rectangle(square, cv::Rect(100, 100, 30, 30), cv::Scalar(255),
                       cv::FILLED);
         assert(armor::extractLightBars(square).empty());
+    }
+
+    // 长边门槛作用在**灯条自己的长度**上，与它斜成什么角度、在画面里占多高无关。
+    //
+    // 这个参数原来叫 min_height，名字让人以为它比的是"画面的竖直高度"，
+    // 已经误导过一次讨论。这里放一根**故意斜到 60°** 的灯条，让两种读法给出
+    // 不同答案：长边 30（合格），但它的竖直跨度只有 ≈ 22（不合格）。
+    // 谁把实现改成"按竖直高度过滤"，这一条立刻红。
+    {
+        const cv::Point2f head(100.0F, 40.0F);
+        const float span = 30.0F;              // 灯条长边
+        const float tilt = 1.0471975F;         // 60°（与竖直方向的夹角）
+        const cv::Point2f tail(head.x + span * std::sin(tilt),
+                               head.y + span * std::cos(tilt));
+        const float dx = tail.x - head.x;
+        const float dy = tail.y - head.y;
+        const cv::Point2f half_normal(-dy / span * 3.0F, dx / span * 3.0F);
+
+        const auto rounded = [](const cv::Point2f& p) {
+            return cv::Point(cvRound(p.x), cvRound(p.y));
+        };
+        const std::vector<cv::Point> quad{rounded(head + half_normal),
+                                          rounded(head - half_normal),
+                                          rounded(tail - half_normal),
+                                          rounded(tail + half_normal)};
+
+        cv::Mat slanted(240, 320, CV_8UC1, cv::Scalar(0));
+        cv::fillConvexPoly(slanted, quad, cv::Scalar(255));
+
+        // 先确认这根灯条确实是"长边够、竖直高度不够"的那种输入，
+        // 否则下面那条断言就没有区分力了。
+        int x0 = 320, x1 = 0, y0 = 240, y1 = 0;
+        for (const cv::Point& p : quad) {
+            x0 = std::min(x0, p.x); x1 = std::max(x1, p.x);
+            y0 = std::min(y0, p.y); y1 = std::max(y1, p.y);
+        }
+        assert(static_cast<float>(y1 - y0) < 25.0F);      // 竖直跨度不到门槛
+        assert(static_cast<float>(x1 - x0) >= 25.0F);     // 而它确实有 30 那么长
+
+        const std::vector<armor::LightBar> bars =
+            armor::extractLightBars(slanted);
+        assert(bars.size() == 1);
+        assert(near(bars[0].length(), span, 2.0F));
     }
 
     // 两根灯条要各自成一根，不能被合并
@@ -277,7 +331,7 @@ int main() {
     // 跨板配对 —— 一根灯条不许夹在另一对的中间
     // =======================================================================
     // 用海康整图 20261008231729930 上**实测**的四根灯条横向位置。
-    // 那一帧上 (514, 909) 这一对的间距比 5.05 能过全部五条配对判据，
+    // 那一帧上 (514, 909) 这一对的间距比 5.05 能过除判据 5 以外的全部配对判据，
     // 但它跨了两块板，中间夹着 x=721 的灯条；而它的外接矩形最大，
     // NMS 按面积取大正好把它留下 —— 裁剪框于是落在中间那根灯条上。
     // 这就是"数字全是 0"那批结果的来源。

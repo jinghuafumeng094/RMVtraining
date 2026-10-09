@@ -76,7 +76,7 @@ bool get_pic(cv::Mat& pic) {
     }
     g_fail_streak = 0;
 
-    // 统一转成三通道 BGR —— 后面的 armor_detect 只接受 CV_8UC3。
+    // 统一转成三通道 BGR —— 后面每一级都按 BGR 处理。
     // 将来接海康，像素格式转换（Bayer -> BGR）就落在这个位置。
     if (raw.channels() == 3) {
         pic = raw;

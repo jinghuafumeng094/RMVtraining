@@ -73,17 +73,10 @@ std::array<cv::Point2f, 4> buildCorners(const LightBar& left,
     corners[2] = r.bottom;  // 右下
     corners[3] = l.bottom;  // 左下
 
-    // 防御二：有向面积为负说明四点成了镜像，交换右上和左下翻回来。
-    //
-    // 诚实说明（实测过，不是推测）：在"按 center.x 定序"
-    // 加"约定 top.y <= bottom.y"这两条同时成立时，
-    // 上面生成的顺序必然给出正面积 ——
-    // 5000 万组任意倾角的随机灯条采样，负面积出现 0 次，最小值 6e-4。
-    // 所以这一分支目前不可达，是廉价保险：
-    // 若将来有人把定序依据从 center.x 改成 top.x，它会立刻开始干活。
-    //
-    // 它挡不住的是另一件事：四点趋近共线。那种情况面积趋近 0 而不是变负，
-    // 必须由调用方按"面积下限"丢弃，否则喂给 warpPerspective 会出 NaN。
+    // 防御二：四点成了镜像时（有向面积为负）交换右上/左下翻回来。
+    // 按上面的定序这条不会触发，是收便宜的保险 —— 但要是哪天定序依据
+    // 从 center.x 改成 top.x，没有它就会安静地给出镜像角点。
+    // 它挡不住"四点趋近共线"：那种情况面积趋近 0 而不是变负。
     if (quadSignedArea(corners) < 0.0F) {
         std::swap(corners[1], corners[3]);
     }
@@ -216,7 +209,7 @@ namespace {
 // 直接拒绝，比让 NaN 流到后面去炸要容易查得多。
 constexpr float kMinQuadAreaPx = 1.0F;
 
-// 转单通道灰度。只认 8 位的三种常见布局，别的一律拒绝。
+// 转单通道灰度。只认 8 位的两种常见布局，别的一律拒绝。
 // 猜一种错误的转换方式，比明确拒绝更难查。
 bool toGray(const cv::Mat& image, cv::Mat& gray) {
     switch (image.type()) {
@@ -225,9 +218,6 @@ bool toGray(const cv::Mat& image, cv::Mat& gray) {
             return true;
         case CV_8UC3:
             cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
-            return true;
-        case CV_8UC4:
-            cv::cvtColor(image, gray, cv::COLOR_BGRA2GRAY);
             return true;
         default:
             return false;
@@ -296,8 +286,7 @@ bool extractDigitPatch(const cv::Mat& image,
     // 理论上板子总比数字框宽。万一日后有人把参数调反了，
     // 夹回图内，宁可裁小也不要越界访问。
     const int safe_w = std::min(box_w, canonical_w);
-    const int box_x = std::max(0, std::min((canonical_w - box_w) / 2,
-                                           canonical_w - safe_w));
+    const int box_x = (canonical_w - safe_w) / 2;  // 居中
 
     const cv::Mat box = canonical(cv::Rect(box_x, 0, safe_w, box_h));
 
@@ -311,12 +300,10 @@ bool extractDigitPatch(const cv::Mat& image,
 
     // Otsu：阈值由这张小图自己的直方图算出来，不用手调，
     // 所以对现场的光照变化比固定阈值皮实。
-    // 数据集是"白数字 + 黑底"，所以是 THRESH_BINARY；
-    // invert 是留给"万一现场抠出来极性相反"的应急开关。
-    const int threshold_type =
-        (params.invert ? cv::THRESH_BINARY_INV : cv::THRESH_BINARY) |
-        cv::THRESH_OTSU;
-    cv::threshold(resized, patch, 0.0, 255.0, threshold_type);
+    // 数据集是"白数字 + 黑底"，所以用 THRESH_BINARY。
+    // 万一现场抠出来极性相反，把下面这个常量换成 THRESH_BINARY_INV。
+    cv::threshold(resized, patch, 0.0, 255.0,
+                  cv::THRESH_BINARY | cv::THRESH_OTSU);
     return true;
 }
 
@@ -326,23 +313,16 @@ bool extractDigitPatch(const cv::Mat& image,
 
 cv::Mat buildColorMask(const cv::Mat& bgr, TeamColor team,
                        const MaskParams& params) {
-    // 灰度图没有颜色可言。返回空矩阵，让调用方自己发现参数喂错了，
-    // 而不是内部猜一个通道顺序 —— 猜错不会有任何提示，整条管线安静地全错。
-    if (bgr.empty() || (bgr.type() != CV_8UC3 && bgr.type() != CV_8UC4)) {
+    // 只收三通道 BGR。灰度图没有颜色、BGRA 该由调用方先转掉
+    // （detectArmors 在入口统一做这件事）。
+    // 这里直接返回空矩阵，而不是内部猜一个通道顺序 ——
+    // 猜错不会有任何提示，整条管线会安静地全错。
+    if (bgr.empty() || bgr.type() != CV_8UC3) {
         return cv::Mat();
     }
 
-    // BGRA 化回 BGR 再用。split 出来的前三个通道本来也一样，
-    // 走一遍 cvtColor 只是为了让下面的类型判断只有一种情况要处理。
-    cv::Mat bgr_only;
-    if (bgr.type() == CV_8UC4) {
-        cv::cvtColor(bgr, bgr_only, cv::COLOR_BGRA2BGR);
-    } else {
-        bgr_only = bgr;
-    }
-
     cv::Mat channels[3];
-    cv::split(bgr_only, channels);  // 0 = B，1 = G，2 = R
+    cv::split(bgr, channels);  // 0 = B，1 = G，2 = R
 
     const bool is_blue = (team == TeamColor::Blue);
     const cv::Mat& main = is_blue ? channels[0] : channels[2];
@@ -407,7 +387,11 @@ std::vector<LightBar> extractLightBars(const cv::Mat& mask,
         const float short_side = edge0_is_short ? edge0 : edge1;
         const float long_side = edge0_is_short ? edge1 : edge0;
 
-        if (short_side <= 0.0F || long_side < params.min_height) {
+        // 长边门槛。它比的是**灯条自己的长度**（沿灯条方向），
+        // 不是画面里的竖直高度 —— 斜着的灯条竖直跨度可以远小于长度。
+        // 这个参数原来叫 min_height，那个名字已经误导过一次讨论，别再改回去。
+        // 它同时是"最远能看多远"的那个闸，理由写在 BarParams 的注释里。
+        if (short_side <= 0.0F || long_side < params.min_long_side) {
             continue;
         }
         const float aspect = long_side / short_side;
@@ -457,7 +441,7 @@ cv::Rect2f boundsOf(const std::array<cv::Point2f, 4>& corners) {
 }
 
 float intersectionOverUnion(const cv::Rect2f& a, const cv::Rect2f& b) {
-    const float intersection = (a & b).area();  // Rect2f 的 & 就是求交
+    const float intersection = (a & b).area();  
     const float total = a.area() + b.area() - intersection;
     return total > 0.0F ? intersection / total : 0.0F;
 }
@@ -521,7 +505,20 @@ std::vector<ArmorDetection> detectArmors(const cv::Mat& bgr, TeamColor team,
                                          const DetectParams& params) {
     std::vector<ArmorDetection> detections;
 
-    const cv::Mat mask = buildColorMask(bgr, team, params.mask);
+    // 通道格式在**入口归一化一次**，后面每一级都只面对三通道 BGR。
+    // 已经是三通道时不复制，只是让两个名字指向同一块数据。
+    // 归一化只做这一处：分散到各级去做的话，多一处就多一处漏掉的可能。
+    cv::Mat bgr_only;
+    if (bgr.type() == CV_8UC4) {
+        cv::cvtColor(bgr, bgr_only, cv::COLOR_BGRA2BGR);
+    } else if (bgr.type() == CV_8UC3) {
+        bgr_only = bgr;
+    }
+    if (bgr_only.empty()) {
+        return detections;  // 空图、灰度图、其它位深：明确拒绝
+    }
+
+    const cv::Mat mask = buildColorMask(bgr_only, team, params.mask);
     if (mask.empty()) {
         return detections;
     }
@@ -549,7 +546,7 @@ std::vector<ArmorDetection> detectArmors(const cv::Mat& bgr, TeamColor team,
         detection.size = classifySize(pair.first, pair.second);
 
         cv::Mat patch;
-        if (extractDigitPatch(bgr, corners, detection.size, patch,
+        if (extractDigitPatch(bgr_only, corners, detection.size, patch,
                               params.patch)) {
             const DigitResult digit = DigitClassifier::classify(patch);
             detection.target_id = digit.target_id;

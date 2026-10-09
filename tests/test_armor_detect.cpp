@@ -172,10 +172,11 @@ int main() {
     assert(armor::classifySize(scaled_left, scaled_right) == ArmorSize::Small);
 
     // =======================================================================
-    // 灯条配对 —— 五条判据各自都要有一个"只靠它才会被拒"的用例，
+    // 灯条配对 —— 判据 1~5 各自都要有一个"只靠它才会被拒"的用例，
+    // 判据 6（左右定序）要有一个"把顺序传反"的用例；
     // 否则那条判据删掉了测试也照样绿（变异测试实测过）
     // =======================================================================
-    // 一对正常的小装甲板：五条判据全过
+    // 一对正常的小装甲板：六条判据全过
     const std::vector<armor::LightBar> ok{small_left, small_right};
     const auto pairs = armor::pairLightBars(ok);
     assert(pairs.size() == 1);
@@ -188,7 +189,7 @@ int main() {
 
     // 判据 2：两根灯条等长、平行，但右灯条整体下移 60px。
     // |Δy| / 平均长度 = 60 / 60 = 1.0 > 0.6 → 拒绝。
-    // 其余四条判据在这组输入下全部通过，所以拒掉的原因只能是判据 2。
+    // 其余五条判据在这组输入下全部通过，所以拒掉的原因只能是判据 2。
     const std::vector<armor::LightBar> misaligned{small_left,
                                                   bar(232.0F, 160.0F, 220.0F)};
     assert(armor::pairLightBars(misaligned).empty());
@@ -204,7 +205,7 @@ int main() {
                                                bar(580.0F, 100.0F, 160.0F)};
     assert(armor::pairLightBars(too_far).empty());
 
-    // 判据 5：把顺序传反，返回的 pair 里 first 仍然必须在左。
+    // 判据 6：把顺序传反，返回的 pair 里 first 仍然必须在左。
     // 少了这个用例，"左右定序"那两行删掉测试也不会红。
     const std::vector<armor::LightBar> reversed{small_right, small_left};
     const auto reversed_pairs = armor::pairLightBars(reversed);
@@ -219,7 +220,7 @@ int main() {
     // 两根都退化、且中心重合 —— 最阴的一种输入：
     // 长度比 0/0 = NaN、间距比 0/0 = NaN，
     // 而 NaN 与任何数比较都是 false（既不 > 也不 <），
-    // 五条判据会全部放行，配出一块四个角点全假的"装甲板"。
+    // 六条判据会全部放行，配出一块四个角点全假的"装甲板"。
     // 只放一根退化灯条是测不到这个的 —— 那种情况会被间距比 inf 挡下。
     assert(armor::pairLightBars({degenerate, degenerate}).empty());
 
@@ -227,7 +228,7 @@ int main() {
     //
     // 这一条是从真实帧上抓回来的：海康整图 20261008231729930 上测到四根灯条
     // 在 x = 263 / 514 / 721 / 909，其中 (514, 909) 这一对间距比 5.05 落在
-    // 合法区间里，能过全部五条判据 —— 但它中间夹着 x=721 那根灯条，
+    // 合法区间里，能过除判据 5 以外的全部判据 —— 但它中间夹着 x=721 那根灯条，
     // 是个跨两块板的假配对。它的外接矩形最大，NMS 按面积取大正好留下它，
     // 于是裁剪框落在中间那根灯条上，抠出来的"数字补丁"其实是灯条。
     //
