@@ -52,8 +52,10 @@ constexpr float kGapRatioSplit = 3.0F;
 
 // 把两根灯条配成装甲板。返回的每一对都保证 first 在左、second 在右。
 // 注意：本函数只做"这两根灯条能不能构成一块板"的局部判断。
-// 三根等距灯条会产生 3 个合法配对（左中 / 中右 / 左右），
-// 去重留给后面的 NMS。
+//
+// 一对灯条之间夹着第三根灯条时会被拒绝 —— 那说明这一对跨了两块板。
+// 只靠间距比挡不住：实测帧上跨板那对的间距比是 5.05，落在合法区间内。
+// 三根等距灯条因此只产生 2 对（左中 / 中右）。剩下的重叠交给 NMS。
 std::vector<std::pair<LightBar, LightBar>> pairLightBars(
     const std::vector<LightBar>& bars, const PairCriteria& criteria = {});
 
@@ -117,5 +119,98 @@ struct PatchParams {
 bool extractDigitPatch(const cv::Mat& image,
                        const std::array<cv::Point2f, 4>& corners, ArmorSize size,
                        cv::Mat& patch, const PatchParams& params = {});
+
+// ---------------------------------------------------------------------------
+// 颜色掩膜 —— 管线第一级
+// ---------------------------------------------------------------------------
+
+// 阈值。两个数都是从海康那 69 张整图上量出来的，不是拍的：
+//   |B-R| < 20 的像素占 99.78%（背景、场地、地板全在这里）
+//   |B-R| ≥ 120 的只占 0.13%（灯条本体）
+//   >60 且主通道 >100 之后，一帧只剩 0~40 个斑块
+// 60 落在"背景极密、灯条极疏"中间的空档里，两边都有近 5 倍余量，
+// 所以在 60 附近挪动不会突然崩，这一点对现场调参很重要。
+//
+// 差值必须是**带符号**的：蓝队找 B>R，红队找 R>B。
+// 用 |B-R| 会把对面颜色的灯条一并收进来，红蓝两队看到一样多的目标 ——
+// 而且不报任何错。这是本函数最容易踩的坑。
+struct MaskParams {
+    int min_channel_diff{60};   // 主通道 - 副通道 的下限
+    int min_channel_value{100}; // 主通道自身的下限
+};
+
+// 生成二值掩膜：255 = 属于本队颜色的亮像素，0 = 其它。
+// 只接受 CV_8UC3 / CV_8UC4（BGR / BGRA）。灰度图**没有颜色**，
+// 这里直接返回空矩阵，而不是猜一个通道顺序 —— 猜错不会有任何提示。
+cv::Mat buildColorMask(const cv::Mat& bgr, TeamColor team,
+                       const MaskParams& params = {});
+
+// ---------------------------------------------------------------------------
+// 灯条提取 —— 管线第二级
+// ---------------------------------------------------------------------------
+
+// 筛选门槛。单位是**像素** —— 这一组和 PairCriteria 那组恰好相反，
+// 是尺度相关的。换分辨率（比如 1440x1080 → 640x480）必须按比例重调，
+// 而 PairCriteria 里那些比值一个都不用动。
+//
+// 门槛同样来自同一批 69 帧的实测：
+//   高/宽 的分布 p5=1.79 p25=2.64 p50=3.53 p90=6.25 max=16.0，
+//   只有一个斑块不满足 1.5 —— 所以 1.5 这个下限几乎不误杀真灯条；
+//   面积 p10=83 p50=364，30 是很松的地板，只负责滤掉噪点碎渣。
+struct BarParams {
+    float min_area{30.0F};    // 轮廓面积下限，单位平方像素
+    float min_height{25.0F};  // 长边下限，单位像素
+    float min_aspect{1.5F};   // 长边 / 短边 的下限
+    float max_aspect{20.0F};  // 同上，上限。防止一根细线冒充灯条
+};
+
+// 从掩膜里提灯条。输入是 buildColorMask 产出的单通道图
+// （按非零判断前景，所以 0/1 或 0/255 两种掩膜都收）。
+// 返回的每根灯条都满足 top.y <= bottom.y 的约定。
+std::vector<LightBar> extractLightBars(const cv::Mat& mask,
+                                       const BarParams& params = {});
+
+// ---------------------------------------------------------------------------
+// 检测串联 + 去重
+// ---------------------------------------------------------------------------
+
+// 整条检测管线的参数。分组是为了现场能只调坏掉的那一组，
+// 不用在一堆数字里找是哪个起了作用。
+struct DetectParams {
+    MaskParams mask{};
+    BarParams bar{};
+    PairCriteria pair{};
+    PatchParams patch{};
+    // 角点四边形面积下限，单位平方像素。低于它认为四点已经退化，
+    // 直接丢掉。extractDigitPatch 内部还有一道同样的检查，
+    // 这里提前拦是为了不在退化角点上白跑一次透视变换。
+    float min_quad_area_px{100.0F};
+    // NMS 的 IoU 上限：两块板的外接矩形重叠超过它就算同一块。
+    // 三根等距灯条会配出 3 对（左中 / 中右 / 左右），这三对互相重叠，
+    // 不合并的话同一块板会报三次，下游 EKF 会当成三个目标去跟踪。
+    float nms_iou{0.3F};
+};
+
+// 非极大值抑制：按外接矩形面积从大到小，贪心保留互不重叠的。
+//
+// 为什么按面积而不是按置信度排序：面积大说明离得近、像素多，
+// 数字本来就更好读；而置信度回答的是"有多确定是某个数字"，
+// 跟"这是不是一块真板"是两回事 —— 板子上什么都没有时，
+// 分类器会很有把握地说"这是 9neg"，置信度一样可以很高。
+std::vector<ArmorDetection> suppressOverlaps(
+    const std::vector<ArmorDetection>& detections, float iou_threshold);
+
+// 检测主入口：
+//   颜色掩膜 → 灯条提取 → 灯条配对 → 角点 → 大小分类 → NMS → 数字分类
+//
+// 关于「目标丢失处理」（评分表明确列的一项）：
+// 板子检测到了、但中间没有数字时，这块板**仍然返回**（角点有效，PnP 能用），
+// 只是 target_id = 0。下游 applyPrediction 用 target_id != 0 把开火闸住。
+// 反过来的做法（找不到数字就整块丢掉）会让"检测坏了"和"分类坏了"
+// 在 Web Debug 上长得一模一样 —— armor_count 都是 0，没法区分。
+//
+// team 传本队颜色：只看自己颜色的灯条，对面队伍的车不会变成目标。
+std::vector<ArmorDetection> detectArmors(const cv::Mat& bgr, TeamColor team,
+                                         const DetectParams& params = {});
 
 }  // namespace armor

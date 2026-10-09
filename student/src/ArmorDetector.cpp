@@ -1,5 +1,7 @@
 #include "ArmorDetector.hpp"
 
+#include "DigitClassifier.hpp"
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -159,7 +161,39 @@ std::vector<std::pair<LightBar, LightBar>> pairLightBars(
                 continue;
             }
 
-            // 判据 5：左右定序，保证返回的 pair 里 first 一定在左
+            // 判据 5：这一对之间不能夹着第三根灯条。
+            //
+            // 真实装甲板中间不会竖着第三根灯条；夹着的那一对是**跨了两块板**。
+            // 光靠间距比挡不住它：在实测的 20261008231729930 那帧上，
+            // 跨板那对 (514, 909) 的间距比是 5.05，正好落在合法区间 [1.2, 6.0] 里，
+            // 五条判据全过。而它的外接矩形最大，NMS 按面积取大正好留它下车 ——
+            // 结果裁剪框落到了中间那根灯条上，"数字补丁"其实是灯条本身。
+            //
+            // 纵向只在两根灯条**共同覆盖的高度带**内判，避免把背景里
+            // 远处、纵向错开的目标误当成"夹在中间"。
+            const float pair_top = std::min(a.top.y, b.top.y);
+            const float pair_bottom = std::max(a.bottom.y, b.bottom.y);
+            const float x_lo = std::min(a.center().x, b.center().x);
+            const float x_hi = std::max(a.center().x, b.center().x);
+            bool has_bar_inside = false;
+            for (std::size_t k = 0; k < count && !has_bar_inside; ++k) {
+                if (k == i || k == j) {
+                    continue;
+                }
+                const cv::Point2f c = bars[k].center();
+                if (c.x <= x_lo || c.x >= x_hi) {
+                    continue;  // 不在这一对的横向区间内
+                }
+                if (c.y <= pair_top || c.y >= pair_bottom) {
+                    continue;  // 纵向错开，不算夹在中间
+                }
+                has_bar_inside = true;
+            }
+            if (has_bar_inside) {
+                continue;
+            }
+
+            // 判据 6：左右定序，保证返回的 pair 里 first 一定在左
             if (a.center().x <= b.center().x) {
                 pairs.emplace_back(a, b);
             } else {
@@ -284,6 +318,251 @@ bool extractDigitPatch(const cv::Mat& image,
         cv::THRESH_OTSU;
     cv::threshold(resized, patch, 0.0, 255.0, threshold_type);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// 颜色掩膜
+// ---------------------------------------------------------------------------
+
+cv::Mat buildColorMask(const cv::Mat& bgr, TeamColor team,
+                       const MaskParams& params) {
+    // 灰度图没有颜色可言。返回空矩阵，让调用方自己发现参数喂错了，
+    // 而不是内部猜一个通道顺序 —— 猜错不会有任何提示，整条管线安静地全错。
+    if (bgr.empty() || (bgr.type() != CV_8UC3 && bgr.type() != CV_8UC4)) {
+        return cv::Mat();
+    }
+
+    // BGRA 化回 BGR 再用。split 出来的前三个通道本来也一样，
+    // 走一遍 cvtColor 只是为了让下面的类型判断只有一种情况要处理。
+    cv::Mat bgr_only;
+    if (bgr.type() == CV_8UC4) {
+        cv::cvtColor(bgr, bgr_only, cv::COLOR_BGRA2BGR);
+    } else {
+        bgr_only = bgr;
+    }
+
+    cv::Mat channels[3];
+    cv::split(bgr_only, channels);  // 0 = B，1 = G，2 = R
+
+    const bool is_blue = (team == TeamColor::Blue);
+    const cv::Mat& main = is_blue ? channels[0] : channels[2];
+    const cv::Mat& other = is_blue ? channels[2] : channels[0];
+
+    // 有符号的差。cv::subtract 对 CV_8U 是**饱和**减法：
+    // 负数截成 0，所以蓝队这里等价于 max(B - R, 0)，正是想要的"只留本队颜色"。
+    //
+    // 换成 cv::absdiff 就是 |B - R| —— 红队和蓝队看到一模一样的结果，
+    // 对面队伍的车全都变成目标。这是本函数唯一的坑，而且它不报错。
+    cv::Mat diff;
+    cv::subtract(main, other, diff);
+
+    cv::Mat strong;  // 通道差够大
+    cv::Mat bright;  // 主通道本身够亮
+    cv::threshold(diff, strong, params.min_channel_diff, 255.0, cv::THRESH_BINARY);
+    cv::threshold(main, bright, params.min_channel_value, 255.0, cv::THRESH_BINARY);
+
+    // 两条判据是"与"关系。只用差值的话，一个通道差 70 的暗灰蓝像素
+    // （比如 80/60/10）也会进来；只用亮度的话，白光（255/255/255）
+    // 差值只有 0 倒是不进，可偏色的高光就会漏进来。
+    cv::Mat mask;
+    cv::bitwise_and(strong, bright, mask);
+    return mask;
+}
+
+// ---------------------------------------------------------------------------
+// 灯条提取
+// ---------------------------------------------------------------------------
+
+std::vector<LightBar> extractLightBars(const cv::Mat& mask,
+                                       const BarParams& params) {
+    std::vector<LightBar> bars;
+    if (mask.empty() || mask.type() != CV_8UC1) {
+        return bars;
+    }
+
+    std::vector<std::vector<cv::Point>> contours;
+    // RETR_EXTERNAL：只要最外层轮廓。
+    // 灯条过曝时中间会烧成白、边缘反而偏暗，用 RETR_LIST / RETR_TREE
+    // 会把同一根灯条拆成里外两三个轮廓，每一圈都被当成独立灯条去配对，
+    // 于是同一块板配出一堆假目标 —— 而且看起来"检测很灵"。
+    cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+    bars.reserve(contours.size());
+    for (const std::vector<cv::Point>& contour : contours) {
+        if (cv::contourArea(contour) < params.min_area) {
+            continue;
+        }
+
+        const cv::RotatedRect rect = cv::minAreaRect(contour);
+
+        // 用四条边的长度分长短边，**刻意不看 rect.angle**。
+        // OpenCV 4.5 起 angle 的取值区间和符号语义都改过（3.x 是 [-90,0)，
+        // 4.5 是 [0,90)），靠它判断哪条边是长边会随版本变；
+        // 直接比边长没有任何歧义。
+        cv::Point2f pts[4];
+        rect.points(pts);
+        const float edge0 = static_cast<float>(cv::norm(pts[1] - pts[0]));
+        const float edge1 = static_cast<float>(cv::norm(pts[2] - pts[1]));
+        const bool edge0_is_short = edge0 <= edge1;
+        const float short_side = edge0_is_short ? edge0 : edge1;
+        const float long_side = edge0_is_short ? edge1 : edge0;
+
+        if (short_side <= 0.0F || long_side < params.min_height) {
+            continue;
+        }
+        const float aspect = long_side / short_side;
+        if (aspect < params.min_aspect || aspect > params.max_aspect) {
+            continue;
+        }
+
+        // 灯条的两端 = 两条**短边**的中点。
+        // 矩形四点是按顺序绕一圈的，所以短边要么是 (0,1) 和 (2,3)，
+        // 要么是 (1,2) 和 (3,0) —— 由上面比出来的结果选一组。
+        LightBar bar;
+        if (edge0_is_short) {
+            bar.top = (pts[0] + pts[1]) * 0.5F;
+            bar.bottom = (pts[2] + pts[3]) * 0.5F;
+        } else {
+            bar.top = (pts[1] + pts[2]) * 0.5F;
+            bar.bottom = (pts[3] + pts[0]) * 0.5F;
+        }
+        // 落到约定的 top.y <= bottom.y。minAreaRect 给的点序
+        // 跟朝向有关，不保证哪一头在上面，所以必须显式对齐一次 ——
+        // tiltDegrees() 的正负号全押在这个约定上。
+        if (bar.top.y > bar.bottom.y) {
+            std::swap(bar.top, bar.bottom);
+        }
+        bars.push_back(bar);
+    }
+    return bars;
+}
+
+// ---------------------------------------------------------------------------
+// 去重
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// 四边形角点的轴对齐外接矩形。
+//
+// 注意 cv::boundingRect 对**点集**用的是含两端的约定：
+// 宽 = x_max - x_min + 1，高 = y_max - y_min + 1。
+// 所以四点跨 200 像素时给出的宽是 201，不是一个笔误。
+// 后果是这里的 IoU 会比"按坐标区间手算"略大一点点
+// （实测 201x61 与 101x61 的重叠是 0.5025 而不是 0.5）。
+// 对 NMS 这种只要相对大小的判据没有影响，但对照手算数字时要记得这件事。
+cv::Rect2f boundsOf(const std::array<cv::Point2f, 4>& corners) {
+    return cv::boundingRect(std::vector<cv::Point2f>(corners.begin(),
+                                                     corners.end()));
+}
+
+float intersectionOverUnion(const cv::Rect2f& a, const cv::Rect2f& b) {
+    const float intersection = (a & b).area();  // Rect2f 的 & 就是求交
+    const float total = a.area() + b.area() - intersection;
+    return total > 0.0F ? intersection / total : 0.0F;
+}
+
+}  // namespace
+
+std::vector<ArmorDetection> suppressOverlaps(
+    const std::vector<ArmorDetection>& detections, float iou_threshold) {
+    std::vector<ArmorDetection> kept;
+    if (detections.empty()) {
+        return kept;
+    }
+
+    std::vector<cv::Rect2f> boxes;
+    boxes.reserve(detections.size());
+    for (const ArmorDetection& detection : detections) {
+        boxes.push_back(boundsOf(detection.corners));
+    }
+
+    // 按面积从大到小排。
+    //
+    // 为什么不是按置信度：置信度回答的是"有多确定这是某个数字"，
+    // 不是"这是不是一块真板"。板子上没有数字时分类器会很有把握地
+    // 报"9neg"，照样给出高置信度。面积大则同时说明离得近、像素多、
+    // 数字更好读，是更强的"这是个真目标"的证据。
+    std::vector<std::size_t> order(detections.size());
+    for (std::size_t i = 0; i < order.size(); ++i) {
+        order[i] = i;
+    }
+    std::sort(order.begin(), order.end(),
+              [&boxes](std::size_t a, std::size_t b) {
+                  return boxes[a].area() > boxes[b].area();
+              });
+
+    std::vector<bool> suppressed(detections.size(), false);
+    for (std::size_t i = 0; i < order.size(); ++i) {
+        const std::size_t candidate = order[i];
+        if (suppressed[candidate]) {
+            continue;
+        }
+        kept.push_back(detections[candidate]);
+        for (std::size_t j = i + 1; j < order.size(); ++j) {
+            const std::size_t other = order[j];
+            if (suppressed[other]) {
+                continue;
+            }
+            if (intersectionOverUnion(boxes[candidate], boxes[other]) >
+                iou_threshold) {
+                suppressed[other] = true;
+            }
+        }
+    }
+    return kept;
+}
+
+// ---------------------------------------------------------------------------
+// 检测串联
+// ---------------------------------------------------------------------------
+
+std::vector<ArmorDetection> detectArmors(const cv::Mat& bgr, TeamColor team,
+                                         const DetectParams& params) {
+    std::vector<ArmorDetection> detections;
+
+    const cv::Mat mask = buildColorMask(bgr, team, params.mask);
+    if (mask.empty()) {
+        return detections;
+    }
+
+    const std::vector<LightBar> bars = extractLightBars(mask, params.bar);
+    if (bars.size() < 2) {
+        return detections;  // 一根灯条配不出板
+    }
+
+    const std::vector<std::pair<LightBar, LightBar>> pairs =
+        pairLightBars(bars, params.pair);
+
+    detections.reserve(pairs.size());
+    for (const std::pair<LightBar, LightBar>& pair : pairs) {
+        const std::array<cv::Point2f, 4> corners =
+            buildCorners(pair.first, pair.second);
+        // 四点退化：面积趋近 0 时透视变换的解已经不可信，
+        // 硬算下去会把 inf/NaN 抹到整幅输出上。提前丢掉。
+        if (std::fabs(quadSignedArea(corners)) < params.min_quad_area_px) {
+            continue;
+        }
+
+        ArmorDetection detection;
+        detection.corners = corners;
+        detection.size = classifySize(pair.first, pair.second);
+
+        cv::Mat patch;
+        if (extractDigitPatch(bgr, corners, detection.size, patch,
+                              params.patch)) {
+            const DigitResult digit = DigitClassifier::classify(patch);
+            detection.target_id = digit.target_id;
+            detection.confidence = digit.confidence;
+        }
+        // 抠补丁失败（或分类器不可用）时**不 continue**。
+        // 角点是对的，PnP 还能用；target_id 保持默认的 0，
+        // 由下游把开火闸住。把这块板丢掉的话，"检测坏了"和"分类坏了"
+        // 在 Web Debug 上会变得一模一样（armor_count 都是 0）。
+        detections.push_back(detection);
+    }
+
+    return suppressOverlaps(detections, params.nms_iou);
 }
 
 }  // namespace armor
