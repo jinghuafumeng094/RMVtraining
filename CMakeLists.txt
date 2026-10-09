@@ -38,6 +38,7 @@ add_library(training_core STATIC
     src/AutoAimTypes.cpp
     student/src/StudentTasks.cpp
     student/src/ArmorDetector.cpp
+    student/src/DigitClassifier.cpp
 )
 target_include_directories(training_core
     PUBLIC
@@ -47,6 +48,10 @@ target_include_directories(training_core
         ${OpenCV_INCLUDE_DIRS}
 )
 target_link_libraries(training_core PUBLIC serialPort ${OpenCV_LIBS})
+# 数字分类模型的绝对路径。编进二进制而不是运行时拼相对路径 ——
+# 现场从来不及猜"当前工作目录是哪儿"。
+target_compile_definitions(training_core PRIVATE
+    ARMOR_SVM_PATH="${CMAKE_CURRENT_SOURCE_DIR}/models/armor_digit_svm.xml")
 
 add_executable(rmv_training main.cpp)
 target_include_directories(rmv_training PRIVATE web_debug/include)
@@ -60,6 +65,34 @@ if(ENABLE_WEB_DEBUG)
     target_link_libraries(rmv_training PRIVATE web_debug)
 endif()
 
+# ---------------------------------------------------------------------------
+# 离线工具：训练 / 抽留出集。
+#
+# 这两个**故意不链 training_core**：只借 DigitClassifier.cpp 一份源码
+# （训练和推理共用同一个 describe()，从物理上不可能分叉），
+# 链 OpenCV 就够了。链了 training_core 会把 serialPort、相机那套全拖进来，
+# 训练机上不一定有串口设备。
+# ---------------------------------------------------------------------------
+add_executable(train_digit_svm
+    tools/train_digit_svm.cpp
+    student/src/DigitClassifier.cpp
+)
+target_include_directories(train_digit_svm PRIVATE
+    student/include
+    ${OpenCV_INCLUDE_DIRS}
+)
+target_link_libraries(train_digit_svm PRIVATE ${OpenCV_LIBS})
+
+add_executable(make_digit_holdout
+    tools/make_digit_holdout.cpp
+    student/src/DigitClassifier.cpp
+)
+target_include_directories(make_digit_holdout PRIVATE
+    student/include
+    ${OpenCV_INCLUDE_DIRS}
+)
+target_link_libraries(make_digit_holdout PRIVATE ${OpenCV_LIBS})
+
 if(BUILD_TESTING)
     enable_testing()
     add_executable(test_scaffold tests/test_scaffold.cpp)
@@ -68,5 +101,12 @@ if(BUILD_TESTING)
     add_executable(test_armor_detect tests/test_armor_detect.cpp)
     target_link_libraries(test_armor_detect PRIVATE training_core)
     add_test(NAME armor_detect_geometry COMMAND test_armor_detect)
+    add_executable(test_digit_classifier tests/test_digit_classifier.cpp)
+    target_link_libraries(test_digit_classifier PRIVATE training_core)
+    # 留出集在源码树里，不在构建目录里。ctest 的工作目录是构建目录，
+    # 用相对路径会找不到，所以把绝对路径编进二进制。
+    target_compile_definitions(test_digit_classifier PRIVATE
+        ARMOR_HOLDOUT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/digit_holdout")
+    add_test(NAME digit_classifier COMMAND test_digit_classifier)
     add_test(NAME cli_help COMMAND rmv_training --help)
 endif()

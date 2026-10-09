@@ -1,9 +1,14 @@
 #include "ArmorDetector.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <vector>
+
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
 
 namespace {
 
@@ -20,6 +25,59 @@ armor::LightBar tilted(float top_x, float top_y, float dx, float dy) {
 
 bool near(float a, float b, float eps = 1e-3F) {
     return std::fabs(a - b) < eps;
+}
+
+// 造一块"物理比例正确"的假装甲板，正中间画一个正方形亮块，然后抠补丁。
+//   plate_width_mm : 135（小板）或 230（大板）；高度按 57mm 走
+//   marker_mm      : 中间那个方块的边长，单位 mm
+//   bg / fg        : 背景与亮块的灰度。默认 0/255（数据集就是这两个值）；
+//                    压低对比度用来验证 Otsu 真的在自适应光照。
+// 方块是正方形，所以抠出来也必须接近正方形 —— 这是纵横比的判据。
+cv::Mat makePlateAndExtract(float px_per_mm, float plate_width_mm, int marker_mm,
+                           int bg = 0, int fg = 255) {
+    const int plate_w = static_cast<int>(plate_width_mm * px_per_mm);
+    const int plate_h = static_cast<int>(57.0F * px_per_mm);
+    const cv::Point2f o{80.0F, 80.0F};
+    const std::array<cv::Point2f, 4> corners{o,
+                                             {o.x + plate_w, o.y},
+                                             {o.x + plate_w, o.y + plate_h},
+                                             {o.x, o.y + plate_h}};
+
+    const int marker = static_cast<int>(marker_mm * px_per_mm);
+    cv::Mat image(400, 900, CV_8UC1, cv::Scalar(bg));
+    cv::rectangle(image,
+                  cv::Rect(static_cast<int>(o.x) + (plate_w - marker) / 2,
+                           static_cast<int>(o.y) + (plate_h - marker) / 2, marker,
+                           marker),
+                  cv::Scalar(fg), cv::FILLED);
+
+    const ArmorSize size =
+        (plate_width_mm > 180.0F) ? ArmorSize::Large : ArmorSize::Small;
+    cv::Mat patch;
+    if (!armor::extractDigitPatch(image, corners, size, patch)) {
+        return cv::Mat();
+    }
+    return patch;
+}
+
+// 补丁里白像素的外接矩形：返回 {宽, 高, 白像素个数}
+std::array<int, 3> whiteBox(const cv::Mat& patch) {
+    int x0 = patch.cols, x1 = -1, y0 = patch.rows, y1 = -1, count = 0;
+    for (int r = 0; r < patch.rows; ++r) {
+        for (int c = 0; c < patch.cols; ++c) {
+            if (patch.at<unsigned char>(r, c) != 0) {
+                x0 = std::min(x0, c);
+                x1 = std::max(x1, c);
+                y0 = std::min(y0, r);
+                y1 = std::max(y1, r);
+                ++count;
+            }
+        }
+    }
+    if (count == 0) {
+        return {0, 0, 0};
+    }
+    return {x1 - x0 + 1, y1 - y0 + 1, count};
 }
 
 }  // namespace
@@ -170,6 +228,120 @@ int main() {
     const std::vector<armor::LightBar> three{
         small_left, bar(232.0F, 100.0F, 160.0F), bar(364.0F, 100.0F, 160.0F)};
     assert(armor::pairLightBars(three).size() == 3);
+
+    // =======================================================================
+    // 数字补丁裁剪 —— 本函数最危险的地方是纵横比
+    // =======================================================================
+    const cv::Mat small_patch = makePlateAndExtract(3.0F, 135.0F, 20);
+    assert(!small_patch.empty());
+
+    // 契约：28 行 x 20 列、单通道、取值只可能是 0 或 255。
+    // 数据集本身就是 {0,255}，喂灰度模糊图进去 HOG 分布会完全不同 ——
+    // 这种事不会报错，只会让准确率悄悄掉下去，所以必须在这里焊死。
+    assert(small_patch.type() == CV_8UC1);
+    assert(small_patch.cols == 20);
+    assert(small_patch.rows == 28);
+    for (int r = 0; r < small_patch.rows; ++r) {
+        for (int c = 0; c < small_patch.cols; ++c) {
+            const int v = small_patch.at<unsigned char>(r, c);
+            assert(v == 0 || v == 255);
+        }
+    }
+
+    // 20mm 的方块，落在 40.7mm x 57mm 的数字框里，映射到 20x28 上应该是
+    // (20/40.7)*20 ≈ 9.8 宽、(20/57)*28 ≈ 9.8 高 —— 接近正方形。
+    const std::array<int, 3> box = whiteBox(small_patch);
+    assert(box[2] > 0);
+    assert(box[0] >= 5 && box[0] <= 15);
+    assert(box[1] >= 5 && box[1] <= 15);
+    // ↓ 这一条是关键。把四个角点一步 getPerspectiveTransform 到 20x28 的
+    //   实现，会让宽度压成 ≈3、高度还是 ≈10，宽高差 7 > 3，立刻红。
+    assert(std::abs(box[0] - box[1]) <= 3);
+
+    // 大板同样要方 —— 这条同时钉住"size 参数真的被用上了"
+    const cv::Mat large_patch = makePlateAndExtract(2.0F, 230.0F, 20);
+    assert(!large_patch.empty());
+    const std::array<int, 3> large_box = whiteBox(large_patch);
+    assert(large_box[2] > 0);
+    assert(large_box[0] >= 5 && large_box[0] <= 15);
+    assert(std::abs(large_box[0] - large_box[1]) <= 3);
+
+    // 窗口必须在板子中央，而不是贴着左缘。
+    // 只在最左侧 10mm 涂白（30px），数字框从 47mm 才开始，应该完全看不到。
+    // 少了这一条，"从 x=0 开始裁"的实现只会让补丁整体偏一点，很难被发现。
+    {
+        const int plate_w = 405;
+        const int plate_h = 171;
+        const cv::Point2f o{100.0F, 100.0F};
+        const std::array<cv::Point2f, 4> corners{
+            o,
+            {o.x + plate_w, o.y},
+            {o.x + plate_w, o.y + plate_h},
+            {o.x, o.y + plate_h}};
+        cv::Mat image = cv::Mat::zeros(480, 640, CV_8UC1);
+        cv::rectangle(image, cv::Rect(100, 100, 30, plate_h), cv::Scalar(255),
+                      cv::FILLED);
+        cv::Mat patch;
+        assert(armor::extractDigitPatch(image, corners, ArmorSize::Small, patch));
+        assert(whiteBox(patch)[2] <= 5);
+    }
+
+    // 低对比度：背景 30、亮块 100，整体压暗压窄。
+    // 这不是刁难 —— 现场光照一变，ROI 里的灰度范围就可能被压成这样。
+    // Otsu 会自己从直方图里找刀口（≈65），固定阈值 128 会把整幅判成黑，
+    // 数字直接丢干净。少了这一条，"把 Otsu 换成固定阈值"这种改动
+    // 在两个 0/255 的极端之间看不出任何差别，测试抓不住。
+    {
+        const cv::Mat low = makePlateAndExtract(3.0F, 135.0F, 20, 30, 100);
+        assert(!low.empty());
+        assert(whiteBox(low)[2] > 0);  // 亮块必须还在
+        assert(low.type() == CV_8UC1);
+        assert(low.cols == 20);
+        assert(low.rows == 28);
+        for (int r = 0; r < low.rows; ++r) {
+            for (int c = 0; c < low.cols; ++c) {
+                const int v = low.at<unsigned char>(r, c);
+                assert(v == 0 || v == 255);  // 阈值化之后仍是二值
+            }
+        }
+    }
+
+    // 退化输入必须被拒，而不是吐出一张全黑的图冒充成功。
+    // 四点共线时 getPerspectiveTransform 会给出退化矩阵，
+    // warpPerspective 的结果是垃圾（可能含 NaN），必须提前拦掉。
+    {
+        cv::Mat patch;
+        cv::Mat image = cv::Mat::zeros(64, 64, CV_8UC1);
+        const std::array<cv::Point2f, 4> collinear{
+            {{0, 0}, {5, 0}, {10, 0}, {15, 0}}};
+        assert(!armor::extractDigitPatch(image, collinear, ArmorSize::Small,
+                                         patch));
+        assert(patch.empty());
+
+        // 空图也要拒
+        cv::Mat empty_image;
+        const std::array<cv::Point2f, 4> fine_corners{
+            {{0, 0}, {10, 0}, {10, 10}, {0, 10}}};
+        assert(!armor::extractDigitPatch(empty_image, fine_corners,
+                                         ArmorSize::Small, patch));
+        assert(patch.empty());
+
+        // 参数本身非法同样要拒，不能"尽力而为"。
+        // px_per_mm = 0 会把规范板缩成 1x1，再放大回 20x28 ——
+        // 得到一张糊成一片的"补丁"，看着像成功，实际全是垃圾。
+        armor::PatchParams zero_scale;
+        zero_scale.px_per_mm = 0.0F;
+        assert(!armor::extractDigitPatch(image, fine_corners, ArmorSize::Small,
+                                         patch, zero_scale));
+        assert(patch.empty());
+
+        // 输出尺寸为 0 会直接喂给 resize 一个空尺寸
+        armor::PatchParams zero_out;
+        zero_out.out_width = 0;
+        assert(!armor::extractDigitPatch(image, fine_corners, ArmorSize::Small,
+                                         patch, zero_out));
+        assert(patch.empty());
+    }
 
     return 0;
 }

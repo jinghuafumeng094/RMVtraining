@@ -4,6 +4,8 @@
 #include <cmath>
 #include <cstddef>
 
+#include <opencv2/imgproc.hpp>
+
 namespace armor {
 namespace {
 
@@ -166,6 +168,122 @@ std::vector<std::pair<LightBar, LightBar>> pairLightBars(
         }
     }
     return pairs;
+}
+
+// ---------------------------------------------------------------------------
+// 依赖图像：数字补丁裁剪
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// 四点退化到多小就不再可用，单位是平方像素。
+// 取 1.0 而不是 0.0：面积趋近 0 时 getPerspectiveTransform 的解已经不可信，
+// 算出来的矩阵可能含 inf/NaN，warpPerspective 会把 NaN 抹到整幅输出上。
+// 直接拒绝，比让 NaN 流到后面去炸要容易查得多。
+constexpr float kMinQuadAreaPx = 1.0F;
+
+// 转单通道灰度。只认 8 位的三种常见布局，别的一律拒绝。
+// 猜一种错误的转换方式，比明确拒绝更难查。
+bool toGray(const cv::Mat& image, cv::Mat& gray) {
+    switch (image.type()) {
+        case CV_8UC1:
+            gray = image;  // 不拷贝，只共享数据
+            return true;
+        case CV_8UC3:
+            cv::cvtColor(image, gray, cv::COLOR_BGR2GRAY);
+            return true;
+        case CV_8UC4:
+            cv::cvtColor(image, gray, cv::COLOR_BGRA2GRAY);
+            return true;
+        default:
+            return false;
+    }
+}
+
+}  // namespace
+
+bool extractDigitPatch(const cv::Mat& image,
+                       const std::array<cv::Point2f, 4>& corners, ArmorSize size,
+                       cv::Mat& patch, const PatchParams& params) {
+    // 先清空。无论成功还是失败，调用方拿到的都是干净状态 ——
+    // 和 get_pic 用同一个约定，免得调用方误用上一帧的补丁。
+    patch.release();
+
+    if (image.empty() || params.px_per_mm <= 0.0F || params.out_width <= 0 ||
+        params.out_height <= 0) {
+        return false;
+    }
+    if (std::fabs(quadSignedArea(corners)) < kMinQuadAreaPx) {
+        return false;
+    }
+
+    cv::Mat gray;
+    if (!toGray(image, gray)) {
+        return false;
+    }
+
+    // ---- 第一级：把角点四边形正射到"保物理比例的规范板" ----
+    // 目标尺寸 = 物理毫米数 x 像素密度。大小板只有宽度不同，高度都是 57mm。
+    // 注意这一步同时把透视畸变也一起去掉了：四边形被拉成矩形，
+    // 所以斜着看板子也能得到端正的数字。
+    const float plate_width_mm = (size == ArmorSize::Large)
+                                     ? params.large_width_mm
+                                     : params.small_width_mm;
+    const int canonical_w = std::max(
+        1, static_cast<int>(std::lround(plate_width_mm * params.px_per_mm)));
+    const int canonical_h = std::max(
+        1, static_cast<int>(
+               std::lround(params.plate_height_mm * params.px_per_mm)));
+
+    const std::vector<cv::Point2f> source(corners.begin(), corners.end());
+    const std::vector<cv::Point2f> destination{
+        {0.0F, 0.0F},
+        {static_cast<float>(canonical_w - 1), 0.0F},
+        {static_cast<float>(canonical_w - 1), static_cast<float>(canonical_h - 1)},
+        {0.0F, static_cast<float>(canonical_h - 1)}};
+
+    const cv::Mat warp = cv::getPerspectiveTransform(source, destination);
+    cv::Mat canonical;
+    cv::warpPerspective(gray, canonical, warp,
+                        cv::Size(canonical_w, canonical_h), cv::INTER_LINEAR);
+
+    // ---- 第二级：从规范板中央裁出数字框 ----
+    // 框高 = 整块板高。为什么不按字形的实际大小裁：数据集里量过，
+    // 墨迹高度只占补丁高的 0.68~0.95 倍，说明人家裁的时候就留了余量。
+    // 我们按字形裁会得到一个比训练数据更紧的裁剪，分布对不上。
+    //
+    // 框宽不是独立参数：它和框高、纵横比三者只有两个自由度。
+    // 纵横比定成 20:28（= 数据集补丁的比例），框宽就唯一确定了：
+    //   57mm * 20/28 ≈ 40.7mm
+    // 这个 40.7 不是我拍的，是算出来的。
+    const int box_h = canonical_h;
+    const int box_w =
+        std::max(1, static_cast<int>(std::lround(box_h * params.digit_aspect)));
+    // 理论上板子总比数字框宽。万一日后有人把参数调反了，
+    // 夹回图内，宁可裁小也不要越界访问。
+    const int safe_w = std::min(box_w, canonical_w);
+    const int box_x = std::max(0, std::min((canonical_w - box_w) / 2,
+                                           canonical_w - safe_w));
+
+    const cv::Mat box = canonical(cv::Rect(box_x, 0, safe_w, box_h));
+
+    // ---- 缩放 + 二值化 ----
+    // 顺序很重要：必须"先缩放、再阈值"。
+    // 反过来的话，INTER_AREA 会把 0/255 平均成中间灰度，输出就不再是
+    // 训练数据那种 {0,255} 二值图 —— 而且不会报任何错，只是准确率悄悄掉。
+    cv::Mat resized;
+    cv::resize(box, resized, cv::Size(params.out_width, params.out_height), 0.0,
+               0.0, cv::INTER_AREA);
+
+    // Otsu：阈值由这张小图自己的直方图算出来，不用手调，
+    // 所以对现场的光照变化比固定阈值皮实。
+    // 数据集是"白数字 + 黑底"，所以是 THRESH_BINARY；
+    // invert 是留给"万一现场抠出来极性相反"的应急开关。
+    const int threshold_type =
+        (params.invert ? cv::THRESH_BINARY_INV : cv::THRESH_BINARY) |
+        cv::THRESH_OTSU;
+    cv::threshold(resized, patch, 0.0, 255.0, threshold_type);
+    return true;
 }
 
 }  // namespace armor
