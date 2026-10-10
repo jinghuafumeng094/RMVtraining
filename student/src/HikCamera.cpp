@@ -15,7 +15,7 @@ namespace {
 // 曝光和增益都**不用自动**。自动曝光的"目标亮度"是相机自己定的，灯一变
 // 整幅图的灰度跟着变 —— 下游那些固定的颜色阈值会被它整死。
 // （现场第一批图就是这么废掉的：AE 顶格 + AWB 还在 Continuous。）
-constexpr float    kExposureUs     = 20000.0F;   // 曝光时间，微秒
+constexpr float    kExposureUs     = 5000.0F;   // 曝光时间，微秒
 constexpr float    kGainDb         = 0.0F;      // 增益，dB
 constexpr unsigned kGrabTimeoutMs  = 1000;       // 单帧等待上限
 constexpr int      kFailStreakLimit = 5;         // 连败几次就重开相机
