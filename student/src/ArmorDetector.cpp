@@ -234,7 +234,7 @@ bool extractDigitPatch(const cv::Mat& image,
     patch.release();
 
     if (image.empty() || params.px_per_mm <= 0.0F || params.out_width <= 0 ||
-        params.out_height <= 0) {
+        params.out_height <= 0 || params.patch_quad_scale <= 0.0F) {
         return false;
     }
     if (std::fabs(quadSignedArea(corners)) < kMinQuadAreaPx) {
@@ -246,7 +246,7 @@ bool extractDigitPatch(const cv::Mat& image,
         return false;
     }
 
-    // ---- 第一级：把角点四边形正射到"保物理比例的规范板" ----
+    // ---- 第一级：把（撑大后的）角点四边形正射到"保物理比例的规范板" ----
     // 目标尺寸 = 物理毫米数 x 像素密度。大小板只有宽度不同，高度都是 57mm。
     // 注意这一步同时把透视畸变也一起去掉了：四边形被拉成矩形，
     // 所以斜着看板子也能得到端正的数字。
@@ -259,7 +259,19 @@ bool extractDigitPatch(const cv::Mat& image,
         1, static_cast<int>(
                std::lround(params.plate_height_mm * params.px_per_mm)));
 
-    const std::vector<cv::Point2f> source(corners.begin(), corners.end());
+    // 正射前先把四边形绕中心撑大：检测出的四边形只框住两根灯条，
+    // 而牌面上的图案比灯条高一截，照着原四边形裁会切掉图案的上下缘。
+    // 撑大的只是这里的局部副本，检测输出的角点（要喂给 PnP）不受影响。
+    // 必须是"在原图上撑开再正射"——反过来在规范板里取大窗没用，
+    // 四边形外面没有真实像素，取到的只是边缘拉丝。
+    const cv::Point2f quad_center =
+        (corners[0] + corners[1] + corners[2] + corners[3]) * 0.25F;
+    const float quad_scale = params.patch_quad_scale;
+    const std::vector<cv::Point2f> source{
+        quad_center + (corners[0] - quad_center) * quad_scale,
+        quad_center + (corners[1] - quad_center) * quad_scale,
+        quad_center + (corners[2] - quad_center) * quad_scale,
+        quad_center + (corners[3] - quad_center) * quad_scale};
     const std::vector<cv::Point2f> destination{
         {0.0F, 0.0F},
         {static_cast<float>(canonical_w - 1), 0.0F},
@@ -277,9 +289,12 @@ bool extractDigitPatch(const cv::Mat& image,
     // 我们按字形裁会得到一个比训练数据更紧的裁剪，分布对不上。
     //
     // 框宽不是独立参数：它和框高、纵横比三者只有两个自由度。
-    // 纵横比定成 20:28（= 数据集补丁的比例），框宽就唯一确定了：
-    //   57mm * 20/28 ≈ 40.7mm
-    // 这个 40.7 不是我拍的，是算出来的。
+    // 纵横比定成 20:28（= 数据集补丁的比例），框宽就唯一确定了。
+    // 注意规范板的"每像素多少毫米"随 patch_quad_scale 变：四边形撑大了
+    // scale 倍，规范板却还是 plate_width_mm * px_per_mm 宽，于是
+    //   1 像素 = scale / px_per_mm 毫米
+    // 默认 2.0/2.0 = 1mm，框高 114px 就对应撑大后四边形的 114mm，
+    // 框宽 = 114 * 20/28 ≈ 81mm。
     const int box_h = canonical_h;
     const int box_w =
         std::max(1, static_cast<int>(std::lround(box_h * params.digit_aspect)));

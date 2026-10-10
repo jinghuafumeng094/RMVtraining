@@ -262,12 +262,15 @@ int main() {
         }
     }
 
-    // 20mm 的方块，落在 40.7mm x 57mm 的数字框里，映射到 20x28 上应该是
-    // (20/40.7)*20 ≈ 9.8 宽、(20/57)*28 ≈ 9.8 高 —— 接近正方形。
+    // 20mm 的方块，落在数字窗里，映射到 20x28 上应该 ≈ (20/81)*20 ≈ 5 宽、
+    // (20/114)*28 ≈ 5 高 —— 接近正方形。
+    // 窗是 ≈81mm x 114mm，比物理板(40.7mm x 57mm)大，因为 patch_quad_scale=2：
+    // 灯条只占牌面一部分，抠数字得把图案上下缘一起要进来。
+    // 见 PatchParams::patch_quad_scale 的注释。
     const std::array<int, 3> box = whiteBox(small_patch);
     assert(box[2] > 0);
-    assert(box[0] >= 5 && box[0] <= 15);
-    assert(box[1] >= 5 && box[1] <= 15);
+    assert(box[0] >= 3 && box[0] <= 8);
+    assert(box[1] >= 3 && box[1] <= 8);
     // ↓ 这一条是关键。把四个角点一步 getPerspectiveTransform 到 20x28 的
     //   实现，会让宽度压成 ≈3、高度还是 ≈10，宽高差 7 > 3，立刻红。
     assert(std::abs(box[0] - box[1]) <= 3);
@@ -277,7 +280,7 @@ int main() {
     assert(!large_patch.empty());
     const std::array<int, 3> large_box = whiteBox(large_patch);
     assert(large_box[2] > 0);
-    assert(large_box[0] >= 5 && large_box[0] <= 15);
+    assert(large_box[0] >= 3 && large_box[0] <= 8);
     assert(std::abs(large_box[0] - large_box[1]) <= 3);
 
     // 窗口必须在板子中央，而不是贴着左缘。
