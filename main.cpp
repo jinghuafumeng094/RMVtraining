@@ -427,10 +427,27 @@ void *OperationFunction(void *arg) {
         const std::vector<ArmorPose> observations =
             armor_solve(detections, camera, gimbal);
         if (!observations.empty()) {
-            WEB_LOG("pnp_reprojection_error", observations.front().reprojection_error);
-            WEB_LOG("pnp_distance_m", cv::norm(observations.front().position_gimbal_m));
+            const ArmorPose& observation = observations.front();
+            WEB_LOG("pnp_reprojection_error", observation.reprojection_error);
+            WEB_LOG("pnp_distance_m", cv::norm(observation.position_gimbal_m));
+
+            // 目标 yaw/pitch：板心在云台系里的方位角，也就是"云台该往哪转"。
+            // 云台系 x 向右、y 向下、z 向前（与相机系同向，见 StudentTasks.cpp
+            // 里的物体系约定），所以：
+            //   yaw   = atan2(x, z)          右正
+            //   pitch = -atan2(y, hypot(x,z)) 上正（y 向下，取负才得到"抬头为正"）
+            // 注意这两个是**观测**值，不要和 EKF 输出的 target_yaw/target_pitch
+            // 混看：那两条是滤波后的云台指令，这里是单帧 PnP 的原始方位。
+            const cv::Vec3d& p_gimbal = observation.position_gimbal_m;
+            WEB_LOG("pnp_yaw_rad", std::atan2(p_gimbal[0], p_gimbal[2]));
+            WEB_LOG("pnp_pitch_rad",
+                    -std::atan2(p_gimbal[1], std::hypot(p_gimbal[0], p_gimbal[2])));
         } else {
+            // 没有观测时把这一帧显式标成无效，否则网页会一直显示上一帧的旧值，
+            // 看着像"还在跟踪"，其实早就丢了目标。
             WEB_LOG("pnp_reprojection_error", -1.0);
+            WEB_LOG("pnp_yaw_rad", -1.0);
+            WEB_LOG("pnp_pitch_rad", -1.0);
         }
 
         // 3. 计算帧间隔和通信延迟，再调用 EKF。即使 observations 为空也必须调用。
