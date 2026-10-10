@@ -9,17 +9,54 @@ option(ENABLE_WEB_DEBUG "Build the scalar Web Debug dashboard" ON)
 option(BUILD_TESTING "Build the starter-project tests" ON)
 
 find_package(Eigen3 REQUIRED)
-# core    : cv::Mat 等基础类型
-# imgproc : cv::cvtColor 等图像处理
-# videoio : cv::VideoCapture / VideoWriter 取流
-# calib3d : cv::solvePnP 位姿解算（第四课用）
-find_package(OpenCV 4 REQUIRED COMPONENTS 
-	core imgproc videoio calib3d
+# core     : cv::Mat 等基础类型
+# imgproc  : cv::cvtColor / resize 等图像处理
+# calib3d  : cv::solvePnP 位姿解算（第四课用）
+# objdetect: cv::HOGDescriptor（数字分类的特征）
+# ml       : cv::ml::SVM（数字分类的分类器）
+# imgcodecs: cv::imread / imwrite（离线工具读写图片）
+#
+# 没有 videoio：取流走海康 MVS SDK，不再用 cv::VideoCapture，
+# 全仓已无 videoio 符号（见 student/src/HikCamera.cpp）。
+find_package(OpenCV 4 REQUIRED COMPONENTS
+	core imgproc calib3d
 	objdetect
 	ml
 	imgcodecs
 )
 find_package(Threads REQUIRED)
+
+# ---------------------------------------------------------------------------
+# 海康 MVS 相机 SDK —— get_pic() 靠它取流（student/src/HikCamera.cpp）。
+#
+# 路径写死 /opt/MVS 而不是 find_package：SDK 不自带 CMake 配置文件，
+# 没有 config mode 可找。装在别处就 -DMVS_ROOT=<安装根目录>。
+# ---------------------------------------------------------------------------
+set(MVS_ROOT "/opt/MVS" CACHE PATH "海康 MVS SDK 安装根目录")
+
+find_path(MVS_INCLUDE_DIR MvCameraControl.h
+    PATHS "${MVS_ROOT}/include" NO_DEFAULT_PATH)
+find_library(MVS_LIBRARY MvCameraControl
+    PATHS "${MVS_ROOT}/lib/64" NO_DEFAULT_PATH)
+
+if(NOT MVS_INCLUDE_DIR OR NOT MVS_LIBRARY)
+    message(FATAL_ERROR
+        "找不到海康 MVS SDK。\n"
+        "  找过: ${MVS_ROOT}/include 和 ${MVS_ROOT}/lib/64\n"
+        "  当前: MVS_INCLUDE_DIR=${MVS_INCLUDE_DIR} MVS_LIBRARY=${MVS_LIBRARY}\n"
+        "装着 SDK 的话，用 -DMVS_ROOT=<安装根目录> 重新 configure。")
+endif()
+
+add_library(hik_mvs INTERFACE)
+target_include_directories(hik_mvs INTERFACE "${MVS_INCLUDE_DIR}")
+target_link_libraries(hik_mvs INTERFACE "${MVS_LIBRARY}")
+
+# 把库目录烤进可执行文件的 rpath —— 官方 Sample 的 Makefile 也这么干
+# （-Wl,-rpath=$(MVCAM_COMMON_RUNENV)/64）。这样跑自己的程序**完全不依赖
+# MVCAM_* 环境变量**：那四个只写在 ~/.bashrc 里，而登录 shell 是 zsh，
+# 干净终端里它们是空的 —— 靠环境变量就等于靠运气。
+get_filename_component(MVS_LIB_DIR "${MVS_LIBRARY}" DIRECTORY)
+target_link_options(hik_mvs INTERFACE "-Wl,-rpath,${MVS_LIB_DIR}")
 
 add_subdirectory(serialPort)
 if(ENABLE_WEB_DEBUG)
@@ -37,6 +74,7 @@ add_library(training_core STATIC
     src/AppSupport.cpp
     src/AutoAimTypes.cpp
     student/src/StudentTasks.cpp
+    student/src/HikCamera.cpp
     student/src/ArmorDetector.cpp
     student/src/DigitClassifier.cpp
 )
@@ -47,7 +85,9 @@ target_include_directories(training_core
         serialPort/include
         ${OpenCV_INCLUDE_DIRS}
 )
-target_link_libraries(training_core PUBLIC serialPort ${OpenCV_LIBS})
+# hik_mvs 用 PUBLIC：链了 training_core 的目标都会被 get_pic 拖上
+# libMvCameraControl，头文件和 -rpath 得一路传下去。
+target_link_libraries(training_core PUBLIC serialPort hik_mvs ${OpenCV_LIBS})
 # 数字分类模型的绝对路径。编进二进制而不是运行时拼相对路径 ——
 # 现场从来不及猜"当前工作目录是哪儿"。
 target_compile_definitions(training_core PRIVATE
@@ -92,6 +132,18 @@ target_include_directories(make_digit_holdout PRIVATE
     ${OpenCV_INCLUDE_DIRS}
 )
 target_link_libraries(make_digit_holdout PRIVATE ${OpenCV_LIBS})
+
+# ---------------------------------------------------------------------------
+# 抓一帧存盘：验证 get_pic() 本身（相机 SDK 调通了没有）。
+#
+# 它**不需要 config/camera.yaml** —— 取流和标定是两回事，
+# 内参外参还没齐不影响相机能不能出图。所以这是相机到手后第一件能验的事。
+#
+# 这个要链 training_core：验的就是 get_pic 这个真入口
+# （StudentTasks.cpp 里那个 static HikCamera），不是绕过它直接调 HikCamera。
+# ---------------------------------------------------------------------------
+add_executable(grab_one tools/grab_one.cpp)
+target_link_libraries(grab_one PRIVATE training_core)
 
 if(BUILD_TESTING)
     enable_testing()
