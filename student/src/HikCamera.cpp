@@ -44,18 +44,18 @@ void releaseCameraAtExit() {
 // 第一版把 SDK 的初始化/反初始化拆给两个函数局部 static 管（"退出时自动
 // 收尾"）。函数局部 static 按**构造完成顺序的逆序**析构，于是退出时钩子先跑
 // （MV_CC_Finalize），camera 后跑（StopGrabbing 一个已死的句柄）——
-// 段错误，栈顶在 MVS 自己的线程里（libMvUsb3vTL.so），完全不像是我们的错。
+// 段错误，栈顶在 MVS 自己的线程里（libMvUsb3vTL.so），完全不像是这一层的错。
 //
 // 改成"一个对象管到底"之后**仍然崩**，这才挖到底：MVS 自己在
 // Initialize/OpenDevice 那一串调用里注册了退出清理。atexit 处理器按
-// **注册的逆序**执行 —— 它注册得比我们早，就跑得比我们早；等轮到我们时，
+// **注册的逆序**执行 —— 它注册得更早，就跑得更早；等轮到这一层时，
 // 设备早被它释放了。实测那种时序下：
 //     StopGrabbing  -> 0x80000000（MV_E_HANDLE，无效句柄）
 //     CloseDevice   -> 0x0
 //     DestroyHandle -> **段错误**（在已释放的内存上再释放一次，double free）
 // 且时崩时不崩，是最难查的一类。
 //
-// 解法：把我们的注册点推到 StartGrabbing **之后**，比 MVS 的清理注册得晚，
+// 解法：把本层的注册点推到 StartGrabbing **之后**，比 MVS 的清理注册得晚，
 // 于是跑得比它早——那时设备还活着。实测四个调用全部 0x0，稳定干净退出。
 // 所以：**别把 std::atexit 那一行挪到 StartGrabbing 之前。**
 void HikCamera::releaseAll() {
@@ -117,8 +117,8 @@ bool HikCamera::openOnce() {
         return false;
     }
     if (devList.nDeviceNum == 0) {
-        std::cerr << "[camera] 没枚举到相机。USB 插好了吗？"
-                     "MVS 客户端是不是还占着设备？（它开着我们就打不开）\n";
+        std::cerr << "[camera] 未枚举到相机。USB 未连接，"
+                     "或设备被 MVS 客户端占用\n";
         return false;
     }
     if (devList.nDeviceNum > 1) {
@@ -167,7 +167,7 @@ bool HikCamera::openOnce() {
     // ---- 注册退出钩子（位置很重要，别往上挪）----
     // 必须在 StartGrabbing **之后**注册：atexit 按注册的逆序执行，注册得越晚
     // 跑得越早。MVS 自己的退出清理是在 Initialize/OpenDevice 那一串里注册的，
-    // 比这里早 —— 只有注册点排在它后面，我们的清理才会赶到它前面，
+    // 比这里早 —— 只有注册点排在它后面，本层的清理才会赶到它前面，
     // 那时设备还活着。顺序错了就是 double free 段错误，详见 releaseAll()。
     // 每次成功开流都注册一次（不是只注册一次）：注册得越晚跑得越早，
     // 所以重开相机之后重新注册，才能继续压过 SDK 新注册的那份。
@@ -175,8 +175,8 @@ bool HikCamera::openOnce() {
     std::atexit(&releaseCameraAtExit);
     g_liveCamera = this;
 
-    std::cout << "[camera] 已打开（曝光 " << kExposureUs << " us，增益 "
-              << kGainDb << " dB，自动全关）\n";
+    std::cout << "[camera] 已打开。曝光 " << kExposureUs << " us，增益 "
+              << kGainDb << " dB，自动曝光/增益/白平衡已关闭\n";
     failStreak_ = 0;
     return true;
 }
@@ -196,7 +196,7 @@ bool HikCamera::grab(cv::Mat& pic) {
     if (nRet != MV_OK) {
         ++failStreak_;
         std::cerr << "[camera] 取帧失败 nRet = 0x" << std::hex << nRet << std::dec
-                  << "（连续第 " << failStreak_ << " 次）\n";
+                  << "，连续 " << failStreak_ << " 次\n";
         if (failStreak_ >= kFailStreakLimit) {
             std::cerr << "[camera] 连续失败 " << kFailStreakLimit
                       << " 次，重开相机\n";
@@ -239,7 +239,7 @@ bool HikCamera::grab(cv::Mat& pic) {
         reportError("MV_CC_ConvertPixelTypeEx", nRet);
         std::cerr << "[camera] 源像素格式 = 0x" << std::hex
                   << static_cast<unsigned int>(info.enPixelType) << std::dec
-                  << "（BayerRG8 = 0x1080009）\n";
+                  << "，预期 BayerRG8 = 0x1080009\n";
         return false;
     }
     if (w == 0 || h == 0) {
