@@ -326,7 +326,7 @@ bool extractDigitPatch(const cv::Mat& image,
 // 颜色掩膜
 // ---------------------------------------------------------------------------
 
-cv::Mat buildColorMask(const cv::Mat& bgr, TeamColor team,
+cv::Mat buildColorMask(const cv::Mat& bgr, TeamColor enemy_color,
                        const MaskParams& params) {
     // 只收三通道 BGR。灰度图没有颜色、BGRA 该由调用方先转掉
     // （detectArmors 在入口统一做这件事）。
@@ -339,12 +339,12 @@ cv::Mat buildColorMask(const cv::Mat& bgr, TeamColor team,
     cv::Mat channels[3];
     cv::split(bgr, channels);  // 0 = B，1 = G，2 = R
 
-    const bool is_blue = (team == TeamColor::Blue);
+    const bool is_blue = (enemy_color == TeamColor::Blue);
     const cv::Mat& main = is_blue ? channels[0] : channels[2];
     const cv::Mat& other = is_blue ? channels[2] : channels[0];
 
     // 有符号的差。cv::subtract 对 CV_8U 是**饱和**减法：
-    // 负数截成 0，所以蓝队这里等价于 max(B - R, 0)，正是想要的"只留本队颜色"。
+    // 负数截成 0，所以传入蓝色时等价于 max(B - R, 0)，正是想要的"只留该颜色的灯条"。
     //
     // 换成 cv::absdiff 就是 |B - R| —— 红队和蓝队看到一模一样的结果，
     // 对面队伍的车全都变成目标。这是本函数唯一的坑，而且它不报错。
@@ -516,7 +516,7 @@ std::vector<ArmorDetection> suppressOverlaps(
 // 检测串联
 // ---------------------------------------------------------------------------
 
-std::vector<ArmorDetection> detectArmors(const cv::Mat& bgr, TeamColor team,
+std::vector<ArmorDetection> detectArmors(const cv::Mat& bgr, TeamColor enemy_color,
                                          const DetectParams& params) {
     std::vector<ArmorDetection> detections;
 
@@ -533,7 +533,7 @@ std::vector<ArmorDetection> detectArmors(const cv::Mat& bgr, TeamColor team,
         return detections;  // 空图、灰度图、其它位深：明确拒绝
     }
 
-    const cv::Mat mask = buildColorMask(bgr_only, team, params.mask);
+    const cv::Mat mask = buildColorMask(bgr_only, enemy_color, params.mask);
     if (mask.empty()) {
         return detections;
     }

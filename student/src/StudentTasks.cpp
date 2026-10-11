@@ -64,12 +64,12 @@ bool get_pic(cv::Mat& pic) {
 }
 
 // ↓↓↓ 下面两个函数先原样留着，第四、五课再填 ↓↓↓
-std::vector<ArmorDetection> armor_detect(const cv::Mat& image, TeamColor team) {
+std::vector<ArmorDetection> armor_detect(const cv::Mat& image, TeamColor enemy_color) {
     // 整条检测管线都在 ArmorDetector 里：颜色掩膜 → 灯条提取 → 配对
     // → 角点 → 大小分类 → 去重 → 数字分类。
     // 这里只做转发，保持本文件是"把各部分接起来"的地方，
     // 算法本身留在 ArmorDetector，能脱离相机单独测。
-    return armor::detectArmors(image, team);
+    return armor::detectArmors(image, enemy_color);
 }
 
 // 任务 3：装甲板位姿解算。

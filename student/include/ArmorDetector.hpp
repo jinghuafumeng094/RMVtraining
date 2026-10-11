@@ -147,11 +147,11 @@ struct MaskParams {
     int min_channel_value{100}; // 主通道自身的下限
 };
 
-// 生成二值掩膜：255 = 属于本队颜色的亮像素，0 = 其它。
+// 生成二值掩膜：255 = 属于待检测颜色的亮像素，0 = 其它。
 // 只接受 CV_8UC3（BGR）。灰度图没有颜色、BGRA 该在调用方先转掉
 // （detectArmors 会在入口统一做），这里一律返回空矩阵 ——
 // 而不是猜一个通道顺序，猜错不会有任何提示。
-cv::Mat buildColorMask(const cv::Mat& bgr, TeamColor team,
+cv::Mat buildColorMask(const cv::Mat& bgr, TeamColor enemy_color,
                        const MaskParams& params = {});
 
 // ---------------------------------------------------------------------------
@@ -250,12 +250,14 @@ std::vector<ArmorDetection> suppressOverlaps(
 // 反过来的做法（找不到数字就整块丢掉）会让"检测坏了"和"分类坏了"
 // 在 Web Debug 上长得一模一样 —— armor_count 都是 0，没法区分。
 //
-// team 传本队颜色：只看自己颜色的灯条，对面队伍的车不会变成目标。
+// enemy_color 是要检测的队伍颜色，也就是敌方颜色 —— 只看对方车的灯条，
+// 自己队的车不会被当成目标。main.cpp 传的是 enemyColorFromStatus 的结果，
+// 我方蓝时得到红。名字跟框架签名 StudentTasks.hpp 的 armor_detect 保持一致。
 //
 // 通道格式在入口统一归一化一次：CV_8UC4（BGRA）在这里转成 BGR，
 // 已经是 CV_8UC3 的只做浅拷贝。其它类型（灰度、空图）返回空结果。
 // 后面每一级都只面对三通道，所以它们不需要各自再判一次。
-std::vector<ArmorDetection> detectArmors(const cv::Mat& bgr, TeamColor team,
+std::vector<ArmorDetection> detectArmors(const cv::Mat& bgr, TeamColor enemy_color,
                                          const DetectParams& params = {});
 
 }  // namespace armor
