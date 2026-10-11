@@ -3,6 +3,7 @@
 #include "AutoAimTypes.hpp"
 
 #include <array>
+#include <cstddef>
 #include <utility>
 #include <vector>
 
@@ -50,14 +51,71 @@ constexpr float kGapRatioSplit = 3.0F;
 // 纯几何部分：输入输出都是点，不读图像。
 // ---------------------------------------------------------------------------
 
-// 把两根灯条配成装甲板。返回的每一对都保证 first 在左、second 在右。
-// 注意：本函数只做"这两根灯条能不能构成一块板"的局部判断。
+// 一对候选灯条，外加它们在**输入数组**里的下标。
+// 下标是给 choosePairs 用的：光有一对端点没法知道哪两根灯条被占了。
+// first / second 的语义保持和以前一样（first 在左），老代码不用改。
+struct LightBarPair {
+    LightBar first;         // 左灯条
+    LightBar second;        // 右灯条
+    std::size_t left_index{0};
+    std::size_t right_index{0};
+};
+
+// 把两根灯条配成装甲板 —— **只做局部判断**："这两根灯条能不能构成一块板"。
+// 返回的每一对都保证 first 在左、second 在右。
 //
 // 一对灯条之间夹着第三根灯条时会被拒绝 —— 那说明这一对跨了两块板。
 // 只靠间距比挡不住：实测帧上跨板那对的间距比是 5.05，落在合法区间内。
-// 三根等距灯条因此只产生 2 对（左中 / 中右）。剩下的重叠交给 NMS。
-std::vector<std::pair<LightBar, LightBar>> pairLightBars(
-    const std::vector<LightBar>& bars, const PairCriteria& criteria = {});
+// 三根等距灯条因此只产生 2 对（左中 / 中右）。
+//
+// ⚠️ **本函数不保证一根灯条只出现一次。** 四根灯条同框时会给出三对
+// (b0,b1)(b1,b2)(b2,b3)，b1 和 b2 各被两对用到。这是**故意的**：
+// 局部判据不该假装知道全局的事。挑哪一对交给 choosePairs。
+std::vector<LightBarPair> pairLightBars(const std::vector<LightBar>& bars,
+                                        const PairCriteria& criteria = {});
+
+// 一对候选在几何之外的证据。由 detectArmors 算好（要读图），
+// choosePairs 只拿来打分，自己不碰像素。
+struct PairEvidence {
+    // 板面对比度：两根灯条之间那块牌面的灰度均值 ÷ 周围一圈参考区的灰度均值。
+    // 1.0 = 中间和背景一样亮（什么都没有），越大越像"中间有块亮牌面"。
+    // 实测真板 2.03、两块假板 0.30 / 0.18 —— 差 7~12 倍。
+    // 用比值而不是绝对亮度：这是"局部背景的相对量"，与曝光/距离无关。
+    float plate_face_contrast{1.0F};
+    // 数字分类结果。0 = 没读出数字（含 9neg），1~8 是有效目标，不是硬门。
+    // ⚠️ 只有当 plate_face_contrast > 1（中间确实有块板面）时它才计分，见 pairScore。
+    int target_id{0};
+};
+
+// 读出 1~8 时给的奖励分。取 2.0：其余两项的总跨度是 4 分（几何 −3~0、板面 0~+1），
+// 给一半 —— 足够把"两块都像板"的候选分开，但**不足以把几何和板面都明显的证据整个推翻**。
+//
+// 为什么从 10 降下来：真板的板面项封顶只有 +1，所以奖励只要 > 1，一个**误报**的数字
+// 就必然压过一块板面看得清清楚楚的真板。现场实测的跨车假对正是这种情形
+// （见 rm_autoaim_evidence/04-装甲板识别/20261011-两车各4灯条-探针.log）。
+//
+// **它是奖励不是门槛**：读不出数字的板照常返回。
+constexpr float kDigitScoreBonus = 2.0F;
+
+// 在候选对里挑出互不共用灯条的那些 —— 一根灯条物理上只装在一块装甲板上。
+//
+// evidence[i] 对应 candidates[i]（多出来的部分忽略，缺的按默认值算）。
+// 贪心：按分数从高到低，能放就放（两端灯条都还没被占）。
+// 返回**按分数降序**，最好的排最前面。分数打平时按候选顺序定先后 ——
+// 结果必须是确定的，否则同一帧隔一次跑给出不同的框，现场没法复现。
+//
+// 打分三个来源，前提都是"候选已经通过了 pairLightBars 的全部判据"：
+//   几何自洽度（负分，0~3）：三根灯条越像同一块板的证据，扣分越少。
+//     三个分量各自归一化成"预算用掉了几成"，所以量纲无关、可加。
+//   板面对比度（0~1）：min(对比度-1, 1)，封顶是免得它一家独大盖过几何。
+//   数字奖励（0 或 2）：读出 1~8 **且这一对确实有板面**（板面对比度 > 1）才加。
+//                       数字是印在牌面上的，牌面都没有的地方读出数字本身就是错的。
+//
+// 没有竞争时，分数多低的一对都会返回 —— 下游要靠"角点有效但 target_id=0"
+// 把"检测坏了"和"分类坏了"分开，这里筛掉就把两种故障混成一种了。
+std::vector<LightBarPair> choosePairs(const std::vector<LightBarPair>& candidates,
+                                      const std::vector<PairEvidence>& evidence,
+                                      const PairCriteria& criteria = {});
 
 // 由一对灯条生成装甲板的四个角点。顺序是硬约定，全链路都依赖它：
 //   c[0] 左上 = 左灯条 top      c[1] 右上 = 右灯条 top
@@ -127,6 +185,18 @@ struct PatchParams {
 bool extractDigitPatch(const cv::Mat& image,
                        const std::array<cv::Point2f, 4>& corners, ArmorSize size,
                        cv::Mat& patch, const PatchParams& params = {});
+
+// 板面对比度：两根灯条之间那块牌面的灰度均值 ÷ 周围一圈参考区的灰度均值。
+// 1.0 表示中间和背景一样亮（中间什么都没有），越大越像"中间有一块亮牌面"。
+//
+// 为什么用比值：这是个局部背景的相对量，与曝光、与距离都无关，
+// 换台相机、换个场地灯光都不用重标。真板实测 2.0，两块假板 0.3 / 0.2。
+// mask 里非零的像素（灯条本体）会被排除在**参考区**之外 ——
+// 那是亮红，混进参考均值会把分母抬起来，板越近抬得越狠。
+//
+// gray 必须是 CV_8UC1（用 toGray 那种路子先转好），否则返回中性的 1.0。
+float plateFaceContrast(const cv::Mat& gray, const cv::Mat& mask,
+                        const LightBar& left, const LightBar& right);
 
 // ---------------------------------------------------------------------------
 // 颜色掩膜 —— 管线第一级
@@ -227,8 +297,9 @@ struct DetectParams {
     // 这里提前拦是为了不在退化角点上白跑一次透视变换。
     float min_quad_area_px{100.0F};
     // NMS 的 IoU 上限：两块板的外接矩形重叠超过它就算同一块。
-    // 三根等距灯条会配出 3 对（左中 / 中右 / 左右），这三对互相重叠，
-    // 不合并的话同一块板会报三次，下游 EKF 会当成三个目标去跟踪。
+    // 它只兜底"两块真板挨得太近、外接矩形确实叠上了"这一种。
+    // 同一块板被拆成多个框的主要来源（一根灯条被两个候选共用）
+    // 已经在 choosePairs 那一步按一对一拍死了，NMS 是第二道保险。
     float nms_iou{0.3F};
 };
 
@@ -242,7 +313,11 @@ std::vector<ArmorDetection> suppressOverlaps(
     const std::vector<ArmorDetection>& detections, float iou_threshold);
 
 // 检测主入口：
-//   颜色掩膜 → 灯条提取 → 灯条配对 → 角点 → 大小分类 → NMS → 数字分类
+//   颜色掩膜 → 灯条提取 → 灯条配对 → 一对一选择 → 角点 → 大小分类 → 数字分类 → NMS
+//
+// 一对一选择（choosePairs）在这里，而不是在 pairLightBars 里：
+// 局部判据不该假装知道全局的事。先把"每一对像不像一块板"算完，
+// 再在全局上保证一根灯条只被用一次。
 //
 // 关于「目标丢失处理」（评分表明确列的一项）：
 // 板子检测到了、但中间没有数字时，这块板**仍然返回**（角点有效，PnP 能用），

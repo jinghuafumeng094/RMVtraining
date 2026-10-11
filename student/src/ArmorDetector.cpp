@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <numeric>
 
 #include <opencv2/imgproc.hpp>
 
@@ -22,6 +23,40 @@ float angleDifferenceDegrees(float a, float b) {
         difference = 180.0F - difference;
     }
     return difference;
+}
+
+// 除数保护。阈值为 0 时（调用方把某条判据关掉了）不能让分数变成 inf。
+constexpr float kBudgetEps = 1e-6F;
+
+// 一对候选的"几何自洽度"：三条几何判据各自用掉了几成预算，加起来。
+// 0 = 完美（等长、等高、平行），3 = 三条全顶格。
+//
+// 为什么要归一化成"预算用掉几成"：三个量的量纲互不相同（比值、比值、角度），
+// 直接相加没有意义。各除以自己的阈值之后都成了无量纲的 0~1，才能相加比较。
+// 候选是通过全部判据进来的，所以每个分量天然落在 0~1。
+float pairSelfConsistency(const LightBarPair& pair, const PairCriteria& criteria) {
+    const float length_a = pair.first.length();
+    const float length_b = pair.second.length();
+    const float length_min = std::min(length_a, length_b);
+    const float length_max = std::max(length_a, length_b);
+    if (length_min <= 0.0F) {
+        return 3.0F;  // 退化灯条：直接给最差分，别让它靠 NaN 混过去
+    }
+    const float mean_length = (length_a + length_b) * 0.5F;
+
+    // 长度那一项要减 1：完美的两个等长灯条比值是 1 不是 0，
+    // 不减的话完美的一对也白扣 0.56 分，三个分量就不是同一个起点了。
+    const float length_term =
+        (length_max / length_min - 1.0F) /
+        std::max(kBudgetEps, criteria.max_length_ratio - 1.0F);
+    const float y_term =
+        (std::fabs(pair.first.center().y - pair.second.center().y) / mean_length) /
+        std::max(kBudgetEps, criteria.max_center_y_diff_ratio);
+    const float tilt_term =
+        angleDifferenceDegrees(pair.first.tiltDegrees(), pair.second.tiltDegrees()) /
+        std::max(kBudgetEps, criteria.max_tilt_diff_deg);
+
+    return length_term + y_term + tilt_term;
 }
 
 }  // namespace
@@ -102,9 +137,9 @@ ArmorSize classifySize(const LightBar& left, const LightBar& right,
                                               : ArmorSize::Small;
 }
 
-std::vector<std::pair<LightBar, LightBar>> pairLightBars(
-    const std::vector<LightBar>& bars, const PairCriteria& criteria) {
-    std::vector<std::pair<LightBar, LightBar>> pairs;
+std::vector<LightBarPair> pairLightBars(const std::vector<LightBar>& bars,
+                                        const PairCriteria& criteria) {
+    std::vector<LightBarPair> pairs;
     const std::size_t count = bars.size();
     if (count < 2) {
         return pairs;
@@ -186,15 +221,85 @@ std::vector<std::pair<LightBar, LightBar>> pairLightBars(
                 continue;
             }
 
-            // 判据 6：左右定序，保证返回的 pair 里 first 一定在左
+            // 判据 6：左右定序，保证返回的 pair 里 first 一定在左。
+            // 下标跟着一起交换 —— 它要和 first / second 对得上，
+            // 否则 choosePairs 会把被占用的灯条记错。
             if (a.center().x <= b.center().x) {
-                pairs.emplace_back(a, b);
+                pairs.push_back(LightBarPair{a, b, i, j});
             } else {
-                pairs.emplace_back(b, a);
+                pairs.push_back(LightBarPair{b, a, j, i});
             }
         }
     }
     return pairs;
+}
+
+namespace {
+
+// 一对候选的分数，越大越好：
+//   几何自洽度是**负**分 —— 0 分（最自洽）不扣，3 分（三条判据全顶格）扣满 3。
+//   板面分封顶 1 —— 免得一块特别亮的牌面把几何差异整个盖过去。
+//   数字奖励（见 kDigitScoreBonus）只在**这一对确实有板面**时才加：
+//     数字是印在牌面上的。一对中间根本没有板面的候选，分类器读出来的 1~8
+//     只能是背景上的误报，这时候给它加分等于奖励噪声。这也是唯一能挡住
+//     "跨车那对被误报出数字、反而挤掉真板"的办法 —— 光把奖励调小不够，
+//     因为板面项封顶只有 +1，奖励只要大于 1 就还是能翻盘。
+float pairScore(const LightBarPair& pair, const PairEvidence& evidence,
+                const PairCriteria& criteria) {
+    float score = -pairSelfConsistency(pair, criteria);
+    // 这一段既进分数，又当"有没有板面"的判据用，所以单独提出来。
+    const float face_term =
+        std::min(1.0F, std::max(0.0F, evidence.plate_face_contrast - 1.0F));
+    score += face_term;
+    if (face_term > 0.0F && evidence.target_id >= 1 && evidence.target_id <= 8) {
+        score += kDigitScoreBonus;
+    }
+    return score;
+}
+
+}  // namespace
+
+std::vector<LightBarPair> choosePairs(const std::vector<LightBarPair>& candidates,
+                                      const std::vector<PairEvidence>& evidence,
+                                      const PairCriteria& criteria) {
+    // 先算出分数再排序。放在比较函数里算的话每比较一次跑一遍，
+    // 而且 unordered 的比较函数是未定义行为。
+    std::vector<float> scores(candidates.size());
+    for (std::size_t k = 0; k < candidates.size(); ++k) {
+        // evidence 短了按默认值算（对比度 1.0、无数字）——
+        // 缺证据不该让一对候选凭空消失。
+        scores[k] = pairScore(candidates[k],
+                              k < evidence.size() ? evidence[k] : PairEvidence{},
+                              criteria);
+    }
+
+    std::vector<std::size_t> order(candidates.size());
+    std::iota(order.begin(), order.end(), std::size_t{0});
+    // stable_sort：分数打平时保持候选原顺序，结果才是确定的。
+    std::stable_sort(order.begin(), order.end(),
+                     [&scores](std::size_t a, std::size_t b) {
+                         return scores[a] > scores[b];
+                     });
+
+    // 灯条总数：候选里出现过的最大下标 + 1。choosePairs 看不到原始灯条数组，
+    // 但从下标就能还原出需要多长的占用表。
+    std::size_t bar_count = 0;
+    for (const LightBarPair& pair : candidates) {
+        bar_count = std::max(bar_count, std::max(pair.left_index, pair.right_index) + 1);
+    }
+
+    std::vector<bool> used(bar_count, false);
+    std::vector<LightBarPair> chosen;
+    for (std::size_t k : order) {
+        const LightBarPair& pair = candidates[k];
+        if (used[pair.left_index] || used[pair.right_index]) {
+            continue;  // 两端有一端已经被更好的那对占了
+        }
+        used[pair.left_index] = true;
+        used[pair.right_index] = true;
+        chosen.push_back(pair);
+    }
+    return chosen;
 }
 
 // ---------------------------------------------------------------------------
@@ -320,6 +425,110 @@ bool extractDigitPatch(const cv::Mat& image,
     cv::threshold(resized, patch, 0.0, 255.0,
                   cv::THRESH_BINARY | cv::THRESH_OTSU);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// 板面对比度 —— 配对阶段用的第二个证据
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// 把浮点矩形夹进图内并取整。整块落在图外时返回空矩形。
+cv::Rect clipToImage(float x0, float y0, float x1, float y1,
+                     const cv::Size& size) {
+    const int ix0 = std::max(0, static_cast<int>(std::floor(x0)));
+    const int iy0 = std::max(0, static_cast<int>(std::floor(y0)));
+    const int ix1 = std::min(size.width, static_cast<int>(std::ceil(x1)));
+    const int iy1 = std::min(size.height, static_cast<int>(std::ceil(y1)));
+    if (ix1 <= ix0 || iy1 <= iy0) {
+        return cv::Rect();
+    }
+    return cv::Rect(ix0, iy0, ix1 - ix0, iy1 - iy0);
+}
+
+// 矩形内的灰度累加。三个开关各管一件事：
+//   exclude_mask 跳过掩膜非零的像素（灯条本体）
+//   skip_rect    再挖掉一个矩形（参考环要挖掉内区）
+// 返回 {灰度总和, 参与统计的像素数}。
+std::pair<double, int> sumGray(const cv::Mat& gray, const cv::Mat& mask,
+                               const cv::Rect& box, bool exclude_mask,
+                               const cv::Rect& skip_rect) {
+    double sum = 0.0;
+    int count = 0;
+    const int skip_x1 = skip_rect.x + skip_rect.width;
+    const int skip_y1 = skip_rect.y + skip_rect.height;
+    for (int y = box.y; y < box.y + box.height; ++y) {
+        const unsigned char* gray_row = gray.ptr<unsigned char>(y);
+        const unsigned char* mask_row =
+            (exclude_mask && !mask.empty()) ? mask.ptr<unsigned char>(y) : nullptr;
+        for (int x = box.x; x < box.x + box.width; ++x) {
+            if (!skip_rect.empty() && x >= skip_rect.x && x < skip_x1 &&
+                y >= skip_rect.y && y < skip_y1) {
+                continue;
+            }
+            if (mask_row != nullptr && mask_row[x] != 0) {
+                continue;
+            }
+            sum += gray_row[x];
+            ++count;
+        }
+    }
+    return {sum, count};
+}
+
+}  // namespace
+
+float plateFaceContrast(const cv::Mat& gray, const cv::Mat& mask,
+                        const LightBar& left, const LightBar& right) {
+    // 提前返回 1.0（= 和背景一样亮，"中间什么都没有"）而不是 0：
+    // 0 会被当成"比背景还暗"，而在打分函数里 1.0 恰好等于零贡献。
+    if (gray.empty() || gray.type() != CV_8UC1) {
+        return 1.0F;
+    }
+
+    const float gap = right.center().x - left.center().x;
+    const float y_top = (left.top.y + right.top.y) * 0.5F;
+    const float y_bottom = (left.bottom.y + right.bottom.y) * 0.5F;
+    const float band = y_bottom - y_top;
+    if (gap <= 0.0F || band <= 0.0F) {
+        return 1.0F;  // 退化几何：给中性值，别让它凭空得分
+    }
+
+    // 内区：两根灯条之间。横向各内缩 0.2*gap，避开灯条边缘的过渡带 ——
+    // 那里是"红转背景"的斜面，把它算进板面会稀释真板的对比度。
+    const float inner_x0 = left.center().x + 0.2F * gap;
+    const float inner_x1 = right.center().x - 0.2F * gap;
+    // 参考环：内区向外扩 0.6*gap（横）0.5*band（纵）。
+    // 这个尺寸是量出来的：再小就贴住灯条、再大就把别的板或场地收进来。
+    const float ring_x0 = inner_x0 - 0.6F * gap;
+    const float ring_x1 = inner_x1 + 0.6F * gap;
+    const float ring_y0 = y_top - 0.5F * band;
+    const float ring_y1 = y_bottom + 0.5F * band;
+
+    const cv::Rect inner =
+        clipToImage(inner_x0, y_top, inner_x1, y_bottom, gray.size());
+    const cv::Rect ring =
+        clipToImage(ring_x0, ring_y0, ring_x1, ring_y1, gray.size());
+    if (inner.empty() || ring.empty()) {
+        return 1.0F;
+    }
+
+    // 内区不剔灯条像素：真框进来了说明这块牌面本来就窄，不该假装没看见。
+    // 参考环必须剔 —— 灯条本体是亮红，混进参考均值会把分母抬起来，
+    // 板越近抬得越狠，正好把最该选的那一对压下去。
+    const std::pair<double, int> inner_sum =
+        sumGray(gray, mask, inner, /*exclude_mask=*/false, cv::Rect());
+    const std::pair<double, int> ring_sum =
+        sumGray(gray, mask, ring, /*exclude_mask=*/true, inner);
+    if (inner_sum.second == 0 || ring_sum.second == 0) {
+        return 1.0F;
+    }
+
+    const double inner_mean = inner_sum.first / inner_sum.second;
+    // 分母兜底到 1.0：参考区全黑时比值会冲到几百，那是个假的高分。
+    const double ring_mean =
+        std::max(1.0, ring_sum.first / ring_sum.second);
+    return static_cast<float>(inner_mean / ring_mean);
 }
 
 // ---------------------------------------------------------------------------
@@ -543,11 +752,22 @@ std::vector<ArmorDetection> detectArmors(const cv::Mat& bgr, TeamColor enemy_col
         return detections;  // 一根灯条配不出板
     }
 
-    const std::vector<std::pair<LightBar, LightBar>> pairs =
-        pairLightBars(bars, params.pair);
+    const std::vector<LightBarPair> candidates = pairLightBars(bars, params.pair);
 
-    detections.reserve(pairs.size());
-    for (const std::pair<LightBar, LightBar>& pair : pairs) {
+    cv::Mat gray;
+    toGray(bgr_only, gray);  // 板面对比度要灰度；转不出来就是空矩阵，那项恒为 1.0
+
+    // 先对**每一个**候选算好草稿（角点 / 大小 / 数字）和证据，
+    // 再统一挑 —— 挑的时候要看证据（板面对比度、数字），
+    // 而这两样都必须读图，所以只能对每个候选各跑一遍。
+    // 四根灯条三个候选，就是多跑两次 HOG；28x20 的补丁很便宜。
+    std::vector<LightBarPair> kept;
+    std::vector<ArmorDetection> drafts;
+    std::vector<PairEvidence> evidence;
+    kept.reserve(candidates.size());
+    drafts.reserve(candidates.size());
+    evidence.reserve(candidates.size());
+    for (const LightBarPair& pair : candidates) {
         const std::array<cv::Point2f, 4> corners =
             buildCorners(pair.first, pair.second);
         // 四点退化：面积趋近 0 时透视变换的解已经不可信，
@@ -560,20 +780,48 @@ std::vector<ArmorDetection> detectArmors(const cv::Mat& bgr, TeamColor enemy_col
         detection.corners = corners;
         detection.size = classifySize(pair.first, pair.second);
 
+        PairEvidence proof;
+        proof.plate_face_contrast =
+            plateFaceContrast(gray, mask, pair.first, pair.second);
+
         cv::Mat patch;
         if (extractDigitPatch(bgr_only, corners, detection.size, patch,
                               params.patch)) {
             const DigitResult digit = DigitClassifier::classify(patch);
             detection.target_id = digit.target_id;
             detection.confidence = digit.confidence;
+            proof.target_id = digit.target_id;
         }
         // 抠补丁失败（或分类器不可用）时**不 continue**。
         // 角点是对的，PnP 还能用；target_id 保持默认的 0，
         // 由下游把开火闸住。把这块板丢掉的话，"检测坏了"和"分类坏了"
         // 在 Web Debug 上会变得一模一样（armor_count 都是 0）。
-        detections.push_back(detection);
+        // 证据同样保持默认（对比度 1.0、无数字），缺证据不该让这一对凭空消失。
+        kept.push_back(pair);
+        drafts.push_back(detection);
+        evidence.push_back(proof);
     }
 
+    // 一步一对：一根灯条只装在一块装甲板上。
+    // 四根灯条会配出三对相邻候选，共用中间两根 —— 不选的话同一块板会被报三次。
+    const std::vector<LightBarPair> chosen =
+        choosePairs(kept, evidence, params.pair);
+
+    detections.reserve(chosen.size());
+    for (const LightBarPair& pair : chosen) {
+        // 按两端下标回查草稿。同一对灯条只会产生一个候选，
+        // 这两个下标合起来就是唯一键。
+        for (std::size_t k = 0; k < kept.size(); ++k) {
+            if (kept[k].left_index == pair.left_index &&
+                kept[k].right_index == pair.right_index) {
+                detections.push_back(drafts[k]);
+                break;
+            }
+        }
+    }
+
+    // NMS 还留着：它管的是另一件事 —— 两块板靠得近、外接矩形真的重叠了
+    // （比如正对着看两块相邻的板）。一对一选择管不到那种重叠。
     return suppressOverlaps(detections, params.nms_iou);
 }
 

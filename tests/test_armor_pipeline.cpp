@@ -49,6 +49,33 @@ cv::Mat makeBluePlate() {
     return plate;
 }
 
+// 装甲板牌面：灰的（R-B = 0，颜色掩膜收不进来），但比背景亮。
+// 它是"这两根灯条中间确实有一块板"的**像素证据**，也是跨车/跨板假配对输掉的地方 ——
+// 假配对中间是背景，板面对比度上不去。
+const cv::Scalar kPlateFace(70.0, 70.0, 70.0);
+
+// 在两根灯条之间画一块牌面。左右各让开 8 像素，别压到灯条本体上。
+void drawFace(cv::Mat& image, float left_x, float right_x, float top_y,
+              float bottom_y) {
+    cv::rectangle(image,
+                  cv::Rect(static_cast<int>(left_x) + 8, static_cast<int>(top_y),
+                           static_cast<int>(right_x - left_x) - 16,
+                           static_cast<int>(bottom_y - top_y)),
+                  kPlateFace, cv::FILLED);
+}
+
+// 检测框的外接矩形宽度（角点来自灯条中心，所以竖直灯条配出的宽度
+// 就等于两根灯条的中心距）。
+float boxWidth(const ArmorDetection& detection) {
+    float min_x = detection.corners[0].x;
+    float max_x = detection.corners[0].x;
+    for (const cv::Point2f& corner : detection.corners) {
+        min_x = std::min(min_x, corner.x);
+        max_x = std::max(max_x, corner.x);
+    }
+    return max_x - min_x;
+}
+
 }  // namespace
 
 int main() {
@@ -363,9 +390,54 @@ int main() {
             }
         }
 
-        // 四根灯条排成一排：每根只跟相邻那根配上 → 3 块板。
-        // 修好之前这里会因为跨板大框胜出而变成别的数（实测 1）。
-        assert(found.size() == 3);
+        // 四根灯条排成一排 → **最多两块板**：一根灯条只装在一块装甲板上，
+        // 所以 b0b1、b1b2、b2b3 三个候选里只能留下互不共用的那些。
+        // 这正是"两块板并排贴在一起"的样子：内侧那两根灯条分属两块板，
+        // 各自只被自己那块板用一次。
+        //
+        // 修这一条之前这里写的是 3 —— 那是"一根灯条被两对共用"的旧行为，
+        // 也就是同一块板被报两次的来源。三个候选在这一组输入下证据全打平
+        // （中间没有牌面、没有数字），所以留下的就是 b0b1 与 b2b3。
+        assert(found.size() == 2);
+    }
+
+    // =======================================================================
+    // 两辆车各露出 4 根灯条（各 2 块板）—— 跨车的假配对不许赢
+    // =======================================================================
+    // 这是"一根灯条只用一次"最该被追问的一种输入：灯条一多，跨车的那一对
+    // 也可能几何完全合法。这里让两辆车**挨着站**（A 车最右 496、B 车最左 620，
+    // 间距 124），跨车那对 (496,620) 的间距比是 2.067、甚至比真板的 2.200
+    // 还更像小板 —— 六条配对判据它一条都不违反。
+    //
+    // 它必须输，输在**板面对比度**上：真板中间有牌面（灰度 70 对背景 20）⇒ 得分 +1，
+    // 跨车那对中间只有背景（对比度 0.615 < 1）⇒ 得分 0。同车两块板之间那几对
+    // （232,364 / 752,884）同理。
+    //
+    // ⚠️ 说清楚这条断言抓的是什么：这一组输入里所有灯条一模一样，几何自洽度
+    // **全部打平**，所以就算把板面对比度整项拿掉，贪心的定序也恰好给出同样的 4 块。
+    // ⇒ 这条断言真正的牙齿在**"一根灯条只用一次"**上：撤掉那一步会从 4 块变成 7 块。
+    // "板面对比度决定谁赢"由 test_armor_detect.cpp 里几何打平的那条断言负责。
+    {
+        cv::Mat scene(300, 1500, CV_8UC3, kBackground);
+        const float xs[8] = {100.0F, 232.0F, 364.0F, 496.0F,
+                             620.0F, 752.0F, 884.0F, 1016.0F};
+        for (int k = 0; k < 4; ++k) {  // 四块真板各画一块牌面
+            drawFace(scene, xs[2 * k], xs[2 * k + 1], 100.0F, 160.0F);
+        }
+        for (float x : xs) {
+            drawBar(scene, x, 100.0F, 160.0F, kRedBar);
+        }
+
+        const std::vector<ArmorDetection> found =
+            armor::detectArmors(scene, TeamColor::Red);
+
+        // 8 根灯条最多配出 4 块板，而且必须**全对**：
+        // 每块板的宽度都是 132（两根真灯条的中心距）。
+        // 跨车那对宽度是 124，判断依据就在这里。
+        assert(found.size() == 4);
+        for (const ArmorDetection& detection : found) {
+            assert(near(boxWidth(detection), 132.0F, 2.0F));
+        }
     }
 
     // =======================================================================
