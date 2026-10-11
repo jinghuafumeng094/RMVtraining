@@ -61,9 +61,7 @@ float pairSelfConsistency(const LightBarPair& pair, const PairCriteria& criteria
 
 }  // namespace
 
-// ---------------------------------------------------------------------------
 // LightBar
-// ---------------------------------------------------------------------------
 
 float LightBar::length() const {
     return static_cast<float>(cv::norm(bottom - top));
@@ -71,20 +69,18 @@ float LightBar::length() const {
 
 float LightBar::tiltDegrees() const {
     // 方向向量取"从上端指向下端"，即图像里的向下方向。
-    // 竖直灯条 → atan2(0, 正数) = 0°；下端偏右 → 正角；偏左 → 负角。
+    // 竖直灯条的 atan2(0, 正数) = 0°；下端偏右得正角，偏左得负角。
     // 因为约定 top.y <= bottom.y，这里 dy 恒为非负，不会出现 180° 翻转。
     const float dx = bottom.x - top.x;
     const float dy = bottom.y - top.y;
     return std::atan2(dx, dy) * 180.0F / kPi;
 }
 
-// ---------------------------------------------------------------------------
 // 纯几何
-// ---------------------------------------------------------------------------
 
 float quadSignedArea(const std::array<cv::Point2f, 4>& corners) {
     // 鞋带公式。图像坐标 y 向下，所以顺时针顺序会得到正值：
-    // 左上→右上→右下→左下 恰好是屏幕上的顺时针。
+    // 左上->右上->右下->左下 恰好是屏幕上的顺时针。
     float twice_area = 0.0F;
     for (int i = 0; i < 4; ++i) {
         const cv::Point2f& current = corners[i];
@@ -109,7 +105,7 @@ std::array<cv::Point2f, 4> buildCorners(const LightBar& left,
     corners[3] = l.bottom;  // 左下
 
     // 防御二：四点成了镜像时（有向面积为负）交换右上/左下翻回来。
-    // 按上面的定序这条不会触发，是收便宜的保险 —— 但要是哪天定序依据
+    // 按上面的定序这条不会触发，是收便宜的保险，但要是哪天定序依据
     // 从 center.x 改成 top.x，没有它就会安静地给出镜像角点。
     // 它挡不住"四点趋近共线"：那种情况面积趋近 0 而不是变负。
     if (quadSignedArea(corners) < 0.0F) {
@@ -124,7 +120,7 @@ ArmorSize classifySize(const LightBar& left, const LightBar& right,
     const float length_right = right.length();
 
     // 退化保护：任一根长度为零，比值就没有意义了。
-    // 不能只在"平均长度为零"时才拦 —— 一根 0、一根 60 时平均是 30，
+    // 不能只在"平均长度为零"时才拦，一根 0、一根 60 时平均是 30，
     // 保护不触发，间距比会被算成 4.4，反而判成大板。
     // 宁可保守判小板，也不能把垃圾输入放大成大目标。
     if (length_left <= 0.0F || length_right <= 0.0F) {
@@ -180,7 +176,7 @@ std::vector<LightBarPair> pairLightBars(const std::vector<LightBar>& bars,
             }
 
             // 判据 4：间距比落在合理区间。
-            // 这是五条里最稳的一条 —— 量纲相消，
+            // 这是五条里最稳的一条，量纲相消，
             // 与分辨率、与远近都无关。
             const float gap = static_cast<float>(cv::norm(a.center() - b.center()));
             const float gap_ratio = gap / mean_length;
@@ -191,13 +187,13 @@ std::vector<LightBarPair> pairLightBars(const std::vector<LightBar>& bars,
 
             // 判据 5：这一对之间不能夹着第三根灯条。
             //
-            // 真实装甲板中间不会竖着第三根灯条；夹着的那一对是**跨了两块板**。
+            // 真实装甲板中间不会竖着第三根灯条；夹着的那一对是跨了两块板。
             // 光靠间距比挡不住它：在实测的 20261008231729930 那帧上，
             // 跨板那对 (514, 909) 的间距比是 5.05，正好落在合法区间 [1.2, 6.0] 里，
-            // 五条判据全过。而它的外接矩形最大，NMS 按面积取大正好留它下车 ——
+            // 五条判据全过。而它的外接矩形最大，NMS 按面积取大正好留它下车，
             // 结果裁剪框落到了中间那根灯条上，"数字补丁"其实是灯条本身。
             //
-            // 纵向只在两根灯条**共同覆盖的高度带**内判，避免把背景里
+            // 纵向只在两根灯条共同覆盖的高度带内判，避免把背景里
             // 远处、纵向错开的目标误当成"夹在中间"。
             const float pair_top = std::min(a.top.y, b.top.y);
             const float pair_bottom = std::max(a.bottom.y, b.bottom.y);
@@ -222,7 +218,7 @@ std::vector<LightBarPair> pairLightBars(const std::vector<LightBar>& bars,
             }
 
             // 判据 6：左右定序，保证返回的 pair 里 first 一定在左。
-            // 下标跟着一起交换 —— 它要和 first / second 对得上，
+            // 下标跟着一起交换，它要和 first / second 对得上，
             // 否则 choosePairs 会把被占用的灯条记错。
             if (a.center().x <= b.center().x) {
                 pairs.push_back(LightBarPair{a, b, i, j});
@@ -237,12 +233,12 @@ std::vector<LightBarPair> pairLightBars(const std::vector<LightBar>& bars,
 namespace {
 
 // 一对候选的分数，越大越好：
-//   几何自洽度是**负**分 —— 0 分（最自洽）不扣，3 分（三条判据全顶格）扣满 3。
-//   板面分封顶 1 —— 免得一块特别亮的牌面把几何差异整个盖过去。
-//   数字奖励（见 kDigitScoreBonus）只在**这一对确实有板面**时才加：
+//   几何自洽度是负分：0 分（最自洽）不扣，3 分（三条判据全顶格）扣满 3。
+//   板面分封顶 1，免得一块特别亮的牌面把几何差异整个盖过去。
+//   数字奖励（见 kDigitScoreBonus）只在这一对确实有板面时才加：
 //     数字是印在牌面上的。一对中间根本没有板面的候选，分类器读出来的 1~8
 //     只能是背景上的误报，这时候给它加分等于奖励噪声。这也是唯一能挡住
-//     "跨车那对被误报出数字、反而挤掉真板"的办法 —— 光把奖励调小不够，
+//     "跨车那对被误报出数字、反而挤掉真板"的办法，光把奖励调小不够，
 //     因为板面项封顶只有 +1，奖励只要大于 1 就还是能翻盘。
 float pairScore(const LightBarPair& pair, const PairEvidence& evidence,
                 const PairCriteria& criteria) {
@@ -266,7 +262,7 @@ std::vector<LightBarPair> choosePairs(const std::vector<LightBarPair>& candidate
     // 而且 unordered 的比较函数是未定义行为。
     std::vector<float> scores(candidates.size());
     for (std::size_t k = 0; k < candidates.size(); ++k) {
-        // evidence 短了按默认值算（对比度 1.0、无数字）——
+        // evidence 短了按默认值算（对比度 1.0、无数字），
         // 缺证据不该让一对候选凭空消失。
         scores[k] = pairScore(candidates[k],
                               k < evidence.size() ? evidence[k] : PairEvidence{},
@@ -302,9 +298,7 @@ std::vector<LightBarPair> choosePairs(const std::vector<LightBarPair>& candidate
     return chosen;
 }
 
-// ---------------------------------------------------------------------------
 // 依赖图像：数字补丁裁剪
-// ---------------------------------------------------------------------------
 
 namespace {
 
@@ -334,7 +328,7 @@ bool toGray(const cv::Mat& image, cv::Mat& gray) {
 bool extractDigitPatch(const cv::Mat& image,
                        const std::array<cv::Point2f, 4>& corners, ArmorSize size,
                        cv::Mat& patch, const PatchParams& params) {
-    // 先清空。无论成功还是失败，调用方拿到的都是干净状态 ——
+    // 先清空。无论成功还是失败，调用方拿到的都是干净状态，
     // 和 get_pic 用同一个约定，免得调用方误用上一帧的补丁。
     patch.release();
 
@@ -367,7 +361,7 @@ bool extractDigitPatch(const cv::Mat& image,
     // 正射前先把四边形绕中心撑大：检测出的四边形只框住两根灯条，
     // 而牌面上的图案比灯条高一截，照着原四边形裁会切掉图案的上下缘。
     // 撑大的只是这里的局部副本，检测输出的角点（要喂给 PnP）不受影响。
-    // 必须是"在原图上撑开再正射"——反过来在规范板里取大窗没用，
+    // 必须是"在原图上撑开再正射"，反过来在规范板里取大窗没用，
     // 四边形外面没有真实像素，取到的只是边缘拉丝。
     const cv::Point2f quad_center =
         (corners[0] + corners[1] + corners[2] + corners[3]) * 0.25F;
@@ -413,7 +407,7 @@ bool extractDigitPatch(const cv::Mat& image,
     // ---- 缩放 + 二值化 ----
     // 顺序很重要：必须"先缩放、再阈值"。
     // 反过来的话，INTER_AREA 会把 0/255 平均成中间灰度，输出就不再是
-    // 训练数据那种 {0,255} 二值图 —— 而且不会报任何错，只是准确率悄悄掉。
+    // 训练数据那种 {0,255} 二值图，而且不会报任何错，只是准确率悄悄掉。
     cv::Mat resized;
     cv::resize(box, resized, cv::Size(params.out_width, params.out_height), 0.0,
                0.0, cv::INTER_AREA);
@@ -427,9 +421,7 @@ bool extractDigitPatch(const cv::Mat& image,
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// 板面对比度 —— 配对阶段用的第二个证据
-// ---------------------------------------------------------------------------
+// 板面对比度，配对阶段用的第二个证据
 
 namespace {
 
@@ -494,7 +486,7 @@ float plateFaceContrast(const cv::Mat& gray, const cv::Mat& mask,
         return 1.0F;  // 退化几何：给中性值，别让它凭空得分
     }
 
-    // 内区：两根灯条之间。横向各内缩 0.2*gap，避开灯条边缘的过渡带 ——
+    // 内区：两根灯条之间。横向各内缩 0.2*gap，避开灯条边缘的过渡带，
     // 那里是"红转背景"的斜面，把它算进板面会稀释真板的对比度。
     const float inner_x0 = left.center().x + 0.2F * gap;
     const float inner_x1 = right.center().x - 0.2F * gap;
@@ -514,7 +506,7 @@ float plateFaceContrast(const cv::Mat& gray, const cv::Mat& mask,
     }
 
     // 内区不剔灯条像素：真框进来了说明这块牌面本来就窄，不该假装没看见。
-    // 参考环必须剔 —— 灯条本体是亮红，混进参考均值会把分母抬起来，
+    // 参考环必须剔，灯条本体是亮红，混进参考均值会把分母抬起来，
     // 板越近抬得越狠，正好把最该选的那一对压下去。
     const std::pair<double, int> inner_sum =
         sumGray(gray, mask, inner, /*exclude_mask=*/false, cv::Rect());
@@ -531,15 +523,13 @@ float plateFaceContrast(const cv::Mat& gray, const cv::Mat& mask,
     return static_cast<float>(inner_mean / ring_mean);
 }
 
-// ---------------------------------------------------------------------------
 // 颜色掩膜
-// ---------------------------------------------------------------------------
 
 cv::Mat buildColorMask(const cv::Mat& bgr, TeamColor enemy_color,
                        const MaskParams& params) {
     // 只收三通道 BGR。灰度图没有颜色、BGRA 该由调用方先转掉
     // （detectArmors 在入口统一做这件事）。
-    // 这里直接返回空矩阵，而不是内部猜一个通道顺序 ——
+    // 这里直接返回空矩阵，而不是内部猜一个通道顺序，
     // 猜错不会有任何提示，整条管线会安静地全错。
     if (bgr.empty() || bgr.type() != CV_8UC3) {
         return cv::Mat();
@@ -552,10 +542,10 @@ cv::Mat buildColorMask(const cv::Mat& bgr, TeamColor enemy_color,
     const cv::Mat& main = is_blue ? channels[0] : channels[2];
     const cv::Mat& other = is_blue ? channels[2] : channels[0];
 
-    // 有符号的差。cv::subtract 对 CV_8U 是**饱和**减法：
+    // 有符号的差。cv::subtract 对 CV_8U 是饱和减法：
     // 负数截成 0，所以传入蓝色时等价于 max(B - R, 0)，正是想要的"只留该颜色的灯条"。
     //
-    // 换成 cv::absdiff 就是 |B - R| —— 红队和蓝队看到一模一样的结果，
+    // 换成 cv::absdiff 就是 |B - R|，红队和蓝队看到一模一样的结果，
     // 对面队伍的车全都变成目标。这是本函数唯一的坑，而且它不报错。
     cv::Mat diff;
     cv::subtract(main, other, diff);
@@ -573,9 +563,7 @@ cv::Mat buildColorMask(const cv::Mat& bgr, TeamColor enemy_color,
     return mask;
 }
 
-// ---------------------------------------------------------------------------
 // 灯条提取
-// ---------------------------------------------------------------------------
 
 std::vector<LightBar> extractLightBars(const cv::Mat& mask,
                                        const BarParams& params) {
@@ -588,7 +576,7 @@ std::vector<LightBar> extractLightBars(const cv::Mat& mask,
     // RETR_EXTERNAL：只要最外层轮廓。
     // 灯条过曝时中间会烧成白、边缘反而偏暗，用 RETR_LIST / RETR_TREE
     // 会把同一根灯条拆成里外两三个轮廓，每一圈都被当成独立灯条去配对，
-    // 于是同一块板配出一堆假目标 —— 而且看起来"检测很灵"。
+    // 于是同一块板配出一堆假目标，而且看起来"检测很灵"。
     cv::findContours(mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
 
     bars.reserve(contours.size());
@@ -599,7 +587,7 @@ std::vector<LightBar> extractLightBars(const cv::Mat& mask,
 
         const cv::RotatedRect rect = cv::minAreaRect(contour);
 
-        // 用四条边的长度分长短边，**刻意不看 rect.angle**。
+        // 用四条边的长度分长短边，刻意不看 rect.angle。
         // OpenCV 4.5 起 angle 的取值区间和符号语义都改过（3.x 是 [-90,0)，
         // 4.5 是 [0,90)），靠它判断哪条边是长边会随版本变；
         // 直接比边长没有任何歧义。
@@ -611,8 +599,8 @@ std::vector<LightBar> extractLightBars(const cv::Mat& mask,
         const float short_side = edge0_is_short ? edge0 : edge1;
         const float long_side = edge0_is_short ? edge1 : edge0;
 
-        // 长边门槛。它比的是**灯条自己的长度**（沿灯条方向），
-        // 不是画面里的竖直高度 —— 斜着的灯条竖直跨度可以远小于长度。
+        // 长边门槛。它比的是灯条自己的长度（沿灯条方向），
+        // 不是画面里的竖直高度，斜着的灯条竖直跨度可以远小于长度。
         // 这个参数原来叫 min_height，那个名字已经误导过一次讨论，别再改回去。
         // 它同时是"最远能看多远"的那个闸，理由写在 BarParams 的注释里。
         if (short_side <= 0.0F || long_side < params.min_long_side) {
@@ -623,9 +611,9 @@ std::vector<LightBar> extractLightBars(const cv::Mat& mask,
             continue;
         }
 
-        // 灯条的两端 = 两条**短边**的中点。
+        // 灯条的两端 = 两条短边的中点。
         // 矩形四点是按顺序绕一圈的，所以短边要么是 (0,1) 和 (2,3)，
-        // 要么是 (1,2) 和 (3,0) —— 由上面比出来的结果选一组。
+        // 要么是 (1,2) 和 (3,0)，由上面比出来的结果选一组。
         LightBar bar;
         if (edge0_is_short) {
             bar.top = (pts[0] + pts[1]) * 0.5F;
@@ -635,7 +623,7 @@ std::vector<LightBar> extractLightBars(const cv::Mat& mask,
             bar.bottom = (pts[3] + pts[0]) * 0.5F;
         }
         // 落到约定的 top.y <= bottom.y。minAreaRect 给的点序
-        // 跟朝向有关，不保证哪一头在上面，所以必须显式对齐一次 ——
+        // 跟朝向有关，不保证哪一头在上面，所以必须显式对齐一次，
         // tiltDegrees() 的正负号全押在这个约定上。
         if (bar.top.y > bar.bottom.y) {
             std::swap(bar.top, bar.bottom);
@@ -645,15 +633,13 @@ std::vector<LightBar> extractLightBars(const cv::Mat& mask,
     return bars;
 }
 
-// ---------------------------------------------------------------------------
 // 去重
-// ---------------------------------------------------------------------------
 
 namespace {
 
 // 四边形角点的轴对齐外接矩形。
 //
-// 注意 cv::boundingRect 对**点集**用的是含两端的约定：
+// 注意 cv::boundingRect 对点集用的是含两端的约定：
 // 宽 = x_max - x_min + 1，高 = y_max - y_min + 1。
 // 所以四点跨 200 像素时给出的宽是 201，不是一个笔误。
 // 后果是这里的 IoU 会比"按坐标区间手算"略大一点点
@@ -721,15 +707,13 @@ std::vector<ArmorDetection> suppressOverlaps(
     return kept;
 }
 
-// ---------------------------------------------------------------------------
 // 检测串联
-// ---------------------------------------------------------------------------
 
 std::vector<ArmorDetection> detectArmors(const cv::Mat& bgr, TeamColor enemy_color,
                                          const DetectParams& params) {
     std::vector<ArmorDetection> detections;
 
-    // 通道格式在**入口归一化一次**，后面每一级都只面对三通道 BGR。
+    // 通道格式在入口归一化一次，后面每一级都只面对三通道 BGR。
     // 已经是三通道时不复制，只是让两个名字指向同一块数据。
     // 归一化只做这一处：分散到各级去做的话，多一处就多一处漏掉的可能。
     cv::Mat bgr_only;
@@ -757,8 +741,8 @@ std::vector<ArmorDetection> detectArmors(const cv::Mat& bgr, TeamColor enemy_col
     cv::Mat gray;
     toGray(bgr_only, gray);  // 板面对比度要灰度；转不出来就是空矩阵，那项恒为 1.0
 
-    // 先对**每一个**候选算好草稿（角点 / 大小 / 数字）和证据，
-    // 再统一挑 —— 挑的时候要看证据（板面对比度、数字），
+    // 先对每一个候选算好草稿（角点 / 大小 / 数字）和证据，
+    // 再统一挑，挑的时候要看证据（板面对比度、数字），
     // 而这两样都必须读图，所以只能对每个候选各跑一遍。
     // 四根灯条三个候选，就是多跑两次 HOG；28x20 的补丁很便宜。
     std::vector<LightBarPair> kept;
@@ -792,7 +776,7 @@ std::vector<ArmorDetection> detectArmors(const cv::Mat& bgr, TeamColor enemy_col
             detection.confidence = digit.confidence;
             proof.target_id = digit.target_id;
         }
-        // 抠补丁失败（或分类器不可用）时**不 continue**。
+        // 抠补丁失败（或分类器不可用）时不 continue。
         // 角点是对的，PnP 还能用；target_id 保持默认的 0，
         // 由下游把开火闸住。把这块板丢掉的话，"检测坏了"和"分类坏了"
         // 在 Web Debug 上会变得一模一样（armor_count 都是 0）。
@@ -803,7 +787,7 @@ std::vector<ArmorDetection> detectArmors(const cv::Mat& bgr, TeamColor enemy_col
     }
 
     // 一步一对：一根灯条只装在一块装甲板上。
-    // 四根灯条会配出三对相邻候选，共用中间两根 —— 不选的话同一块板会被报三次。
+    // 四根灯条会配出三对相邻候选，共用中间两根，不选的话同一块板会被报三次。
     const std::vector<LightBarPair> chosen =
         choosePairs(kept, evidence, params.pair);
 
@@ -820,7 +804,7 @@ std::vector<ArmorDetection> detectArmors(const cv::Mat& bgr, TeamColor enemy_col
         }
     }
 
-    // NMS 还留着：它管的是另一件事 —— 两块板靠得近、外接矩形真的重叠了
+    // NMS 还留着：它管的是另一件事，两块板靠得近、外接矩形真的重叠了
     // （比如正对着看两块相邻的板）。一对一选择管不到那种重叠。
     return suppressOverlaps(detections, params.nms_iou);
 }

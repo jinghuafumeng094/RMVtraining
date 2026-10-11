@@ -14,24 +14,24 @@ namespace {
 
 // 装甲板物理尺寸(m)。来源：仓库根目录 装甲板尺寸.txt（135 x 57 / 230 x 57 mm）。
 // 板上的数字编码了尺寸（序号 1~5 小板、6~8 大板），所以 size 判错时距离会按
-// 错误的比例解出来，而且**不报错** —— 只是数字凭空差一截。
+// 错误的比例解出来，而且不报错，只是数字凭空差一截。
 constexpr double kSmallWidthM = 0.135;
 constexpr double kLargeWidthM = 0.230;
 constexpr double kPlateHeightM = 0.057;
 
 // 观测拒绝阈值。任务书 §3.5 点名要拒绝三类：PnP 失败、深度非法、误差异常。
-// 这三个数是**用合成数据探针实测定的**（/tmp 上的一次性程序，不是拍脑袋）：
-//   · 正常角点（自己投自己解）重投影误差 = 0.000 px
-//   · 单个角点被拉开 10 px → 2.2 px；拉开 30 px → 7.0 px；拉开 60 px → 14.4 px
-//   所以 5 px 大致相当于「某个角点错了 20 px 量级」，是"明显不对"而不是"抖了一下"。
-// 深度上下限是物理约束：近于 5 cm 板已贴在镜头上，远于 30 m 超过 RM 场地长度
-// （场地 28 m），两种都不可能是真目标，只会是把角点缩爆/拉爆后解出来的假位姿。
+// 这三个数是用合成数据探针实测定的，探针在仓库外，不是拍脑袋：
+//   正常角点（自己投自己解）重投影误差 = 0.000 px
+//   单个角点被拉开 10 px -> 2.2 px；30 px -> 7.0 px；60 px -> 14.4 px
+// 所以 5 px 大致相当于某个角点错了 20 px 量级，是"明显不对"而不是"抖了一下"。
+// 深度上下限是物理约束：近于 5 cm 板已贴在镜头上，远于 30 m 超过场地长度
+// （场地 28 m），两种都不可能是真目标，只会是把角点缩爆或拉爆后解出来的假位姿。
 //
 // 2026-10-11 拿真实帧补量了角点抖动，探针 corner_jitter 在仓库外：
-//   三帧静止的板，距离 1.08 m，重投影误差 0.70~0.79 px、深度 1.083~1.088 m，
-//   同一个角点在任意两帧之间最多动 1.41 px。5 px 的闸门有 3.5 倍以上余量。
-//   ⚠️ 这只是**最容易**的那种目标：近距离、正对、曝光正常，而且这三帧的角点落在
-//   整数像素上，亚像素抖动量不出来。远处的小目标抖得更厉害，**别据此收紧闸门**。
+// 三帧静止的板，距离 1.08 m，重投影误差 0.70~0.79 px、深度 1.083~1.088 m，
+// 同一个角点在任意两帧之间最多动 1.41 px。5 px 的闸门有 3.5 倍以上余量。
+// 这只是最容易的那种目标：近距离、正对、曝光正常，而且这三帧的角点落在
+// 整数像素上，亚像素抖动量不出来。远处的小目标抖得更厉害，别据此收紧闸门。
 // 现在宁可松一点：误拒一个好目标比放进一个坏观测更难查。
 constexpr double kMaxReprojectionErrorPx = 5.0;
 constexpr double kMinDepthM = 0.05;
@@ -59,7 +59,7 @@ cv::Vec3d toVec3d(const cv::Mat& column) {
 
 // 任务 1：相机取流。
 //
-// 真正碰 MVS SDK 的地方全在 HikCamera 里，这里只管一件事：**进程内只开一次**。
+// 真正碰 MVS SDK 的地方全在 HikCamera 里，这里只管一件事：进程内只开一次。
 // 函数局部 static 的初始化从 C++11 起是线程安全的，所以第一次调用时打开相机，
 // 之后每帧复用同一个句柄；失败一律返回 false，不往上抛也不终止进程。
 bool get_pic(cv::Mat& pic) {
@@ -67,19 +67,17 @@ bool get_pic(cv::Mat& pic) {
     return camera.grab(pic);
 }
 
-// ↓↓↓ 下面两个函数先原样留着，第四、五课再填 ↓↓↓
 std::vector<ArmorDetection> armor_detect(const cv::Mat& image, TeamColor enemy_color) {
-    // 整条检测管线都在 ArmorDetector 里：颜色掩膜 → 灯条提取 → 配对
-    // → 角点 → 大小分类 → 去重 → 数字分类。
-    // 这里只做转发，保持本文件是"把各部分接起来"的地方，
-    // 算法本身留在 ArmorDetector，能脱离相机单独测。
+    // 整条检测管线都在 ArmorDetector 里：颜色掩膜 -> 灯条提取 -> 配对 -> 角点
+    // -> 大小分类 -> 去重 -> 数字分类。这里只做转发，
+    // 让本文件负责"把各部分接起来"，算法本身留在 ArmorDetector，能脱离相机单独测。
     return armor::detectArmors(image, enemy_color);
 }
 
 // 任务 3：装甲板位姿解算。
 //
-// 用已标定的内参 + 装甲板已知物理尺寸做 PnP，得到板心在**相机系**中的位置，
-// 再用外参把它刚体变换到**云台系**。
+// 用已标定的内参 + 装甲板已知物理尺寸做 PnP，得到板心在相机系中的位置，
+// 再用外参把它刚体变换到云台系。
 //
 // 云台角度(gimbal)在这里用不上：外参 R/t 已经把相机系映射到云台系，
 // 而云台系本身就是跟着云台转的那个系，当前角度不是这条变换的输入。
@@ -88,7 +86,7 @@ std::vector<ArmorPose> armor_solve(const std::vector<ArmorDetection>& detections
                                    const GimbalState&) {
     std::vector<ArmorPose> poses;
 
-    // 没标定就不许解算。返回空，而不是拿占位参数硬算 ——
+    // 没标定就不许解算。返回空，而不是拿占位参数硬算，
     // 后者给出的距离看着正常、实际全错，比"没有结果"难查得多。
     if (!camera.valid()) {
         return poses;
@@ -102,13 +100,13 @@ std::vector<ArmorPose> armor_solve(const std::vector<ArmorDetection>& detections
     poses.reserve(detections.size());
     for (const ArmorDetection& detection : detections) {
         // 角点合法性闸，两种坏输入一起挡：
-        //   · 面积接近 0（四点重合/共线）：solvePnP **不会失败**，会给出一个把板
-        //     压成一点的解，重投影误差还是 0 —— 静默错误。
-        //   · 面积为**负**：说明角点顺序反了。ArmorDetector.hpp:70 写着「顺序正确
-        //     时为正」，所以负号本身就是输入非法的信号。这种输入 PnP 会给出一个
-        //     **位置正确、法向翻转**的镜像解，重投影误差**仍然是 0** —— 靠误差和
-        //     深度都拦不住，只有符号能拦。
-        // 注意这里**不取绝对值**：取绝对值就等于把"顺序反了"当成正常输入放行。
+        //   面积接近 0（四点重合或共线）：solvePnP 不会失败，会给出一个把板
+        //   压成一点的解，重投影误差还是 0，是静默错误。
+        //   面积为负：说明角点顺序反了。ArmorDetector.hpp:70 写着「顺序正确时
+        //   为正」，所以负号本身就是输入非法的信号。这种输入 PnP 会给出一个
+        //   位置正确、法向翻转的镜像解，重投影误差仍然是 0，靠误差和深度都
+        //   拦不住，只有符号能拦。
+        // 注意这里不取绝对值：取绝对值就等于把"顺序反了"当成正常输入放行。
         if (armor::quadSignedArea(detection.corners) < 1.0F) {
             continue;
         }
@@ -126,7 +124,7 @@ std::vector<ArmorPose> armor_solve(const std::vector<ArmorDetection>& detections
 
         // 深度非法就丢（任务书 §3.5）。
         // solvePnP 返回 true 不代表解是物理上可能的：把角点缩到 2% 时它给的距离是
-        // 100 m，角点摆成蝶形时给过 z = 5e11 —— 两种情况 solvePnP **都返回成功**，
+        // 100 m，角点摆成蝶形时给过 z = 5e11。两种情况 solvePnP 都返回成功，
         // 重投影误差还可能是 0。所以只能自己按物理范围兜一道。
         const double depth = tvec[2];
         if (!std::isfinite(depth) || depth < kMinDepthM || depth > kMaxDepthM) {
@@ -134,8 +132,9 @@ std::vector<ArmorPose> armor_solve(const std::vector<ArmorDetection>& detections
         }
 
         // 单次观测的重投影误差：把解出来的位姿再投回图像，和实测角点比。
-        // 这是这一条观测的自洽度，不是标定精度。注意它**看不见约定错误**：
-        // 物体系轴指反、大小分类用错，重投影误差照样接近 0。
+        // 这是这条观测的自洽度，不是标定精度。角点被拉开、灯条配错时它会涨上去，
+        // 而面积和深度都还正常。注意它看不见约定错误，物体系轴指反、大小分类
+        // 用错，重投影误差照样接近 0，那类问题只能靠 test_armor_solve 的断言钉住。
         std::vector<cv::Point2f> reprojected;
         cv::projectPoints(object, rvec, tvec, camera_matrix, distortion,
                           reprojected);
@@ -145,10 +144,7 @@ std::vector<ArmorPose> armor_solve(const std::vector<ArmorDetection>& detections
         }
         error_px /= static_cast<double>(image.size());
 
-        // 误差异常就丢（任务书 §3.5）。这是这条观测的**自洽度**：解出来的位姿再投
-        // 回图像，和实测角点差多远。角点被拉开、灯条配错时它会涨上去，而面积和深度
-        // 都还正常。注意它**看不见约定错误** —— 物体系轴指反、大小分类用错，
-        // 重投影误差照样接近 0，那类问题只能靠 test_armor_solve 的断言钉住。
+        // 误差异常就丢（任务书 §3.5）。
         if (!std::isfinite(error_px) || error_px > kMaxReprojectionErrorPx) {
             continue;
         }
@@ -180,6 +176,7 @@ std::vector<ArmorPose> armor_solve(const std::vector<ArmorDetection>& detections
     return poses;
 }
 
+// 任务 4：EKF 跟踪与预测。第五课再填，先返回空。
 PredictionResult ekf_predict(const std::vector<ArmorPose>&, const GimbalState&,
                              double) {
     return {};

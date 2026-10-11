@@ -14,19 +14,19 @@ namespace {
 
 // 类别表。索引 = 喂给 SVM 的标签。
 // 顺序就是数据集目录的字典序：1 2 3 4 5 6outpost 7guard 8base 9neg。
-// tools/train_digit_svm.cpp 用同一张表打标签，两边必须一致 ——
+// tools/train_digit_svm.cpp 用同一张表打标签，两边必须一致，
 // 不一致的话准确率会正常显示，但每个数字都指向错的装甲板，而且不报错。
 constexpr const char* kClassNames[] = {
     "1", "2", "3", "4", "5", "6outpost", "7guard", "8base", "9neg"};
 
-// label → target_id。9neg 是"这块 ROI 里没有数字"，所以给 0。
+// label 到 target_id 的映射。9neg 是"这块 ROI 里没有数字"，所以给 0。
 constexpr int kTargetIds[] = {1, 2, 3, 4, 5, 6, 7, 8, 0};
 
 // HOG 参数，和训练程序用的是同一套。
-//   winSize   (20,28)  整幅补丁
-//   cellSize  (5,7)    → 20/5 = 4 列，28/7 = 4 行，共 4x4 个 cell
-//   blockSize (10,14)  → 2x2 个 cell
-//   blockStride (5,7)  → 步进 1 个 cell，所以 block 是 3x3 = 9 个
+//   winSize     (20,28)  整幅补丁
+//   cellSize    (5,7)    20/5 = 4 列，28/7 = 4 行，共 4x4 个 cell
+//   blockSize   (10,14)  2x2 个 cell
+//   blockStride (5,7)    步进 1 个 cell，所以 block 是 3x3 = 9 个
 //   9 block x 4 cell x 9 bin = 324 维
 // 放进函数内静态变量：HOGDescriptor 构造要算一堆内部表，
 // 每帧重造是浪费；C++11 起函数内静态变量的初始化是线程安全的。
@@ -41,10 +41,10 @@ cv::HOGDescriptor& hog() {
 //
 // 这里解释为什么置信度要自己算，不能用 predict 的输出：
 // 9 类 SVM 在 OpenCV 里是 one-vs-one，共 9*8/2 = 36 个二分类器。
-// 多类情况下 `predict(..., RAW_OUTPUT)` **返回的是类别标签本身**，不是决策函数值
+// 多类情况下 `predict(..., RAW_OUTPUT)` 返回的是类别标签本身，不是决策函数值
 // （实测：类 1 的样本 raw 恒为 0.0，类 2 恒为 1.0，…… 类 9neg 恒为 8.0）。
-// 拿它当 margin ⇒ 置信度变成"预测出哪个数字"的纯函数，跟输入图像毫无关系，
-// 而且看起来还挺像回事（数字越大越"可信"）—— 这是最难发现的那种错。
+// 拿它当 margin，置信度就成了"预测出哪个数字"的纯函数，跟输入图像毫无关系，
+// 而且看起来还挺像回事（数字越大越"可信"），这是最难发现的那种错。
 //
 // 好在二分类器本身是拿得到的：线性核下 OpenCV 把每个二分类器压缩成
 // "一个原始权重向量 + 一个偏置 rho"，getSupportVectors() 的每一行就是一个权重。
@@ -92,7 +92,7 @@ const char* defaultModelPath() {
 // 模型丢了是要降级运行，不是要让整个程序挂掉。
 //
 // 只接受"线性核 + one-vs-one 压缩形式"的模型。别的核（比如 RBF）
-// 取不到每对的原始权重，置信度就只能退化成常数 —— 与其那样，
+// 取不到每对的原始权重，置信度就只能退化成常数，与其那样，
 // 不如在这里明确拒绝，让问题暴露在加载阶段而不是答辩现场。
 bool tryLoadLocked(const std::string& path) {
     try {
@@ -176,7 +176,7 @@ int DigitClassifier::targetIdForLabel(int label) {
 
 std::vector<float> DigitClassifier::describe(const cv::Mat& patch) {
     std::vector<float> descriptor;
-    // 三个条件缺一不可。尺寸判断要写 cols/rows 而不是 rows/cols ——
+    // 三个条件缺一不可。尺寸判断要写 cols/rows 而不是 rows/cols，
     // 20 和 28 反了的话，HOG 会算出完全不同的特征，而且一声不吭。
     if (patch.empty() || patch.type() != CV_8UC1 ||
         patch.cols != kPatchWidth || patch.rows != kPatchHeight) {
@@ -258,13 +258,13 @@ DigitResult DigitClassifier::classify(const cv::Mat& patch) {
     const int label = static_cast<int>(label_out.at<float>(0) + 0.5F);
     result.target_id = targetIdForLabel(label);
 
-    // ---- 置信度：冠军类在所有对局里的**最小**间隔 ----
+    // 置信度：冠军类在所有对局里的最小间隔
     //
     // 取最小值而不是平均值：只要有一个对手没被明显压住，就不该报高置信度。
     // 这正是"这个数字和某个易混数字之间只差一点"的样子。
     //
     // 间隔带符号：> 0 表示冠军确实赢了这个对手。所以 sigmoid 出来的值
-    // 天然落在 (0,1) 且以 0.5 为界 —— 低于 0.5 就意味着
+    // 天然落在 (0,1) 且以 0.5 为界，低于 0.5 就意味着
     // "预测出的这个类，至少输给过某个对手"，是实打实的没把握。
     bool have_margin = false;
     float worst = 0.0F;
@@ -293,7 +293,7 @@ DigitResult DigitClassifier::classify(const cv::Mat& patch) {
     // 关于置信度的诚实说明：
     // C++ 版的 cv::ml::SVM 没有 setProbability/getProbability
     // （Python 版才有），所以拿不到标定概率。这里给的是
-    // "最小间隔经过 sigmoid" 的单调映射 ——
+    // "最小间隔经过 sigmoid" 的单调映射，
     // 它只保证"离分界面越远越大"，不是"有 92% 的概率是这个数字"。
     // 用它排序、显示、卡阈值都可以，但当概率解释会错。
     result.confidence = 1.0F / (1.0F + std::exp(-worst));
