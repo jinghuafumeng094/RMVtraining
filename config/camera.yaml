@@ -45,7 +45,7 @@ distortion_coefficients: !!opencv-matrix
 # 相机坐标系 -> 云台坐标系的旋转矩阵 R_gimbal_camera。
 # 按上面的轴向约定，两系各轴同向，故取单位阵（刚体变换要求正交且 det = +1，成立）。
 #
-# ⚠️ 本项与「相机光轴是否与枪管平行」是两回事，别混。
+# 本项与「相机光轴是否与枪管平行」是两回事，别混。
 #    若相机支架本身存在安装偏角，那是一个**真实的物理旋转**，与坐标系怎么命名无关，
 #    需另行标定（固定棋盘格 + 云台扫位姿 + cv::calibrateHandEye）；R = I 只覆盖"命名"这一层。
 rotation_camera_to_gimbal: !!opencv-matrix
