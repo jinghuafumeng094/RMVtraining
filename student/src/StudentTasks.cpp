@@ -12,9 +12,9 @@
 
 namespace {
 
-// 装甲板物理尺寸(m)。来源：仓库根目录 装甲板尺寸.txt（135 x 57 / 230 x 57 mm）。
-// 板上的数字编码了尺寸（序号 1~5 小板、6~8 大板），所以 size 判错时距离会按
-// 错误的比例解出来，而且不报错，只是数字凭空差一截。
+// 装甲板物理尺寸(m)。来源：仓库根目录 装甲板尺寸.txt，写成 135 x 57 / 230 x 57 mm。
+// size 由两灯条间距比纯几何判出，和读到的数字无关，所以 7 配小板是正常输出。
+// 但 size 判错时距离会按错误的比例解出来，而且不报错，只是数字凭空差一截。
 constexpr double kSmallWidthM = 0.135;
 constexpr double kLargeWidthM = 0.230;
 constexpr double kPlateHeightM = 0.057;
