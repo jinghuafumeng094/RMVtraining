@@ -737,6 +737,11 @@ std::vector<ArmorDetection> detectArmors(const cv::Mat& bgr, TeamColor enemy_col
     }
 
     const std::vector<LightBarPair> candidates = pairLightBars(bars, params.pair);
+    if (candidates.empty()) {
+        // 没有候选对时，下面那次整帧转灰和逐候选读图全是白跑。
+        // 提前返回和跑完再返回等价：空的候选列表过完 choosePairs 还是空。
+        return detections;
+    }
 
     cv::Mat gray;
     toGray(bgr_only, gray);  // 板面对比度要灰度；转不出来就是空矩阵，那项恒为 1.0
@@ -768,8 +773,12 @@ std::vector<ArmorDetection> detectArmors(const cv::Mat& bgr, TeamColor enemy_col
         proof.plate_face_contrast =
             plateFaceContrast(gray, mask, pair.first, pair.second);
 
+        // 这里传已经转好的 gray，不要传 bgr_only。
+        // extractDigitPatch 内部见到三通道会再转一次整帧灰度，
+        // 每个候选白花一次；传单通道则只共享数据，不转换也不分配。
+        // 两种输入产出的补丁逐字节相同，实测见 testrig/detect_profile。
         cv::Mat patch;
-        if (extractDigitPatch(bgr_only, corners, detection.size, patch,
+        if (extractDigitPatch(gray, corners, detection.size, patch,
                               params.patch)) {
             const DigitResult digit = DigitClassifier::classify(patch);
             detection.target_id = digit.target_id;
