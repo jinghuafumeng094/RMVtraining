@@ -334,8 +334,15 @@ bool ArmorEkf::tryInitialize(const ArmorPose& observation, double gimbal_yaw) {
 
     // 把观测到的板心当作 0 号板，反推旋转中心。编号是任意的全局相位，
     // 取 0 号不影响物理，后续会随观测自动纠正。
+    //
+    // 反推要用的方位角是"旋转中心指向板心"的径向方位。板装在外侧、板面朝外，
+    // 而检测条件是板面法向朝向相机，所以这块板的径向方向与"板心指向相机"
+    // 同向，也就是板心视线的反方位。取板心相对世界原点的方位角是反的 180 度，
+    // 只有车心恰在世界原点时才碰巧相等。
+    // 初始中心误差由此从 2r*cos(delta/2) 降到 2r*sin(delta/2)，
+    // delta 是该板被看到的斜角，可见范围内不超过锥角。
     x_.setZero();
-    x_[Yaw] = wrapToPi(std::atan2(init_mean_.y(), init_mean_.x()));
+    x_[Yaw] = wrapToPi(std::atan2(-init_mean_.y(), -init_mean_.x()));
     x_[Radius1] = config_.initial_radius_m;
     x_[Radius2] = config_.initial_radius_m;
     x_[Px] = init_mean_.x() - config_.initial_radius_m * std::cos(x_[Yaw]);

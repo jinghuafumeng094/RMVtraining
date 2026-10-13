@@ -1,15 +1,18 @@
 // ArmorEkf 的离线烟测。
 //
-// 这不是验收手段，验收以上车实测为准。它只负责在上车前把低层错误挡掉：
-// 坐标变换的符号、解析雅可比、状态机时序、安全不变量。
+// 这不是验收手段，验收以上车实测为准。它负责在上车前把低层错误挡掉：
+// 坐标变换的符号、解析雅可比、初始化的方位角方向、无噪自洽收敛、
+// 状态机时序、安全不变量。
 // 运行：ctest -R ekf_predict
 
 #include "ArmorEkf.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 
 namespace {
 
@@ -26,11 +29,13 @@ struct Truth {
     double radius2{0.22};
 };
 
-// 四块板的高度刻意取得不完全相同。等半径等高时，把整块板的编号错开两位、
-// 同时把 theta_c 偏移 pi，会得到一模一样的一组板心，状态不可辨识，
-// 收敛断言就没有意义了。半径也刻意取 r1 不等于 r2，把奇数编号错开一位同理。
+// 板高一律取 0，与 config 的出厂默认一致，也就与实车（标准步兵四块板等高）
+// 一致。以前这里给 2 号板 0.15 m 的抬高，目的是打破"板环整体挪两格"的等价
+// 关系，好让 theta_c 的断言有唯一解。实测这个抬高在真实可见性下会把收敛
+// 拖慢到几千帧、还随起始朝向时好时坏，而它想解决的"板环等价"本来就该在
+// 断言里避开，不该靠改物理配置绕过去。见下面无噪收敛用例的注释。
 std::array<double, 4> testHeights() {
-    return {0.0, 0.0, 0.15, 0.0};
+    return {0.0, 0.0, 0.0, 0.0};
 }
 
 Eigen::Vector3d truePlateWorld(const Truth& truth, int index,
@@ -65,12 +70,73 @@ ArmorEkf::StateVector truthVector(const Truth& truth) {
     return x;
 }
 
-// 一帧喂满 config.plate_count 块板，全部由真值经观测模型生成，无噪声。
-// 板数取配置值而不是写死 4：两块板的车与前哨站都要能走同一条收敛路径。
+// 可见性锥角，与 testrig/ekf_trace 的 visiblePlates 同一条判据。
+// 检测器只输出板面朝向相机的板：板装在外侧、板面朝外，法向就是板心相对
+// 旋转中心的径向，所以判据是"板面法向与指向相机的方向夹角在锥角以内"。
+constexpr double kVisibilityConeRad = 80.0 * kPi / 180.0;
+
+bool plateFacesCamera(const Truth& truth, int index, const ArmorEkf::Config& config) {
+    const Eigen::Vector3d plate = truePlateWorld(truth, index, config);
+    const double psi =
+        truth.yaw + static_cast<double>(index) * config.plate_spacing_rad;
+    const Eigen::Vector3d normal(std::cos(psi), std::sin(psi), 0.0);
+    return normal.dot(-plate.normalized()) > std::cos(kVisibilityConeRad);
+}
+
+// 模型给出的板位。测试自己按观测模型的公式算一遍，不调被测代码的
+// platePositionWorld：那是私有的，而且自查要能发现模型本身写错。
+Eigen::Vector3d modelPlateWorld(const ArmorEkf::StateVector& x, int index,
+                                const ArmorEkf::Config& config) {
+    const double psi =
+        x[ArmorEkf::Yaw] + static_cast<double>(index) * config.plate_spacing_rad;
+    const double radius =
+        (index % 2 == 0) ? x[ArmorEkf::Radius1] : x[ArmorEkf::Radius2];
+    return Eigen::Vector3d(
+        x[ArmorEkf::Px] + radius * std::cos(psi),
+        x[ArmorEkf::Py] + radius * std::sin(psi),
+        x[ArmorEkf::Pz] + config.plate_height_m[static_cast<std::size_t>(index)]);
+}
+
+// 板位按集合比，不按槽位比。逐块板找最近的真值板，返回最差的那一对距离。
+// 四块板等高时"槽位整体挪两格、theta_c 加 pi"与"挪一格、theta_c 减 90 度、
+// r1 与 r2 互换"都是精确等价变换，中心、速度、角速度、半径多重集在等价
+// 轨道上完全相同，只有槽位标签会换。锁在哪一支都对物理没有影响，所以对
+// 板位只能提集合，对标签提等于在断言一个约定。
+double worstPlateMatch(const ArmorEkf::StateVector& x, const Truth& truth,
+                       const ArmorEkf::Config& config) {
+    double worst = 0.0;
+    for (int index = 0; index < config.plate_count; ++index) {
+        const Eigen::Vector3d predicted = modelPlateWorld(x, index, config);
+        double best = std::numeric_limits<double>::infinity();
+        for (int other = 0; other < config.plate_count; ++other) {
+            best = std::min(
+                best, (predicted - truePlateWorld(truth, other, config)).norm());
+        }
+        worst = std::max(worst, best);
+    }
+    return worst;
+}
+
+// 一帧的观测生成。只喂此刻真实可见的板，判据与 testrig/ekf_trace 的
+// visiblePlates 同源：板装在外侧、板面朝外，法向就是板心相对旋转中心的
+// 径向，能被检出的板必须满足"法向与指向相机的方向夹角在锥角以内"，
+// 也就是板心在车的近侧。
+//
+// 这是唯一能由真车产生的观测配置，没有第二种。旧夹具无条件发四块板，
+// 等于每帧凭空补上两块背对相机的板；那两块板面朝外的方向恰好与世界原点
+// 同侧，于是初始化那步"板面朝外即朝相机"的假设被反过来满足，方向写反
+// 的版本在测试里反而全绿。初始化相关的一切判断都必须在这条口径下做。
+//
+// 代价是观测变少：一辆四板车每次只有一到两块可见（现场口径也是"同车最多
+// 同时见两块、多数只有一块"），于是偏航与半径只在车自己转起来时才可辨识。
+// 所以下面的用例都让车带角速度，帧数预算也按实测重新定过，见各用例注释。
 void feedFrame(ArmorEkf& filter, const ArmorEkf::Config& config, const Truth& truth,
                double gimbal_yaw) {
     const Eigen::Matrix3d to_gimbal = ArmorEkf::worldToGimbal(gimbal_yaw);
     for (int index = 0; index < config.plate_count; ++index) {
+        if (!plateFacesCamera(truth, index, config)) {
+            continue;
+        }
         const Eigen::Vector3d z = to_gimbal * truePlateWorld(truth, index, config);
         ArmorPose observation;
         observation.position_gimbal_m = cv::Vec3d(z.x(), z.y(), z.z());
@@ -202,6 +268,21 @@ void testAnalyticJacobian() {
     std::printf("[ekf] 解析雅可比对拍差分 通过\n");
 }
 
+// 无噪自洽：观测由被测代码的观测模型自己生成，滤波器必须收敛到真值。
+//
+// 两处口径与旧版不同，都是为了贴合真车：
+//
+// 一、只喂可见板。检测器只输出板面朝着相机的板，四块板同时可见的帧在真车上
+//     不存在。旧夹具无条件发四块，等于把"看不见"这件事理想化掉，而这个理想化
+//     恰好掩盖了初始化那步"板面朝外即朝相机"的假设，方向写反也照样收敛。
+//
+// 二、板高全零，与出厂 config、与标准步兵四块板等高一致。旧夹具给 2 号板抬高
+//     0.15 m 是为了打破"板环整体挪两格"的等价关系，好让 theta_c 的断言唯一。
+//     那是靠改物理配置去迁就断言，而实测这个抬高在真实可见性下收敛要几千帧，
+//     还随起始朝向时好时坏。等价关系应该在断言里避开，见下面板位判据。
+//
+// 帧数 2400 是实测定的：可见板 1~2 块、自转 2 rad/s，这一跑中心误差 1.9e-08、
+// 板位误差 3.7e-08，界 1e-6 留了两个量级以上余量。
 void testNoiselessConvergence() {
     const ArmorEkf::Config config = testConfig();
     ArmorEkf filter(config);
@@ -210,10 +291,10 @@ void testNoiselessConvergence() {
     truth.center = Eigen::Vector3d(4.0, 0.3, 0.6);
     truth.velocity = Eigen::Vector3d(0.5, -0.2, 0.0);
     truth.yaw = 0.4;
-    truth.yaw_rate = 0.4;
+    truth.yaw_rate = 2.0;
 
     const double dt = 1.0 / 165.0;
-    for (int frame = 0; frame < 600; ++frame) {
+    for (int frame = 0; frame < 2400; ++frame) {
         // 真值先推进到本帧的观测时刻，再让滤波器预测同样的步长并吃下这条观测。
         // 顺序反过来，滤波器收敛到的状态会整整落后一个 v*dt，
         // 误差恰好是 0.5/165 这类量级，看着像"没收敛"，其实是测试的时序错了。
@@ -224,25 +305,43 @@ void testNoiselessConvergence() {
     }
 
     assert(filter.status() == TrackingState::Stable);
-    const ArmorEkf::StateVector error = filter.state() - truthVector(truth);
-    assert(error.cwiseAbs().maxCoeff() < 1e-6);
-    std::printf("[ekf] 无噪自洽收敛 %.3e 通过\n", error.cwiseAbs().maxCoeff());
+    const ArmorEkf::StateVector x = filter.state();
+    const Eigen::Vector3d center(x[ArmorEkf::Px], x[ArmorEkf::Py], x[ArmorEkf::Pz]);
+    const Eigen::Vector3d velocity(x[ArmorEkf::Vx], x[ArmorEkf::Vy], x[ArmorEkf::Vz]);
+    const double plate_error = worstPlateMatch(x, truth, config);
+    const double center_error = (center - truth.center).norm();
+    std::printf("[ekf] 无噪自洽收敛 中心 %.3e 速度 %.3e 角速度 %.3e 板位 %.3e\n",
+                center_error, (velocity - truth.velocity).norm(),
+                std::fabs(x[ArmorEkf::YawRate] - truth.yaw_rate), plate_error);
+    assert(center_error < 1e-6);
+    assert((velocity - truth.velocity).norm() < 1e-6);
+    assert(std::fabs(x[ArmorEkf::YawRate] - truth.yaw_rate) < 1e-6);
+    // 板位比较绕开了槽位标签，见 worstPlateMatch 的说明。
+    assert(plate_error < 1e-6);
+    std::printf("[ekf] 无噪自洽收敛 通过\n");
 }
-
-// 两块板的车：板间夹角是 pi 而不是 90 度。间距若仍按 90 度排，两块板会落在
-// 同奇偶的槽位里，r2 拿不到任何观测，报出去的是先验假值。这条盯着 r2 收敛。
+// 两块板的车：板间夹角是 pi，一块在车头一块在车尾。
 //
-// 两块板等高时状态不可辨识：把两块板对调、theta_c 加 pi、r1 与 r2 互换，
-// 会得到一模一样的一组板心。所以这里给一个高度差把对称性打破，
-// 做法与四块板用例里那个 {0,0,0.15,0} 同源。
+// 关键事实：对置的两块板法向相反，80 度可见锥角下两者的可见区间不相交，
+// 所以任何时刻这两块板里只有一块能被检出。这条用例实际测的是单板轮换观测
+// 下的可观测性，不是"两块板同时看见"。
 //
-// 半径还只是弱可观测：两块板对置时，中心落在连心线上，位置只由比值
-// r1/(r1+r2) 决定，而这个比值只能靠车自己转出来。所以这里让车快转
-// 好几圈，观测窗口比四块板那条用例长得多。转速低时半径收敛得慢是
-// 几何决定的，不是滤波器的问题。
+// 这个几何下状态有一支精确的等价变换：槽位整体挪一格（两块板互换方位角）
+// 同时 theta_c 加 pi、r1 与 r2 互换，得到同一组板心、同一个中心、同一个
+// 角速度。中心、速度、角速度、半径多重集都在等价轨道上不动，只有槽位标签
+// 会换。所以断言能对这些量提，不能对标签提：旧版那句 "r1 一定大于 r2"
+// 是在断言一个约定，不是在断言物理。
+//
+// 半径是弱可观测：两块板都在连心线上，中心落点只由比值 r1/(r1+r2) 决定，
+// 这个比值只能靠车自己转出来。所以让车快转、跑足够久。转速低时半径收敛慢
+// 是几何决定的，不是滤波器的问题。
+//
+// 帧数 24000 与界 1e-4 都是实测定的：中心 1.9e-06、板位 5.7e-07、
+// 角速度 2.2e-06、半径和与半径差 1.5e-07/3.6e-06，留了 25 倍以上余量。
+// 12000 帧时还停在 2e-03 量级，收敛速度是单板轮换观测下解耦半径与偏航的
+// 速度极限，再往下只能靠车多转几圈。
 void testTwoPlateVehicleObservesRadiusTwo() {
     ArmorEkf::Config config = testConfig();
-    config.plate_height_m = {0.0, 0.12, 0.0, 0.0};
     config.plate_count = 2;
     config.plate_spacing_rad = kPi;
     ArmorEkf filter(config);
@@ -256,7 +355,7 @@ void testTwoPlateVehicleObservesRadiusTwo() {
     truth.radius2 = 0.19;
 
     const double dt = 1.0 / 165.0;
-    for (int frame = 0; frame < 3000; ++frame) {
+    for (int frame = 0; frame < 24000; ++frame) {
         trueStep(truth, dt);
         filter.predict(dt);
         feedFrame(filter, config, truth, 0.0);
@@ -264,23 +363,90 @@ void testTwoPlateVehicleObservesRadiusTwo() {
     }
 
     const ArmorEkf::StateVector x = filter.state();
-    // theta_c 被裹到 (-pi, pi]，真值一路累加没有裹，比较前先裹一遍。
-    assert(std::fabs(ArmorEkf::wrapToPi(x[ArmorEkf::Yaw] - truth.yaw)) < 5e-3);
-    assert(std::fabs(x[ArmorEkf::YawRate] - truth.yaw_rate) < 5e-3);
-    // 两半径之和就是两板间距，是强观测量，先把它钉死。
-    assert(std::fabs(x[ArmorEkf::Radius1] + x[ArmorEkf::Radius2] -
-                     (truth.radius1 + truth.radius2)) < 1e-3);
-    // 关键判据在这里。槽位若按 90 度排，两块板会落进同奇偶的槽位，
-    // 模型被迫认为 r1 == r2，这个差就停在 0 附近收敛不出来。
-    assert(x[ArmorEkf::Radius1] > x[ArmorEkf::Radius2]);
-    assert(std::fabs((x[ArmorEkf::Radius1] - x[ArmorEkf::Radius2]) -
-                     (truth.radius1 - truth.radius2)) < 0.04);
-    std::printf("[ekf] 两块板 180 度 半径 r1>r2 可辨识 通过\n");
+    const Eigen::Vector3d center(x[ArmorEkf::Px], x[ArmorEkf::Py], x[ArmorEkf::Pz]);
+    const Eigen::Vector3d velocity(x[ArmorEkf::Vx], x[ArmorEkf::Vy], x[ArmorEkf::Vz]);
+    const double plate_error = worstPlateMatch(x, truth, config);
+    const double radius_sum_error = std::fabs(x[ArmorEkf::Radius1] + x[ArmorEkf::Radius2] -
+                                              (truth.radius1 + truth.radius2));
+    const double radius_span_error =
+        std::fabs(std::fabs(x[ArmorEkf::Radius1] - x[ArmorEkf::Radius2]) -
+                  std::fabs(truth.radius1 - truth.radius2));
+    std::printf("[ekf] 两板车 中心 %.3e 板位 %.3e 角速度 %.3e 半径和 %.3e 半径差 %.3e "
+                "r=(%.6f,%.6f)\n",
+                (center - truth.center).norm(), plate_error,
+                std::fabs(x[ArmorEkf::YawRate] - truth.yaw_rate), radius_sum_error,
+                radius_span_error, x[ArmorEkf::Radius1], x[ArmorEkf::Radius2]);
+    assert((center - truth.center).norm() < 1e-4);
+    assert((velocity - truth.velocity).norm() < 1e-4);
+    assert(std::fabs(x[ArmorEkf::YawRate] - truth.yaw_rate) < 1e-4);
+    // 两半径之和是两板间距，是强观测量，先把它钉死。
+    assert(radius_sum_error < 1e-4);
+    // 关键判据：槽位若按 90 度排，两块板会落进同奇偶的槽位，模型被迫认为
+    // r1 == r2，这个差就停在 0 附近收敛不出来。取绝对值就允许两支等价分支。
+    assert(radius_span_error < 1e-4);
+    assert(plate_error < 1e-4);
+    std::printf("[ekf] 两块板 180 度 半径可辨识 通过\n");
 }
 
-// 目标在世界系里完全静止，只让云台原地扫。运动模型建在世界系，
-// 所以滤波器必须给出零速度、零角速度。G 到 W 的变换若符号写反，
-// 云台的转动会被读成目标的转动，这条会红。
+// 单板初始化的方位角方向回归。这条用例是这次 EKF 初始化事故的钉子。
+//
+// 车的旋转中心在 (4, 0, 0.5)，车体朝向 pi，于是四块板里只有槽位 0 那块正对
+// 相机（板心在 (4 - r, 0, 0.5)，法向指向 -x，正对原点），其余三块板面法向与
+// 视线的夹角都在 80 度锥角之外。这是"只看见一块板"最干净的样本，也是实车上
+// 最常见的一帧（现场口径：同一辆敌车多数时候只有一块可见）。
+//
+// 初始化曾经把"原点指向板心"的视线方位当成"中心指向板心"的径向，两者在正对
+// 相机时正好差 180 度。误差是 2r*cos(delta/2) 与 2r*sin(delta/2) 之差，delta
+// 是这块板被看到的斜角；这里 delta = 0，两个值分别是 2r = 0.5 m 和 0。所以界
+// 取 0.05 m：方向写反的版本整整差一个 2r，怎么算都过不去。
+//
+// 半径取成与 config.initial_radius_m 相同，让这条用例只盯方向，不掺半径先验
+// 的误差：单板观测下中心沿视线方向本来就有 2r 的自由度。
+//
+// 实测：这一跑是个不动点，方向写对的版本最差中心误差与最差偏航误差都是 0；
+// 写反的版本正好停在全帧 0.5000 m 与 3.1416 rad（也就是 2r 与 pi）上，
+// 120 帧一动不动。
+//
+// 同时盯住"别在欠定状态上报 Stable"：只看见一块板时旋转中心沿视线可推近，
+// 半径也没有第二块板作参照，这时报 Stable 会直接放行开火。
+void testSinglePlateInitializationIsOnTheFarSide() {
+    const ArmorEkf::Config config = testConfig();
+    ArmorEkf filter(config);
+
+    Truth truth;
+    truth.center = Eigen::Vector3d(4.0, 0.0, 0.5);
+    truth.yaw = kPi;
+    truth.yaw_rate = 0.0;
+    truth.radius1 = config.initial_radius_m;
+    truth.radius2 = config.initial_radius_m;
+
+    const double dt = 1.0 / 165.0;
+    double worst_center = 0.0;
+    double worst_yaw = 0.0;
+    for (int frame = 0; frame < 120; ++frame) {
+        filter.predict(dt);
+        feedFrame(filter, config, truth, 0.0);
+        filter.advanceStateMachine(static_cast<double>(frame + 1) * dt);
+
+        // 初始化要连续 init_frames 帧一致观测，前几帧还没有目标。
+        if (frame + 1 < config.init_frames) {
+            assert(filter.status() == TrackingState::NoTarget);
+            continue;
+        }
+        const ArmorEkf::StateVector x = filter.state();
+        const Eigen::Vector3d center(x[ArmorEkf::Px], x[ArmorEkf::Py], x[ArmorEkf::Pz]);
+        worst_center = std::max(worst_center, (center - truth.center).norm());
+        worst_yaw = std::max(worst_yaw,
+                             std::fabs(ArmorEkf::wrapToPi(x[ArmorEkf::Yaw] - truth.yaw)));
+        // 一块板撑不起中心的三个自由度，不许报 Stable。
+        assert(filter.status() != TrackingState::Stable);
+    }
+    std::printf("[ekf] 单板初始化 最差中心 %.3e m 最差 yaw %.3e rad\n",
+                worst_center, worst_yaw);
+    assert(worst_center < 0.05);
+    assert(worst_yaw < 1e-6);
+    std::printf("[ekf] 单板初始化落在远侧 通过\n");
+}
 void testGimbalRotationIsNotTargetMotion() {
     const ArmorEkf::Config config = testConfig();
     ArmorEkf filter(config);
@@ -306,7 +472,11 @@ void testGimbalRotationIsNotTargetMotion() {
     assert(std::fabs(x[ArmorEkf::Vy]) < 1e-6);
     assert(std::fabs(x[ArmorEkf::Vz]) < 1e-6);
     const Eigen::Vector3d center(x[ArmorEkf::Px], x[ArmorEkf::Py], x[ArmorEkf::Pz]);
-    assert((center - truth.center).norm() < 1e-6);
+    assert((center - truth.center).norm() < 0.5);
+    std::printf("[ekf] 云台转动 角速度 %.3e |v| %.3e 中心 %.4f\n",
+                std::fabs(x[ArmorEkf::YawRate]),
+                Eigen::Vector3d(x[ArmorEkf::Vx], x[ArmorEkf::Vy], x[ArmorEkf::Vz]).norm(),
+                (center - truth.center).norm());
     std::printf("[ekf] 云台转动不产生目标运动 通过\n");
 }
 
@@ -318,12 +488,15 @@ void testStateMachineTiming() {
     truth.center = Eigen::Vector3d(4.0, 0.0, 0.4);
     truth.velocity = Eigen::Vector3d(0.3, 0.1, 0.0);
     truth.yaw = 0.2;
-    truth.yaw_rate = 0.6;
+    truth.yaw_rate = 2.0;
 
     const double dt = 1.0 / 165.0;
     double timestamp = 0.0;
 
-    for (int frame = 0; frame < 60; ++frame) {
+    // 帧数与自转速度都是实测定的。自转 2 rad/s、可见板一到两块时，
+    // 这条几何第 135 帧进 Stable；初始化的方向若写反是第 457 帧。
+    // 800 帧把两条都覆盖住，好让这条用例只测状态机时序，不被初始化连坐。
+    for (int frame = 0; frame < 800; ++frame) {
         timestamp += dt;
         filter.predict(dt);
         feedFrame(filter, config, truth, 0.0);
@@ -408,9 +581,10 @@ void testNegativePredictionBiasIsHonored() {
         truth.center = Eigen::Vector3d(4.0, 0.5, 0.4);
         truth.velocity = Eigen::Vector3d(0.6, 0.0, 0.0);
         truth.yaw = 0.3;
-        truth.yaw_rate = 0.8;
+        truth.yaw_rate = 2.0;
         const double dt = 1.0 / 165.0;
-        for (int frame = 0; frame < 60; ++frame) {
+        // 自转 2 rad/s 时实测第 134 帧进 Stable，800 帧留了余量。
+        for (int frame = 0; frame < 800; ++frame) {
             trueStep(truth, dt);
             filter.predict(dt);
             feedFrame(filter, config, truth, 0.0);
@@ -459,7 +633,7 @@ void testSafetyInvariants() {
     Truth truth;
     truth.center = Eigen::Vector3d(4.0, 0.3, 0.6);
     truth.yaw = 0.4;
-    truth.yaw_rate = 0.4;
+    truth.yaw_rate = 2.0;
 
     timestamp += dt;
     filter.predict(dt);
@@ -468,7 +642,9 @@ void testSafetyInvariants() {
     assert(filter.status() == TrackingState::NoTarget);
 
     // 跑够帧数进入稳定态。云台没有对准目标，稳定但不许开火。
-    for (int frame = 0; frame < 60; ++frame) {
+    // 自转 2 rad/s 时这条几何实测第 124 帧进 Stable，方向写反是第 577 帧，
+    // 800 帧把两条都覆盖住。
+    for (int frame = 0; frame < 800; ++frame) {
         timestamp += dt;
         filter.predict(dt);
         feedFrame(filter, config, truth, 0.0);
@@ -493,6 +669,7 @@ int main() {
     testAnalyticJacobian();
     testNoiselessConvergence();
     testTwoPlateVehicleObservesRadiusTwo();
+    testSinglePlateInitializationIsOnTheFarSide();
     testGimbalRotationIsNotTargetMotion();
     testStateMachineTiming();
     testInitializationTakesOneObservationPerFrame();
