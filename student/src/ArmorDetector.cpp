@@ -309,7 +309,6 @@ namespace {
 constexpr float kMinQuadAreaPx = 1.0F;
 
 // 转单通道灰度。只认 8 位的两种常见布局，别的一律拒绝。
-// 猜一种错误的转换方式，比明确拒绝更难查。
 bool toGray(const cv::Mat& image, cv::Mat& gray) {
     switch (image.type()) {
         case CV_8UC1:
@@ -353,16 +352,14 @@ bool extractDigitPatch(const cv::Mat& image,
                                      ? params.large_width_mm
                                      : params.small_width_mm;
     const int canonical_w = std::max(
-        1, static_cast<int>(std::lround(plate_width_mm * params.px_per_mm)));
+        1, static_cast<int>(std::lround(plate_width_mm * params.px_per_mm))); //装甲板真实物理宽度 · 像素/毫米
     const int canonical_h = std::max(
         1, static_cast<int>(
                std::lround(params.plate_height_mm * params.px_per_mm)));
 
     // 正射前先把四边形绕中心撑大：检测出的四边形只框住两根灯条，
     // 而牌面上的图案比灯条高一截，照着原四边形裁会切掉图案的上下缘。
-    // 撑大的只是这里的局部副本，检测输出的角点（要喂给 PnP）不受影响。
     // 必须是"在原图上撑开再正射"，反过来在规范板里取大窗没用，
-    // 四边形外面没有真实像素，取到的只是边缘拉丝。
     const cv::Point2f quad_center =
         (corners[0] + corners[1] + corners[2] + corners[3]) * 0.25F;
     const float quad_scale = params.patch_quad_scale;
