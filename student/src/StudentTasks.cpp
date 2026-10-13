@@ -1,12 +1,15 @@
 #include "StudentTasks.hpp"
 
 #include "ArmorDetector.hpp"
+#include "ArmorEkf.hpp"
 #include "HikCamera.hpp"
 
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
 
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <vector>
 
@@ -176,8 +179,34 @@ std::vector<ArmorPose> armor_solve(const std::vector<ArmorDetection>& detections
     return poses;
 }
 
-// 任务 4：EKF 跟踪与预测。第五课再填，先返回空。
-PredictionResult ekf_predict(const std::vector<ArmorPose>&, const GimbalState&,
-                             double) {
-    return {};
+// 任务 4：EKF 跟踪与预测。
+//
+// 跨帧状态放在函数内的 static 里。main.cpp 的操作线程是唯一调用者，
+// 不存在并发问题；ArmorEkf 本身可以独立构造，单测直接测类，不走这个适配器。
+PredictionResult ekf_predict(const std::vector<ArmorPose>& observations,
+                             const GimbalState& gimbal, double timestamp_seconds) {
+    static ArmorEkf filter;
+    static double last_timestamp = 0.0;
+
+    // timestamp_seconds 是 steady_clock 自纪元起的秒数，两帧相减就是帧间隔；
+    // 用"现在"减它，得到的是这一帧从采集到此刻消耗掉的检测与解算时间，也就是延迟。
+    const double dt = (last_timestamp > 0.0 && std::isfinite(timestamp_seconds))
+                          ? std::clamp(timestamp_seconds - last_timestamp, 0.0, 0.5)
+                          : 0.0;
+    // 时间戳非有限时不要把 NaN 写进 static，否则后续每一帧的 dt 都会被拖成 NaN。
+    if (std::isfinite(timestamp_seconds)) {
+        last_timestamp = timestamp_seconds;
+    }
+
+    const double now_seconds = std::chrono::duration<double>(
+                                   std::chrono::steady_clock::now().time_since_epoch())
+                                   .count();
+    const double latency_s = std::clamp(now_seconds - timestamp_seconds, 0.0, 0.2);
+
+    filter.predict(dt);
+    for (const ArmorPose& observation : observations) {
+        filter.update(observation, static_cast<double>(gimbal.yaw));
+    }
+    filter.advanceStateMachine(timestamp_seconds);
+    return filter.buildPrediction(gimbal, latency_s);
 }

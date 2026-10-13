@@ -77,6 +77,7 @@ add_library(training_core STATIC
     student/src/HikCamera.cpp
     student/src/ArmorDetector.cpp
     student/src/DigitClassifier.cpp
+    student/src/ArmorEkf.cpp
 )
 target_include_directories(training_core
     PUBLIC
@@ -87,7 +88,10 @@ target_include_directories(training_core
 )
 # hik_mvs 用 PUBLIC：链了 training_core 的目标都会被 get_pic 拖上
 # libMvCameraControl，头文件和 -rpath 得一路传下去。
-target_link_libraries(training_core PUBLIC serialPort hik_mvs ${OpenCV_LIBS})
+# algorithm_support 也放 PUBLIC：ArmorEkf 用 Eigen 算矩阵，弹道飞行时间
+# 复用 armor/ 里的 Bullet_Model，链这一个目标就把 Eigen 的头、
+# armor/include 目录和 Bullet_Model 的实现一起带过来。
+target_link_libraries(training_core PUBLIC serialPort hik_mvs algorithm_support ${OpenCV_LIBS})
 # 数字分类模型的绝对路径。编进二进制而不是运行时拼相对路径 ——
 # 现场从来不及猜"当前工作目录是哪儿"。
 target_compile_definitions(training_core PRIVATE
@@ -166,5 +170,10 @@ if(BUILD_TESTING)
     target_compile_definitions(test_digit_classifier PRIVATE
         ARMOR_HOLDOUT_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/digit_holdout")
     add_test(NAME digit_classifier COMMAND test_digit_classifier)
+    add_executable(test_ekf_predict tests/test_ekf_predict.cpp)
+    target_link_libraries(test_ekf_predict PRIVATE training_core)
+    # 测试全是裸 assert，NDEBUG 会把它们整个编译掉，ctest 就变成假绿。
+    target_compile_options(test_ekf_predict PRIVATE -UNDEBUG)
+    add_test(NAME ekf_predict COMMAND test_ekf_predict)
     add_test(NAME cli_help COMMAND rmv_training --help)
 endif()
