@@ -152,7 +152,7 @@ bool writeFrame(SerialPort& serialPort, Translator& frame) {
 }
 
 void logPrediction(const PredictionResult& result) {
-    WEB_LOG("target_found", result.state == TrackingState::NoTarget ? 0.0 : 1.0);
+    // ekf_state 是 0/1/2 三态，0 就表示没有目标，不再单独记一个布尔量。
     WEB_LOG("ekf_state", static_cast<double>(result.state));
     if (result.state == TrackingState::NoTarget) {
         return;
@@ -171,11 +171,11 @@ void logPrediction(const PredictionResult& result) {
     WEB_LOG("ekf_yaw_rate_rad_s", result.body_yaw_velocity);
     WEB_LOG("ekf_radius_1_m", result.radius_1_m);
     WEB_LOG("ekf_radius_2_m", result.radius_2_m);
-    // 切换与遮挡的直接证据：当前瞄准的槽位、连续命中与连续丢失的帧数、
-    // 累计被离群闸挡下的观测条数。
+    // 切换与遮挡的直接证据：当前瞄准的槽位、连续命中与连续丢失、累计被离群闸挡下的观测条数。
+    // hit_streak 与 miss_count 互斥，任何时刻只有一个非零，所以合成一条带符号的曲线：
+    // 正值为连续命中帧数，负值为连续丢失帧数，0 表示刚重置。
     WEB_LOG("ekf_aim_index", result.aim_index);
-    WEB_LOG("ekf_hit_streak", result.hit_streak);
-    WEB_LOG("ekf_miss_count", result.miss_count);
+    WEB_LOG("ekf_streak", result.hit_streak - result.miss_count);
     WEB_LOG("ekf_rejected_count", result.rejected_count);
 }
 
@@ -347,8 +347,6 @@ void *OperationFunction(void *arg) {
     // Web 服务和相机 SDK 都属于操作线程的资源，生命周期与原工程一致。
     START_WEB_SERVER(web_port);
 
-    double dt = 0.0;
-    double last_time_stamp = 0.0;
     auto last_frame_time = std::chrono::steady_clock::time_point{};
     int empty_frame_count = 0;
 
@@ -458,17 +456,12 @@ void *OperationFunction(void *arg) {
             WEB_LOG("pnp_pitch_rad", -1.0);
         }
 
-        // 3. 计算帧间隔和通信延迟，再调用 EKF。即使 observations 为空也必须调用。
+        // 3. 记下时间戳和通信延迟，再调用 EKF。即使 observations 为空也必须调用。
+        // 不单独记帧间隔：相机帧率就是同一对 frame_time 差值的倒数，两条曲线互为倒影。
         const double time_stamp =
             std::chrono::duration<double>(frame_time.time_since_epoch()).count();
-        dt = last_time_stamp > 0.0 ? time_stamp - last_time_stamp : 0.0;
-        if (dt < 0.0 || !std::isfinite(dt)) {
-            dt = 0.0;
-        }
-        last_time_stamp = time_stamp;
         translator.message.latency = static_cast<float>(
             std::chrono::duration<double, std::milli>(frame_time - process_start).count());
-        WEB_LOG("frame_dt_ms", dt * 1000.0);
 
         const PredictionResult prediction = ekf_predict(observations, gimbal, time_stamp);
         bool prediction_valid = applyPrediction(translator, prediction);

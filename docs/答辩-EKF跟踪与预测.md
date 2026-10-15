@@ -15,7 +15,7 @@
 
 # 零、这一层在整个流水线里的位置
 
-`main.cpp:465` 那一行的前后：
+`main.cpp:466` 那一行的前后：
 
 ```
 armor_solve 的产物                          EKF 的输入
@@ -804,7 +804,7 @@ const double rel_yaw = gimbalAzimuth(p_gimbal_aim);
 const double rel_pitch = gimbalElevation(p_gimbal_aim);
 ```
 
-**这两个式子在 `ArmorEkf.cpp:44-50` 集中定义，与 `main.cpp:449-452` 的 `pnp_yaw_rad/pnp_pitch_rad`、与 `armor_solve` 的 `armor_yaw` 逐字同式**：云台系是 前 / 左 / 上，所以
+**这两个式子在 `ArmorEkf.cpp:44-50` 集中定义，与 `main.cpp:448-451` 的 `pnp_yaw_rad/pnp_pitch_rad`、与 `armor_solve` 的 `armor_yaw` 逐字同式**：云台系是 前 / 左 / 上，所以
 
 ```
 rel_yaw   = atan2(-y, x)                  右为正，正前方是 0
@@ -1042,7 +1042,7 @@ R = diag(depth², lateral², lateral²)
 
 ## 12.4 EKF 之前没有目标筛选（问题清单 §2.7b，未答）
 
-`main.cpp:428` 的 `armor_solve` 把所有同色检测解算完，`main.cpp:465` 整体喂给 `ekf_predict`，EKF 之前**没有目标筛选**。一帧里若有两辆敌车，八块板会一起进同一个「单目标 4 槽」模型。这与 12.1 是两回事，`ekf_trace` 也没有建这个模。
+`main.cpp:434` 的 `armor_solve` 把所有同色检测解算完，`main.cpp:466` 整体喂给 `ekf_predict`，EKF 之前**没有目标筛选**。一帧里若有两辆敌车，八块板会一起进同一个「单目标 4 槽」模型。这与 12.1 是两回事，`ekf_trace` 也没有建这个模。
 
 ## 12.5 弹速是默认值
 
