@@ -61,7 +61,7 @@ applyPrediction(translator, prediction)           src/AppSupport.cpp:74
 
 **G 与 W 的轴向完全相同**（学长 2026-10-15：「云台系和世界系一样」），两系只差一个绕竖直轴的偏航角，再外加原点平移。依据与推导过程见 `docs/上车前问题清单.md` 第 1.1 节，图见 `docs/img/坐标系方向.png`。
 
-两个偏航角的转正方向**故意不同**，这不是笔误（`ArmorEkf.cpp:16-22` 有原话）：
+两个偏航角的转正方向**故意不同**，这不是笔误（`ArmorEkf.cpp:15-22` 有原话）：
 
 - `theta_c` 是 W 系里的方位角，从 +x 转向 +y 为正，而 W 的 +y 朝左，所以 `theta_c` **左为正**。
 - `gimbal.yaw` 在 `atan2(-y, x)` 这个口径下定义成 **右为正**，与 `main.cpp` 的 `pnp_yaw_rad`、`armor_solve` 的 `armor_yaw` 同号。
@@ -72,7 +72,7 @@ applyPrediction(translator, prediction)           src/AppSupport.cpp:74
 
 ## 1.2 唯一的变换函数
 
-`ArmorEkf.cpp:78-90`：
+`ArmorEkf.cpp:94-106`：
 
 ```cpp
 Eigen::Matrix3d ArmorEkf::gimbalToWorld(double gimbal_yaw) {
@@ -220,7 +220,7 @@ return filter.buildPrediction(gimbal, latency_s);   // :211
 
 ## 3.1 `predict(dt)`：先验
 
-`ArmorEkf.cpp:263-284`：
+`ArmorEkf.cpp:286-307`：
 
 ```cpp
 void ArmorEkf::predict(double dt) {
@@ -253,7 +253,7 @@ void ArmorEkf::predict(double dt) {
 
 ## 3.2 过程模型 `propagate` 与 `F`
 
-`ArmorEkf.cpp:170-183`：
+`ArmorEkf.cpp:190-203`：
 
 ```cpp
 void ArmorEkf::propagate(StateVector& x, double dt) const {
@@ -278,7 +278,7 @@ void ArmorEkf::fillTransition(double dt, Eigen::Matrix<double, 10, 10>& F) const
 
 ## 3.3 过程噪声 `Q`
 
-`ArmorEkf.cpp:185-214`。按随机加速度模型离散化，每个「位置 + 速度」轴对共享一个分块：
+`ArmorEkf.cpp:205-234`。按随机加速度模型离散化，每个「位置 + 速度」轴对共享一个分块：
 
 ```
 Q_pv = sigma_a^2 * [ dt^4/4   dt^3/2 ]
@@ -312,7 +312,7 @@ Q(Radius2, Radius2) = radius_variance;
 
 | 常量 | 值 | 依据 |
 |---|---|---|
-| `accel_noise_m_s2` | 6.0 | RM 步兵 0 到 20 m/s 约 1 到 2 秒，瞬时机动约 10 m/s²，取一半（`ArmorEkf.cpp:24-25`） |
+| `accel_noise_m_s2` | 6.0 | RM 步兵 0 到 20 m/s 约 1 到 2 秒，瞬时机动约 10 m/s²，取一半（`ArmorEkf.cpp:27-29`） |
 | `angular_accel_noise_rad_s2` | 12.0 | 车能快速起旋停旋，同量级取整 |
 | `radius_drift_m` | 0.2 | 半径近乎恒定，只给随机游走强度 0.2 m/√s |
 
@@ -320,7 +320,7 @@ Q(Radius2, Radius2) = radius_variance;
 
 ## 3.4 `P0`
 
-`ArmorEkf.cpp:227-240`：
+`ArmorEkf.cpp:250-263`：
 
 ```cpp
 P(Px, Px) = 1.0;      P(Py, Py) = 1.0;      P(Pz, Pz) = 1.0;      // 位置 (m^2)
@@ -337,7 +337,7 @@ P(Radius1, Radius1) = 0.0225;  P(Radius2, Radius2) = 0.0225;      // m^2
 
 ## 4.1 `h`
 
-`ArmorEkf.cpp:118-130`：
+`ArmorEkf.cpp:134-146`：
 
 ```cpp
 Eigen::Vector3d ArmorEkf::observationModel(const StateVector& x, int armor_index,
@@ -374,7 +374,7 @@ h_i(x) = M(theta_g)^T * u_i(x)                    换到 G 系, 3 维观测
 
 ## 4.2 `H`
 
-`ArmorEkf.cpp:132-155`。非零的四个列：
+`ArmorEkf.cpp:148-175`。非零的四个列：
 
 ```cpp
 ObservationJacobian H = ObservationJacobian::Zero();
@@ -410,7 +410,7 @@ H.col(radius) = M^T *       ( cos psi_i, sin psi_i, 0) =       ( cos psi_plus_gi
 
 ## 4.3 关联用的 `radiusIndex` 与槽位
 
-`ArmorEkf.cpp:104-116`：
+`ArmorEkf.cpp:120-132`：
 
 ```cpp
 int ArmorEkf::normalizeIndex(int armor_index, int plate_count) {
@@ -444,7 +444,7 @@ bool ArmorEkf::update(const ArmorPose& observation, double gimbal_yaw) {
 
 ## 5.1 `associateAndUpdate`：三道闸
 
-`ArmorEkf.cpp:370-445`。进来先过两道「观测本身合不合法」的闸：
+`ArmorEkf.cpp:393-468`。进来先过两道「观测本身合不合法」的闸：
 
 ```cpp
 if (!z.allFinite() || !std::isfinite(observation.reprojection_error)) {
@@ -483,11 +483,11 @@ for (int i = 0; i < config_.plate_count; ++i) {
 
 关联用**马氏距离**（NIS）而不是最近欧氏距离，因为侧板的横向不确定度大，欧氏距离会把它误配进来。`S = H P H^T + R` 里已经把不确定度算进去了。
 
-**`residual.norm() > jump_gate_m` 用的是 `continue` 而不是直接拒绝整个观测**：一块板跳得远，不代表其他几块也跳，剩下的板还有机会配上。全都过不了才 `++rejected_count_; return false;`（`:417-424`）。
+**`residual.norm() > jump_gate_m` 用的是 `continue` 而不是直接拒绝整个观测**：一块板跳得远，不代表其他几块也跳，剩下的板还有机会配上。全都过不了才 `++rejected_count_; return false;`（`:440-447`）。
 
 ## 5.2 吃下观测：Joseph 形式
 
-`ArmorEkf.cpp:426-444`：
+`ArmorEkf.cpp:449-458`：
 
 ```cpp
 const Eigen::Vector3d residual = z - best_h;
@@ -532,7 +532,7 @@ P = (I - K H) P (I - K H)^T + K R K^T
 
 ## 6.1 每帧的四个计数器
 
-`ArmorEkf.cpp:451-490` 的前半段：
+`ArmorEkf.cpp:474-513` 的前半段：
 
 ```cpp
 if (updated_this_frame_) {
@@ -607,7 +607,7 @@ return center_std < config_.stable_center_std_m &&    // 0.10 m
 
 # 七、初始化 `tryInitialize`
 
-`ArmorEkf.cpp:300-368`。这是整份代码里最需要关注的一段，也是曾经唯一出过问题的一段：
+`ArmorEkf.cpp:323-391`。这是整份代码里最需要关注的一段，也是曾经唯一出过问题的一段：
 反推中心的方位角方向反了 180 度，2026-10-13 已修（提交 `d3a7ff3`），下面 7.2 讲的就是它。
 
 ## 7.1 三帧一致门
@@ -643,7 +643,7 @@ if (init_count_ < config_.init_frames) {    // 3 帧
 
 ## 7.2 反推中心
 
-`ArmorEkf.cpp:344-350`：
+`ArmorEkf.cpp:367-373`：
 
 ```cpp
 x_.setZero();
@@ -715,7 +715,7 @@ return true;
 
 # 八、输出 `buildPrediction`
 
-`ArmorEkf.cpp:599-704`。这是把状态向量变成云台指令的一段，顺序上分六步。
+`ArmorEkf.cpp:621-728`。这是把状态向量变成云台指令的一段，顺序上分六步。
 
 ## 8.1 取云台角、bias，算 `t0`
 
@@ -734,7 +734,7 @@ const double t0 = std::clamp(latency + bias, 0.0, config_.max_prediction_s);
 
 ## 8.2 弹道飞行时间：两次迭代解开循环
 
-`ArmorEkf.cpp:618-631`：
+`ArmorEkf.cpp:640-653`：
 
 ```cpp
 double flight_s = 0.0;
@@ -790,7 +790,7 @@ if (aim_index_ >= 0 && current_facing && aim_index_ != best) {
 
 ## 8.4 `target_yaw/target_pitch`
 
-`ArmorEkf.cpp:633-647`：
+`ArmorEkf.cpp:655-667`：
 
 ```cpp
 StateVector x_pred = x_;
@@ -824,7 +824,7 @@ result.target_pitch = gimbal_pitch + rel_pitch;
 
 ## 8.5 角速度：中心差分
 
-`ArmorEkf.cpp:649-669`。在 `t_pred ± 5 ms` 各推一次，两个 `rel_yaw/rel_pitch` 相减除以窗口：
+`ArmorEkf.cpp:669-687`。在 `t_pred ± 5 ms` 各推一次，两个 `rel_yaw/rel_pitch` 相减除以窗口：
 
 ```cpp
 const double yaw_velocity = wrapToPi(yaw_late - yaw_early) / dt_window;
@@ -835,7 +835,7 @@ const double pitch_velocity = (pitch_late - pitch_early) / dt_window;
 
 ## 8.6 填 `PredictionResult` 与 `fire_allowed`
 
-`ArmorEkf.cpp:671-703`。要点：
+`ArmorEkf.cpp:689-728`。要点：
 
 ```cpp
 result.state = status_;                                   // 就是 crc
@@ -914,7 +914,17 @@ if (!predictionIsFinite(result)) {
 
 ### 观测噪声 `R` 的数从哪来
 
-`ArmorEkf.cpp:27-30` 记了依据：仓库已实测的角点抖动是 1.08 m 处单次重投影 0.70~0.79 px、同一角点两帧间最多动 1.41 px。按 `delta_px * d / f`（`f` 约 1805 px）估横向约 `0.0006 * d`，再留约 3 倍余量取 `0.002 d + 0.005`。深度误差按同样比例放大取 `0.010 d + 0.010`。
+`ArmorEkf.cpp:30-34` 记了依据：仓库已实测的角点抖动是 1.08 m 处单次重投影 0.70~0.79 px、同一角点两帧间最多动 1.41 px。按 `delta_px * d / f`（`f` 约 1805 px）估横向约 `0.0006 * d`，再留约 3 倍余量取 `0.002 d + 0.005`。深度误差按同样比例放大取 `0.010 d + 0.010`。
+
+**两个数放到哪一维，跟着云台系走**（`observationNoise`，`ArmorEkf.cpp:236-248`）：
+
+```
+R = diag(depth², lateral², lateral²)
+```
+
+云台系是 前 / 左 / 上，**第 0 个分量正好沿视线**，所以深度进 `(0,0)`、横向进 `(1,1)` 与 `(2,2)`。
+旧口径（x 右 / y 下 / z 前）下第 0 维是「右」，这一格是反的。**放错轴不会报错，只是让滤波器
+该信的不信、该松的不松**，对拍差分也看不出来（`H` 是对的），只能靠人工核对。
 
 ---
 
@@ -924,42 +934,46 @@ if (!predictionIsFinite(result)) {
 
 | 行 | 内容 |
 |---|---|
-| `:38-40` | 三个 `using`：`StateVector` / `Covariance` / `ObservationJacobian` |
-| `:43-55` | `Index` 枚举 |
-| `:57-115` | `Config` |
-| `:117-131` | 构造函数、`reset`、主循环四个方法 |
-| `:134-142` | 只读访问器（测试与 Web Debug 用） |
-| `:149-164` | 两个变换 + 观测模型/雅可比 + `wrapToPi` 的声明 |
-| `:168-187` | 私有辅助函数声明 |
-| `:189-226` | 成员状态（`x_`、`P_`、计数器、环形缓冲、`aim_index_`） |
+| `:42-44` | 三个 `using`：`StateVector` / `Covariance` / `ObservationJacobian` |
+| `:47-59` | `Index` 枚举 |
+| `:61-130` | `Config` |
+| `:132-146` | 构造函数、`reset`、主循环四个方法 |
+| `:148-159` | 只读访问器（测试与 Web Debug 用） |
+| `:167-182` | 两个变换 + 观测模型/雅可比 + `wrapToPi` 的声明 |
+| `:186-205` | 私有辅助函数声明 |
+| `:207-245` | 成员状态（`x_`、`P_`、计数器、环形缓冲、`aim_index_`） |
 
 `ArmorEkf.cpp`：
 
 | 行 | 函数 |
 |---|---|
-| `:40-51` | `flightTimeSeconds`（匿名命名空间，包 `Bullet_Model`） |
-| `:55-66` | `predictionIsFinite`（匿名命名空间） |
-| `:78-90` | `gimbalToWorld` / `worldToGimbal` |
-| `:92-98` | `wrapToPi` |
-| `:104-116` | `normalizeIndex` / `radiusIndex` |
-| `:118-130` | `observationModel` |
-| `:132-155` | `observationJacobian` |
-| `:157-164` | `platePositionWorld` |
-| `:170-183` | `propagate` / `fillTransition` |
-| `:185-214` | `fillProcessNoise` |
-| `:216-225` | `observationNoise` |
-| `:227-240` | `initialCovariance` |
-| `:242-261` | `reset` |
-| `:263-284` | `predict` |
-| `:290-298` | `update`（分派器） |
-| `:300-368` | `tryInitialize` |
-| `:370-445` | `associateAndUpdate` |
-| `:451-490` | `advanceStateMachine` |
-| `:492-500` | `covarianceIsStable` |
-| `:502-521` | `recordNis` / `recentNisMean` |
-| `:523-542` | `smoothedLatency` |
-| `:548-597` | `selectArmorIndex` |
-| `:599-704` | `buildPrediction` |
+| `:44-50` | `gimbalAzimuth` / `gimbalElevation`（匿名命名空间，右正 / 抬头正） |
+| `:52-65` | `flightTimeSeconds`（匿名命名空间，包 `Bullet_Model`） |
+| `:67-82` | `predictionIsFinite`（匿名命名空间） |
+| `:94-102` | `gimbalToWorld` |
+| `:104-106` | `worldToGimbal` |
+| `:108-114` | `wrapToPi` |
+| `:120-126` | `normalizeIndex` |
+| `:128-132` | `radiusIndex` |
+| `:134-146` | `observationModel` |
+| `:148-175` | `observationJacobian` |
+| `:177-184` | `platePositionWorld` |
+| `:190-195` | `propagate` |
+| `:197-203` | `fillTransition` |
+| `:205-234` | `fillProcessNoise` |
+| `:236-248` | `observationNoise` |
+| `:250-263` | `initialCovariance` |
+| `:265-284` | `reset` |
+| `:286-307` | `predict` |
+| `:313-321` | `update`（分派器） |
+| `:323-391` | `tryInitialize` |
+| `:393-468` | `associateAndUpdate` |
+| `:474-513` | `advanceStateMachine` |
+| `:515-523` | `covarianceIsStable` |
+| `:525-544` | `recordNis` / `recentNisMean` |
+| `:546-565` | `smoothedLatency` |
+| `:571-619` | `selectArmorIndex` |
+| `:621-728` | `buildPrediction` |
 
 ---
 
@@ -1048,7 +1062,7 @@ if (!predictionIsFinite(result)) {
 
 ### 12.6.2 两个半径只要目标在转，都会收敛
 
-`H.col(radiusIndex(i))`（`ArmorEkf.cpp:152`）是雅可比里唯一非零的半径列，一条观测只修得动一个奇偶的半径。但可见槽位随车体旋转轮换，两个半径都会陆续拿到观测：
+`H.col(radiusIndex(i))`（`ArmorEkf.cpp:173`）是雅可比里唯一非零的半径列，一条观测只修得动一个奇偶的半径。但可见槽位随车体旋转轮换，两个半径都会陆续拿到观测：
 
 | 目标自转 omega (rad/s) | 末态 r1 / r2 | 真值 | 末态中心误差 |
 |---|---|---|---|
@@ -1106,7 +1120,7 @@ yaw 为什么不可观测：相机只看得到板，看不到车心。车心由�
 
 ### 12.6.5 顺带查出：`covarianceIsStable()` 是单向门
 
-它只在 Unstable 到 Stable 那一步被查（`ArmorEkf.cpp:482-490`）。进了 `Stable` 之后，只有连续丢 `stable_hold_misses = 3` 帧能降回 `Unstable`。所以 **`Stable` 可以和远超门槛的协方差共存**：`omega = 1.0` 第 704 帧进入 `Stable`，跑到第 2999 帧状态仍是 `Stable`，而末态 yaw sd 已经 0.1750，是门槛 0.10 的 3.5 倍。是刻意留的滞回还是漏了回退闸，需要定。
+它只在 Unstable 到 Stable 那一步被查（`ArmorEkf.cpp:505-512`）。进了 `Stable` 之后，只有连续丢 `stable_hold_misses = 3` 帧能降回 `Unstable`。所以 **`Stable` 可以和远超门槛的协方差共存**：`omega = 1.0` 第 704 帧进入 `Stable`，跑到第 2999 帧状态仍是 `Stable`，而末态 yaw sd 已经 0.1750，是门槛 0.10 的 3.5 倍。是刻意留的滞回还是漏了回退闸，需要定。
 
 ### 12.6.6 待定：整状态协方差闸换成「瞄准点自身的不确定度闸」
 

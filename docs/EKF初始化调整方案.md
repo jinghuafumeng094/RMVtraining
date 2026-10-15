@@ -1,7 +1,7 @@
 # EKF 初始化调整方案
 
 日期：2026-10-13
-适用：`student/src/ArmorEkf.cpp:336-343` 的初始化段
+适用：`student/src/ArmorEkf.cpp:366-373` 的初始化段
 前一版结论：`docs/上车前问题清单.md` §2.7、`rm_autoaim_evidence/06-EKF跟踪与预测/20261013-ekf-fix-trials-候选修法全试过.md`
 
 **一句话**：初始化的方位角方向取反了 180°。代码假设观测到的板**背对**相机，
@@ -16,7 +16,7 @@
 
 ## 一、根因
 
-初始化段（`ArmorEkf.cpp:336-343`）把**板心相对世界原点**的方位角，
+初始化段（`ArmorEkf.cpp:366-373`）把**板心相对世界原点**的方位角，
 当成了**板心相对旋转中心**的方位角：
 
 ```cpp
@@ -185,7 +185,7 @@ Stable，与现在的实现哪一帧报 Stable 对比。27 行 × 两个变体�
 （这里数的是可见而不是被接受，拒绝多时真实的门只会更晚开，所以"免费"这条对真实实现是乐观侧，
 "堵不住"这条不受影响。）
 
-做法（若要做）：在 `advanceStateMachine`（`ArmorEkf.cpp:444`）的 Unstable 转 Stable 条件里加一条
+做法（若要做）：在 `advanceStateMachine`（`ArmorEkf.cpp:474`）的 Unstable 转 Stable 条件里加一条
 
 ```
 去过偶数槽位的观测 && 去过奇数槽位的观测
@@ -229,7 +229,7 @@ Stable，与现在的实现哪一帧报 Stable 对比。27 行 × 两个变体�
 
 ## 七、顺序
 
-1. ~~改 `ArmorEkf.cpp:338` 一行（取反）。~~ **已完成**，`student/src/ArmorEkf.cpp`。
+1. ~~改 `ArmorEkf.cpp:368` 一行（取反）。~~ **已完成**，`student/src/ArmorEkf.cpp`。
 2. ~~改夹具：`feedFrame` 加可见性筛选（与 `ekf_trace` 同一条锥角判据）。~~ **已完成**。
 3. ~~重定 `testNoiselessConvergence` 的帧数预算；重写 `testTwoPlateVehicleObservesRadiusTwo`。~~
    **已完成**，2400 帧与 24000 帧，界与实测见第四节。
