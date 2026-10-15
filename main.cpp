@@ -163,12 +163,20 @@ void logPrediction(const PredictionResult& result) {
     WEB_LOG("target_distance", result.distance_m);
     WEB_LOG("ekf_x_m", result.center_x_m);
     WEB_LOG("ekf_y_m", result.center_y_m);
+    WEB_LOG("ekf_z_m", result.center_z_m);
     WEB_LOG("ekf_vx_m_s", result.center_velocity_x_m_s);
     WEB_LOG("ekf_vy_m_s", result.center_velocity_y_m_s);
+    WEB_LOG("ekf_vz_m_s", result.center_velocity_z_m_s);
     WEB_LOG("ekf_yaw_rad", result.body_yaw);
     WEB_LOG("ekf_yaw_rate_rad_s", result.body_yaw_velocity);
     WEB_LOG("ekf_radius_1_m", result.radius_1_m);
     WEB_LOG("ekf_radius_2_m", result.radius_2_m);
+    // 切换与遮挡的直接证据：当前瞄准的槽位、连续命中与连续丢失的帧数、
+    // 累计被离群闸挡下的观测条数。
+    WEB_LOG("ekf_aim_index", result.aim_index);
+    WEB_LOG("ekf_hit_streak", result.hit_streak);
+    WEB_LOG("ekf_miss_count", result.miss_count);
+    WEB_LOG("ekf_rejected_count", result.rejected_count);
 }
 
 // main 中启动线程前先同步读一帧，保持参考工程的初始化顺序。

@@ -29,11 +29,15 @@ struct Truth {
     double radius2{0.22};
 };
 
-// 板高一律取 0，与 config 的出厂默认一致，也就与实车（标准步兵四块板等高）
-// 一致。以前这里给 2 号板 0.15 m 的抬高，目的是打破"板环整体挪两格"的等价
-// 关系，好让 theta_c 的断言有唯一解。实测这个抬高在真实可见性下会把收敛
-// 拖慢到几千帧、还随起始朝向时好时坏，而它想解决的"板环等价"本来就该在
-// 断言里避开，不该靠改物理配置绕过去。见下面无噪收敛用例的注释。
+// 板高一律取 0，走共面这一支，与 config 的出厂默认一致。
+// 实车不是共面：标准步兵相对的两块等高、相邻两块有高差，也就是 0/2 共用一个
+// 高度、1/3 共用另一个，与 r1/r2 的奇偶配对同一套（armor/src/Planner.cpp:223-226
+// 的 z0=z2、z1=z3）。这里取 0 只是让断言避开"板环整体挪两格"的等价关系，
+// 不是在声明实车共面；上车的真实高差要另外量。
+// 以前这里给 2 号板 0.15 m 的抬高，目的是打破同一层的等价关系，好让 theta_c
+// 的断言有唯一解。实测这个抬高在真实可见性下会把收敛拖慢到几千帧、还随起始
+// 朝向时好时坏，而它想解决的"板环等价"本来就该在断言里避开，不该靠改物理
+// 配置绕过去。见下面无噪收敛用例的注释。
 std::array<double, 4> testHeights() {
     return {0.0, 0.0, 0.0, 0.0};
 }
@@ -276,10 +280,12 @@ void testAnalyticJacobian() {
 //     不存在。旧夹具无条件发四块，等于把"看不见"这件事理想化掉，而这个理想化
 //     恰好掩盖了初始化那步"板面朝外即朝相机"的假设，方向写反也照样收敛。
 //
-// 二、板高全零，与出厂 config、与标准步兵四块板等高一致。旧夹具给 2 号板抬高
-//     0.15 m 是为了打破"板环整体挪两格"的等价关系，好让 theta_c 的断言唯一。
-//     那是靠改物理配置去迁就断言，而实测这个抬高在真实可见性下收敛要几千帧，
-//     还随起始朝向时好时坏。等价关系应该在断言里避开，见下面板位判据。
+// 二、板高全零，与出厂 config 的默认一致，走共面这一支。实车是 0/2 等高、
+//     1/3 等高且两组不同，但共面下观测模型仍然自洽，自洽检查用哪一支都成立。
+//     旧夹具给 2 号板抬高 0.15 m 是为了打破"板环整体挪两格"的等价关系，好让
+//     theta_c 的断言唯一。那是靠改物理配置去迁就断言，而实测这个抬高在真实
+//     可见性下收敛要几千帧，还随起始朝向时好时坏。等价关系应该在断言里避开，
+//     见下面板位判据。
 //
 // 帧数 2400 是实测定的：可见板 1~2 块、自转 2 rad/s，这一跑中心误差 1.9e-08、
 // 板位误差 3.7e-08，界 1e-6 留了两个量级以上余量。
@@ -661,6 +667,95 @@ void testSafetyInvariants() {
     std::printf("[ekf] 安全不变量 通过\n");
 }
 
+// Web Debug 要靠 PredictionResult 里这几个数把收敛、切换、遮挡恢复画出来。
+// 它们是 EKF 内部状态的出口，少了任何一个，页面上就没有直接证据；
+// 这里钉住三件事：车体中心的 z 分量、当前瞄准的板编号、命中与丢失的计数。
+void testTrackingEvidenceFieldsReachPrediction() {
+    const ArmorEkf::Config config = testConfig();
+    ArmorEkf filter(config);
+    const GimbalState gimbal = makeGimbal(0.0, 0.0);
+
+    const double dt = 1.0 / 165.0;
+    double timestamp = 0.0;
+
+    Truth truth;
+    truth.center = Eigen::Vector3d(4.0, 0.3, 0.6);
+    truth.yaw = 0.4;
+    truth.yaw_rate = 2.0;
+
+    // 自转 2 rad/s，实测第 124 帧进 Stable，800 帧留足余量。
+    int distinct_aim = 0;
+    int last_aim = -2;
+    for (int frame = 0; frame < 800; ++frame) {
+        timestamp += dt;
+        filter.predict(dt);
+        feedFrame(filter, config, truth, 0.0);
+        filter.advanceStateMachine(timestamp);
+        trueStep(truth, dt);
+        const PredictionResult result = filter.buildPrediction(gimbal, 0.001);
+        // 有目标时瞄准槽位必须落在板数范围内；无目标时用 -1 表示没瞄。
+        assert(result.aim_index < config.plate_count);
+        if (result.state != TrackingState::NoTarget) {
+            assert(result.aim_index >= 0);
+            if (result.aim_index != last_aim) {
+                ++distinct_aim;
+                last_aim = result.aim_index;
+            }
+        }
+    }
+    assert(filter.status() == TrackingState::Stable);
+    // 车在转，瞄准的板必然换过；一个数都没换说明 aim_index 没接上。
+    assert(distinct_aim >= 2);
+
+    // 车体中心三个分量都要报出来。truth 的 z 是 0.6 m，
+    // 少报 z 时页面只有二维位置。
+    const PredictionResult tracked = filter.buildPrediction(gimbal, 0.001);
+    assert(std::isfinite(tracked.center_z_m));
+    assert(std::fabs(tracked.center_z_m - truth.center.z()) < 0.05);
+    assert(std::isfinite(tracked.center_velocity_z_m_s));
+
+    // 稳态下：连续命中在涨，连续丢失是零。
+    assert(tracked.hit_streak > 0);
+    assert(tracked.miss_count == 0);
+
+    // 短时遮挡 10 帧。60 ms 远小于 1.5 s 重置门限，状态不许变 NoTarget，
+    // 但"在丢"这件事必须能从计数上看出来。
+    for (int frame = 0; frame < 10; ++frame) {
+        timestamp += dt;
+        filter.predict(dt);
+        filter.advanceStateMachine(timestamp);
+        trueStep(truth, dt);
+    }
+    const PredictionResult occluded = filter.buildPrediction(gimbal, 0.001);
+    assert(occluded.state != TrackingState::NoTarget);
+    assert(occluded.miss_count >= 10);
+    assert(occluded.hit_streak == 0);
+
+    // 观测回来，丢失计数复位、命中重新累计。
+    timestamp += dt;
+    filter.predict(dt);
+    feedFrame(filter, config, truth, 0.0);
+    filter.advanceStateMachine(timestamp);
+    trueStep(truth, dt);
+    const PredictionResult recovered = filter.buildPrediction(gimbal, 0.001);
+    assert(recovered.miss_count == 0);
+    assert(recovered.hit_streak > 0);
+
+    // 离群观测：跳变闸之外的一条，必须被拒且计数涨。
+    const int rejected_before = recovered.rejected_count;
+    ArmorPose outlier;
+    outlier.position_gimbal_m = cv::Vec3d(0.0, 0.0, 30.0);
+    outlier.position_camera_m = outlier.position_gimbal_m;
+    outlier.reprojection_error = 0.3;
+    outlier.detection.target_id = 1;
+    assert(!filter.update(outlier, 0.0));
+    timestamp += dt;
+    filter.advanceStateMachine(timestamp);
+    const PredictionResult after_outlier = filter.buildPrediction(gimbal, 0.001);
+    assert(after_outlier.rejected_count == rejected_before + 1);
+    std::printf("[ekf] 跟踪证据字段 通过\n");
+}
+
 }  // namespace
 
 int main() {
@@ -674,6 +769,7 @@ int main() {
     testStateMachineTiming();
     testInitializationTakesOneObservationPerFrame();
     testNegativePredictionBiasIsHonored();
+    testTrackingEvidenceFieldsReachPrediction();
     testSafetyInvariants();
     std::printf("[ekf] 全部通过\n");
     return 0;

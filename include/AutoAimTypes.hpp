@@ -72,8 +72,10 @@ struct PredictionResult {
     std::uint8_t target_id{0};
     float center_x_m{0.0F};
     float center_y_m{0.0F};
+    float center_z_m{0.0F};
     float center_velocity_x_m_s{0.0F};
     float center_velocity_y_m_s{0.0F};
+    float center_velocity_z_m_s{0.0F};
     float body_yaw{0.0F};
     float body_yaw_velocity{0.0F};
     float radius_1_m{0.0F};
@@ -85,6 +87,15 @@ struct PredictionResult {
     float target_yaw_velocity{0.0F};
     float target_pitch_velocity{0.0F};
     bool fire_allowed{false};
+
+    // 跟踪过程的可观测出口，供 Web Debug 画出装甲板切换与遮挡恢复。
+    // aim_index 是当前瞄准的装甲板槽位，-1 表示当前没有可瞄的板；
+    // hit_streak 与 miss_count 分别是连续命中、连续无有效观测的帧数，二者互斥；
+    // rejected_count 是累计被离群闸挡下的观测条数。
+    int aim_index{-1};
+    int hit_streak{0};
+    int miss_count{0};
+    int rejected_count{0};
 };
 
 // 读取 OpenCV YAML，将矩阵统一为 CV_64F，并拒绝占位数据或几何上无效的标定结果。

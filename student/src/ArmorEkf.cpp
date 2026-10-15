@@ -54,10 +54,12 @@ double flightTimeSeconds(double horizontal_m, double vertical_m) {
 // 否则框架会把它降级成安全帧，不如在这里就先判掉。
 bool predictionIsFinite(const PredictionResult& p) {
     return std::isfinite(p.center_x_m) && std::isfinite(p.center_y_m) &&
+           std::isfinite(p.center_z_m) &&
            std::isfinite(p.center_x_m * 1000.0F) &&
            std::isfinite(p.center_y_m * 1000.0F) &&
            std::isfinite(p.center_velocity_x_m_s) &&
-           std::isfinite(p.center_velocity_y_m_s) && std::isfinite(p.body_yaw) &&
+           std::isfinite(p.center_velocity_y_m_s) &&
+           std::isfinite(p.center_velocity_z_m_s) && std::isfinite(p.body_yaw) &&
            std::isfinite(p.body_yaw_velocity) && std::isfinite(p.radius_1_m) &&
            std::isfinite(p.radius_2_m) && std::isfinite(p.distance_m) &&
            std::isfinite(p.target_yaw) && std::isfinite(p.target_pitch) &&
@@ -674,11 +676,17 @@ PredictionResult ArmorEkf::buildPrediction(const GimbalState& gimbal, double lat
     const std::uint8_t aim_target_id =
         index_target_id_[static_cast<std::size_t>(aim_index)];
     result.target_id = aim_target_id != 0 ? aim_target_id : target_id_;
-    // 车体状态报在跟踪系（W：x 前、y 左）里，与 PredictionResult 的注释一致。
+    result.aim_index = aim_index;
+    result.hit_streak = hit_streak_;
+    result.miss_count = miss_count_;
+    result.rejected_count = rejected_count_;
+    // 车体状态报在跟踪系（W：x 前、y 左、z 上）里，与 PredictionResult 的注释一致。
     result.center_x_m = static_cast<float>(x_[Px]);
     result.center_y_m = static_cast<float>(x_[Py]);
+    result.center_z_m = static_cast<float>(x_[Pz]);
     result.center_velocity_x_m_s = static_cast<float>(x_[Vx]);
     result.center_velocity_y_m_s = static_cast<float>(x_[Vy]);
+    result.center_velocity_z_m_s = static_cast<float>(x_[Vz]);
     result.body_yaw = static_cast<float>(x_[Yaw]);
     result.body_yaw_velocity = static_cast<float>(x_[YawRate]);
     result.radius_1_m = static_cast<float>(std::max(0.0, x_[Radius1]));

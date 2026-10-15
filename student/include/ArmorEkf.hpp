@@ -55,9 +55,20 @@ public:
     };
 
     struct Config {
-        // 每块装甲板相对旋转中心的高度差 (m)，下标是板编号 0..3。
-        // 默认全零。前哨站不是共面的，例如 {0, -0.102, 0.102, 0}
-        // （来源 armor/include/Planner.hpp 的前哨站参数）。
+        // 每块装甲板相对旋转中心的高度差 (m)，下标是板槽位 0..3。
+        //
+        // 标准步兵与哨兵：相对的两块等高、相邻两块有高差，也就是槽位 0/2
+        // 共用一个高度、1/3 共用另一个，与半径 r1/r2 的奇偶配对同一套。
+        // 参考实现是这么建的，armor/src/Planner.cpp:223-226 的 z0 = z2、z1 = z3
+        // （状态里没有第 12、13 维时 z2/z3 直接回落到 z0/z1）。
+        // 所以四个数实际只有两个自由度，上车量出来按 {h0, h1, h0, h1} 填。
+        //
+        // 默认全零表示四块共面。这对标准步兵是错的，且不会报错：观测模型的
+        // 高度是常量，填错只会把高差算进 pz 的偏置里，滤波看上去一切正常。
+        // 上车的必做项之一就是把它量出来。
+        //
+        // 前哨站是三块不共面，四个数互相独立，例如 {0, -0.102, 0.102, 0}
+        // （来源 armor/include/Planner.hpp:56-58 的 outpost_z_offset_0/1/2）。
         std::array<double, 4> plate_height_m{0.0, 0.0, 0.0, 0.0};
 
         // 装甲板在车体周向上的块数，以及相邻两块之间的夹角。
@@ -136,6 +147,8 @@ public:
     int hitStreak() const { return hit_streak_; }
     int missCount() const { return miss_count_; }
     int rejectedCount() const { return rejected_count_; }
+    // 当前瞄准的装甲板槽位，-1 表示没有可瞄的板。
+    int aimIndex() const { return aim_index_; }
     bool hasTarget() const { return status_ != TrackingState::NoTarget; }
     const StateVector& state() const { return x_; }
     const Covariance& covariance() const { return P_; }
