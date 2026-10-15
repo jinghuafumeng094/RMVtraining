@@ -159,20 +159,24 @@ std::vector<ArmorPose> armor_solve(const std::vector<ArmorDetection>& detections
         pose.reprojection_error = error_px;
 
         // 相机系 -> 云台系：一条刚体变换，全函数就这一处用到外参。
+        // 这里的 R 不是单位阵：相机系是 右 / 下 / 前，云台系是 前 / 左 / 上，
+        // 两者差一个 90 度置换，见 config/camera.yaml 顶部。若把 R 当单位阵，
+        // 位置会照常解出来、也不报错，只是每个分量都换了含义。
         const cv::Mat p_camera =
             (cv::Mat_<double>(3, 1) << tvec[0], tvec[1], tvec[2]);
         pose.position_gimbal_m = toVec3d(R_camera_to_gimbal * p_camera +
                                          t_camera_to_gimbal);
 
-        // armor_yaw：装甲板法向在云台系中的偏航角。
+        // armor_yaw：装甲板法向在云台系中的偏航角，右为正。
         // 物体系 +z（指向板背）在相机系里就是旋转矩阵的第三列，
-        // 换到云台系后取 atan2(x, z)。板正对相机时 = 0。
+        // 换到云台系（前 / 左 / 上）后取 atan2(-y, x)。板正对相机时 = 0。
+        // 与 main.cpp 的 pnp_yaw_rad、ArmorEkf 的 rel_yaw 同一套口径。
         cv::Mat R_object_to_camera;
         cv::Rodrigues(rvec, R_object_to_camera);
         const cv::Mat normal_gimbal =
             R_camera_to_gimbal * R_object_to_camera.col(2);
-        pose.armor_yaw =
-            std::atan2(normal_gimbal.at<double>(0), normal_gimbal.at<double>(2));
+        pose.armor_yaw = std::atan2(-normal_gimbal.at<double>(1),
+                                    normal_gimbal.at<double>(0));
 
         poses.push_back(pose);
     }

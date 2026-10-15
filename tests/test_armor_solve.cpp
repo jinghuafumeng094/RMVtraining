@@ -82,6 +82,33 @@ cv::Mat yawRotation(double phi) {
             0.0, -std::sin(phi), 0.0, std::cos(phi));
 }
 
+// 相机系 -> 云台系的旋转外参，与 config/camera.yaml 里填的是同一个值。
+// 这里手写一遍是有意的：相机系是 右 / 下 / 前，云台系是 前 / 左 / 上，
+// 两系之间必须差一个 90 度置换。若实现里把它当单位阵，位置照样解得出来、
+// 也不报错，只有逐分量比对能发现。三列分别是相机三个轴在云台系里的分量：
+//   相机的 +x（右）-> 云台的 (0, -1, 0)
+//   相机的 +y（下）-> 云台的 (0, 0, -1)
+//   相机的 +z（前）-> 云台的 (1, 0, 0)
+cv::Mat cameraToGimbalRotation() {
+    return (cv::Mat_<double>(3, 3) << 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, 0.0, -1.0,
+            0.0);
+}
+
+// 相机光心在云台系中的位置：前 67.11 mm、横向 0、上 51.5 mm。
+// 轴序只能这么读：同一份材料里枪口向量写作 (74.1, 0, 0)，枪口必然在正前方，
+// 所以第一个分量是"前"，那组数就是在 前 / 左 / 上 里量的。
+cv::Mat cameraToGimbalTranslation() { return tvecOf(0.06711, 0.0, 0.0515); }
+
+// 装上真外参的那台相机。makeCamera() 给的是单位阵外参，只用来量相机系
+// 那一半的几何；凡是断言里出现云台系坐标或 armor_yaw 的用例，都得用这一台，
+// 否则那两个量在单位阵下会退化成恒 0，断言等于没写。
+CameraParameters makeCameraOnGimbal() {
+    CameraParameters c = makeCamera();
+    c.rotation_camera_to_gimbal = cameraToGimbalRotation();
+    c.translation_camera_to_gimbal = cameraToGimbalTranslation();
+    return c;
+}
+
 double dist(const cv::Vec3d& a, const cv::Vec3d& b) {
     const double dx = a[0] - b[0], dy = a[1] - b[1], dz = a[2] - b[2];
     return std::sqrt(dx * dx + dy * dy + dz * dz);
@@ -105,7 +132,7 @@ int main() {
     // 1. 正对相机的板：位置要还原到毫米级，重投影误差要接近 0
     // =======================================================================
     {
-        const CameraParameters cam = makeCamera();
+        const CameraParameters cam = makeCameraOnGimbal();
         const cv::Mat zero_rvec = cv::Mat::zeros(3, 1, CV_64F);
         const cv::Mat pose = tvecOf(0.1, -0.05, 2.0);
 
@@ -126,15 +153,24 @@ int main() {
         assert(poses[0].detection.confidence == 0.9F);
         assert(poses[0].detection.size == ArmorSize::Small);
 
-        // 板正对相机 => 法向的偏航角是 0。
+        // 板正对相机 => 法向在云台系里朝正前方，偏航角是 0。
+        // 物体系 +z（板背方向）在相机系里是 (0, 0, 1)，置换后落在云台系的 +x。
         //
-        // ↓ 这一条是**唯一**能抓住"平面位姿二义性选错了"的断言：
-        //    矩形板有镜像解，解错的话位置一模一样、重投影误差一样是 0，
-        //    只有法向会翻成 ±π。位置那几条断言全绿也发现不了。
+        // 这一条是**唯一**能抓住"平面位姿二义性选错了"的断言：
+        // 矩形板有镜像解，解错的话位置一模一样、重投影误差一样是 0，
+        // 只有法向会翻成 ±π。位置那几条断言全绿也发现不了。
+        // 注意这要求外参是真外参：单位阵下云台系等于相机系，法向是 (0, 0, 1)，
+        // atan2 的两个输入同时为 0，这一条会退化成恒真。
         assert(std::fabs(poses[0].armor_yaw) < 1e-3);
 
-        // 外参是单位阵 + 零平移 => 云台系坐标必须等于相机系坐标
-        assert(dist(poses[0].position_gimbal_m, poses[0].position_camera_m) < 1e-9);
+        // 云台系坐标 = R * 相机系坐标 + t，R 是那个 90 度置换、不是单位阵。
+        // 板心在相机系里是 (0.1, -0.05, 2.0)，于是云台系里是
+        // (前 2.06711, 左 -0.1, 上 0.1015)，逐分量写死，不引实现里的任何量。
+        assert(std::fabs(poses[0].position_gimbal_m[0] - 2.06711) < 1e-3);
+        assert(std::fabs(poses[0].position_gimbal_m[1] + 0.1) < 1e-3);
+        assert(std::fabs(poses[0].position_gimbal_m[2] - 0.1015) < 1e-3);
+        // 三个分量全都换了位置 —— 把 R 当单位阵时这三条会同时红
+        assert(dist(poses[0].position_gimbal_m, poses[0].position_camera_m) > 1.0);
     }
 
     // =======================================================================
@@ -228,8 +264,12 @@ int main() {
     // =======================================================================
     // 5. 板没正对相机时，偏航角要跟着转
     // =======================================================================
+    // 相机绕竖直轴把板转 phi，法向在相机系里是 (sin phi, 0, cos phi)；
+    // 换到云台系（前 / 左 / 上）是 (cos phi, -sin phi, 0)，
+    // 取 atan2(-y, x) 正好还原成 phi。这条同时钉住"置换的方向别反"：
+    // 若实现写成 R 的转置，这里会得到 -phi。
     {
-        const CameraParameters cam = makeCamera();
+        const CameraParameters cam = makeCameraOnGimbal();
         const double phi = 30.0 * CV_PI / 180.0;
         cv::Mat rvec;
         cv::Rodrigues(yawRotation(phi), rvec);

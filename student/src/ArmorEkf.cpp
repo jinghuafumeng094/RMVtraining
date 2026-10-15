@@ -14,8 +14,11 @@
 //
 // 符号约定：两个偏航角转正的方向并不相同，这不是笔误。
 // theta_c 是 W 系（x 前、y 左）里的方位角，从 +x 转向 +y 为正，而 +y 朝左，
-// 所以 theta_c 左为正。gimbal.yaw 经 G 系（x 右、y 下、z 前）定义成右为正。
+// 所以 theta_c 左为正。gimbal.yaw 定义成右为正。
 // 两者各自只在一个地方用一次，滤波器因此仍然自洽，不需要强行统一。
+//
+// G 云台系与 W 世界系轴向相同（前 / 左 / 上），只差绕竖直轴的偏航角。依据是
+// 学长 2026-10-15「云台系和世界系一样」，见 docs/上车前问题清单.md 第 1.1 节。
 // tests/test_ekf_predict.cpp 把两处都钉住了：坐标变换用例钉 gimbalToWorld 的
 // 方向，无噪收敛用例逐分量比对真值（真值的 psi 就用左为正），把 theta_c 钉住。
 // 但"是否符合电控下发的符号"仓库里没有任何一处写明，只能上车确认。若发现
@@ -34,6 +37,17 @@ namespace {
 constexpr double kPi = 3.14159265358979323846;
 constexpr int kNisRingSize = 8;
 constexpr int kLatencyRingSize = 32;
+
+// 云台系（前 / 左 / 上）里，一个点相对云台的两个视线角。
+// 这两个式子与 main.cpp 的 pnp_yaw_rad / pnp_pitch_rad 同式，与 armor_solve 的
+// armor_yaw 同口径：右为正、抬头为正，正前方是 0。集中在这里，别在调用处散抄。
+double gimbalAzimuth(const Eigen::Vector3d& p) {
+    return std::atan2(-p.y(), p.x());
+}
+
+double gimbalElevation(const Eigen::Vector3d& p) {
+    return std::atan2(p.z(), std::hypot(p.x(), p.y()));
+}
 
 // 弹道飞行时间。复用仓库里的 Bullet_Model（armor/include/BulletModel.hpp），
 // 它的坐标系就是 W（前 x、左 y、上 z），默认初速 24 m/s。
@@ -81,9 +95,9 @@ Eigen::Matrix3d ArmorEkf::gimbalToWorld(double gimbal_yaw) {
     const double s = std::sin(gimbal_yaw);
     const double c = std::cos(gimbal_yaw);
     Eigen::Matrix3d m;
-    m << -s, 0.0, c,
-         -c, 0.0, -s,
-         0.0, -1.0, 0.0;
+    m << c, s, 0.0,
+         -s, c, 0.0,
+         0.0, 0.0, 1.0;
     return m;
 }
 
@@ -136,23 +150,27 @@ ArmorEkf::ObservationJacobian ArmorEkf::observationJacobian(
     const std::array<double, 4>& plate_height_m, double plate_spacing_rad) {
     (void)plate_height_m;  // 高度是常量，不进状态，因此不产生列
     const int i = armor_index;
-    const double s = std::sin(gimbal_yaw);
-    const double c = std::cos(gimbal_yaw);
-    const double psi_plus_gimbal =
-        x[Yaw] + static_cast<double>(i) * plate_spacing_rad + gimbal_yaw;
+    const double psi = x[Yaw] + static_cast<double>(i) * plate_spacing_rad;
     const double radius = x[radiusIndex(i)];
+    const Eigen::Matrix3d to_gimbal = worldToGimbal(gimbal_yaw);
 
+    // h(x) = M^T * u(x)，所以每列就是 M^T 乘上 u 对那个状态分量在 W 系里的偏导。
+    // 一律走 worldToGimbal，不在这里手抄 M^T 的元素。手抄等于把同一个约定写两遍，
+    // 换约定时容易只改一处；测试的有限差分对拍能抓到，但不该给它这个机会。
     ObservationJacobian H = ObservationJacobian::Zero();
-    // 平移部分：z = M^T * u，u 对 px/py/pz 的偏导是坐标轴，M^T 取 M 的列。
-    H.col(Px) << -s, 0.0, c;
-    H.col(Py) << -c, 0.0, -s;
-    H.col(Pz) << 0.0, -1.0, 0.0;
-    // yaw：u 对 theta_c 的偏导为 r * (-sin psi, cos psi, 0)。
-    H.col(Yaw) << -radius * std::cos(psi_plus_gimbal), 0.0,
-        -radius * std::sin(psi_plus_gimbal);
-    // 半径：只有该板对应的那一列非零，另一列在上面已被置零。
-    H.col(radiusIndex(i)) << -std::sin(psi_plus_gimbal), 0.0,
-        std::cos(psi_plus_gimbal);
+    // 平移：u 的三个平移项分别是 px/py/pz 加一个与状态无关的偏移，偏导就是坐标轴。
+    H.col(Px) = to_gimbal * Eigen::Vector3d(1.0, 0.0, 0.0);
+    H.col(Py) = to_gimbal * Eigen::Vector3d(0.0, 1.0, 0.0);
+    H.col(Pz) = to_gimbal * Eigen::Vector3d(0.0, 0.0, 1.0);
+    // yaw 与半径各自在 W 系里有一个方向，再统一换到云台系。两个方向差 90 度，
+    // 别图省事共用同一个向量：
+    //   u 对 theta_c 的偏导 = r * (-sin psi, cos psi, 0)   方位角转，切向
+    //   u 对 r 的偏导       =     ( cos psi, sin psi, 0)   半径伸长，径向
+    const Eigen::Vector3d tangential(-std::sin(psi), std::cos(psi), 0.0);
+    const Eigen::Vector3d radial(std::cos(psi), std::sin(psi), 0.0);
+    H.col(Yaw) = to_gimbal * (radius * tangential);
+    // 半径只有该板对应的那一列非零，另一列在上面已被置零。
+    H.col(radiusIndex(i)) = to_gimbal * radial;
     return H;
 }
 
@@ -216,13 +234,16 @@ void ArmorEkf::fillProcessNoise(double dt, Covariance& Q) const {
 }
 
 Eigen::Matrix3d ArmorEkf::observationNoise(const Eigen::Vector3d& z) const {
+    // 云台系是 前 / 左 / 上，第 0 个分量沿视线，也就是深度；1、2 两个是横向。
+    // 深度方向的不确定度比横向大好几倍（单目深度靠板宽反推），别把两者放错轴：
+    // 放错不会报错，只会让滤波器该信的不信、该松的不松。
     const double d = z.norm();
     const double lateral = config_.lateral_noise_scale * d + config_.lateral_noise_base_m;
     const double depth = config_.depth_noise_scale * d + config_.depth_noise_base_m;
     Eigen::Matrix3d R = Eigen::Matrix3d::Zero();
-    R(0, 0) = lateral * lateral;
+    R(0, 0) = depth * depth;
     R(1, 1) = lateral * lateral;
-    R(2, 2) = depth * depth;
+    R(2, 2) = lateral * lateral;
     return R;
 }
 
@@ -570,7 +591,7 @@ int ArmorEkf::selectArmorIndex(const StateVector& x, double gimbal_yaw, bool com
             current_facing = true;
         }
         const Eigen::Vector3d p_gimbal = to_gimbal * p_world;
-        const double abs_yaw = std::fabs(std::atan2(p_gimbal.x(), p_gimbal.z()));
+        const double abs_yaw = std::fabs(gimbalAzimuth(p_gimbal));
         if (abs_yaw < best_abs_yaw) {
             best_abs_yaw = abs_yaw;
             best = i;
@@ -586,8 +607,7 @@ int ArmorEkf::selectArmorIndex(const StateVector& x, double gimbal_yaw, bool com
     // 迟滞：新板要好过当前瞄准板一个余量才切，避免在两块板之间来回跳。
     if (aim_index_ >= 0 && current_facing && aim_index_ != best) {
         const Eigen::Vector3d p_current = to_gimbal * platePositionWorld(x, aim_index_);
-        const double current_abs_yaw =
-            std::fabs(std::atan2(p_current.x(), p_current.z()));
+        const double current_abs_yaw = std::fabs(gimbalAzimuth(p_current));
         if (current_abs_yaw - best_abs_yaw < config_.aim_switch_margin_rad) {
             best = aim_index_;
         }
@@ -642,11 +662,9 @@ PredictionResult ArmorEkf::buildPrediction(const GimbalState& gimbal, double lat
     const Eigen::Vector3d p_gimbal_aim =
         to_gimbal * platePositionWorld(x_pred, aim_index);
 
-    // 与 main.cpp 里 pnp_yaw_rad / pnp_pitch_rad 逐字同式：
-    // yaw 右为正，pitch 抬头为正。
-    const double rel_yaw = std::atan2(p_gimbal_aim.x(), p_gimbal_aim.z());
-    const double rel_pitch = -std::atan2(
-        p_gimbal_aim.y(), std::hypot(p_gimbal_aim.x(), p_gimbal_aim.z()));
+    // 与 main.cpp 里 pnp_yaw_rad / pnp_pitch_rad 同式：yaw 右为正，pitch 抬头为正。
+    const double rel_yaw = gimbalAzimuth(p_gimbal_aim);
+    const double rel_pitch = gimbalElevation(p_gimbal_aim);
 
     // 角速度用中心差分，窗口 +/-5 ms。
     constexpr double kRateHalfWindowS = 0.005;
@@ -658,12 +676,10 @@ PredictionResult ArmorEkf::buildPrediction(const GimbalState& gimbal, double lat
     propagate(x_late, t_late);
     const Eigen::Vector3d p_early = to_gimbal * platePositionWorld(x_early, aim_index);
     const Eigen::Vector3d p_late = to_gimbal * platePositionWorld(x_late, aim_index);
-    const double yaw_early = std::atan2(p_early.x(), p_early.z());
-    const double yaw_late = std::atan2(p_late.x(), p_late.z());
-    const double pitch_early =
-        -std::atan2(p_early.y(), std::hypot(p_early.x(), p_early.z()));
-    const double pitch_late =
-        -std::atan2(p_late.y(), std::hypot(p_late.x(), p_late.z()));
+    const double yaw_early = gimbalAzimuth(p_early);
+    const double yaw_late = gimbalAzimuth(p_late);
+    const double pitch_early = gimbalElevation(p_early);
+    const double pitch_late = gimbalElevation(p_late);
     const double dt_window = t_late - t_early;
     const double yaw_velocity =
         dt_window > 0.0 ? wrapToPi(yaw_late - yaw_early) / dt_window : 0.0;

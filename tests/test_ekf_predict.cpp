@@ -170,23 +170,32 @@ ArmorEkf::Config testConfig() {
 // ---------------------------------------------------------------------------
 
 void testCoordinateTransforms() {
+    // 云台系与世界系轴向相同（前 / 左 / 上），云台正对前方时两系重合。
+    // 这条同时钉住了"没有基础变换"这件事：若哪天又冒出一个 90 度的置换，
+    // 下面第一个断言就会红。
     const Eigen::Matrix3d m = ArmorEkf::gimbalToWorld(0.0);
+    assert((m - Eigen::Matrix3d::Identity()).norm() < 1e-12);
     assert(std::fabs(m.determinant() - 1.0) < 1e-12);
 
-    // 云台系正前方 +z 对应世界系 +x，云台系右侧 +x 对应世界系 -y。
-    assert((m * Eigen::Vector3d(0.0, 0.0, 5.0) - Eigen::Vector3d(5.0, 0.0, 0.0)).norm() <
+    // 三个轴一一对应。
+    assert((m * Eigen::Vector3d(5.0, 0.0, 0.0) - Eigen::Vector3d(5.0, 0.0, 0.0)).norm() <
            1e-12);
-    assert((m * Eigen::Vector3d(5.0, 0.0, 0.0) - Eigen::Vector3d(0.0, -5.0, 0.0)).norm() <
+    assert((m * Eigen::Vector3d(0.0, 5.0, 0.0) - Eigen::Vector3d(0.0, 5.0, 0.0)).norm() <
            1e-12);
-    assert((m * Eigen::Vector3d(0.0, 5.0, 0.0) - Eigen::Vector3d(0.0, 0.0, -5.0)).norm() <
+    assert((m * Eigen::Vector3d(0.0, 0.0, 5.0) - Eigen::Vector3d(0.0, 0.0, 5.0)).norm() <
            1e-12);
 
     // 云台向右转，视线在世界系里朝 -y 走。这条把 gimbal.yaw 的方向钉死：
     // 右为正是它的定义，符号若反了这里立刻红。
     const double yaw = 0.2;
     const Eigen::Vector3d boresight =
-        ArmorEkf::gimbalToWorld(yaw) * Eigen::Vector3d(0.0, 0.0, 1.0);
+        ArmorEkf::gimbalToWorld(yaw) * Eigen::Vector3d(1.0, 0.0, 0.0);
     assert(std::fabs(std::atan2(boresight.y(), boresight.x()) + yaw) < 1e-12);
+
+    // 竖直轴不参与偏航：竖直方向在两系里一致。
+    const Eigen::Vector3d up =
+        ArmorEkf::gimbalToWorld(yaw) * Eigen::Vector3d(0.0, 0.0, 5.0);
+    assert((up - Eigen::Vector3d(0.0, 0.0, 5.0)).norm() < 1e-12);
 
     const Eigen::Matrix3d round_trip =
         ArmorEkf::worldToGimbal(yaw) * ArmorEkf::gimbalToWorld(yaw);
@@ -224,8 +233,9 @@ void testPlateAzimuthConvention() {
     assert(relative.y() > 0.0);  // 左为正
 
     // 同一时刻云台 yaw 取同一个正值，视线却朝 -y（右）。方向确实相反。
+    // 云台系的"正前方"是 +x，与 W 系一致。
     const Eigen::Vector3d boresight =
-        ArmorEkf::gimbalToWorld(theta_c) * Eigen::Vector3d(0.0, 0.0, 1.0);
+        ArmorEkf::gimbalToWorld(theta_c) * Eigen::Vector3d(1.0, 0.0, 0.0);
     assert(boresight.y() < 0.0);
 
     std::printf("[ekf] theta_c 左为正 / gimbal.yaw 右为正 通过\n");
@@ -744,7 +754,7 @@ void testTrackingEvidenceFieldsReachPrediction() {
     // 离群观测：跳变闸之外的一条，必须被拒且计数涨。
     const int rejected_before = recovered.rejected_count;
     ArmorPose outlier;
-    outlier.position_gimbal_m = cv::Vec3d(0.0, 0.0, 30.0);
+    outlier.position_gimbal_m = cv::Vec3d(30.0, 0.0, 0.0);
     outlier.position_camera_m = outlier.position_gimbal_m;
     outlier.reprojection_error = 0.3;
     outlier.detection.target_id = 1;

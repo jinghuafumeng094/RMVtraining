@@ -18,17 +18,21 @@
 //     r1/r2     偶数/奇数编号装甲板到旋转中心的半径 (m)
 //
 // 两套坐标系，互相变换只允许走 gimbalToWorld / worldToGimbal 两个函数：
-//   G 云台系  x 右、y 下、z 前
-//             armor_solve 输出的 position_gimbal_m 就在这个系里，
-//             与相机系同向（外参 R 是单位阵，见 StudentTasks.cpp 的物体系约定）。
+//   G 云台系  x 前、y 左、z 上
+//             armor_solve 输出的 position_gimbal_m 就在这个系里。
 //   W 世界系  x 前、y 左、z 上
 //             与 armor/include/BulletModel.hpp 的弹道模型约定一致。
+//
+// 两系轴向相同，只差一个绕竖直轴（两系的 z）的偏航角，没有基础变换。
+// 依据：学长 2026-10-15「云台系和世界系一样」，见 docs/上车前问题清单.md 第 1.1 节。
+// 代价是相机系（右 / 下 / 前）与云台系不再同向，config/camera.yaml 的旋转外参
+// 因此不是单位阵而是 90 度置换矩阵；那是外参的事，本类只按上面的轴向写。
 //
 // 运动模型必须建在 W 系。云台会转，同一个静止目标在 G 系里每帧坐标都在变，
 // 在 G 系里做运动模型会把云台的转动误当成目标的运动。
 //
 // 两个偏航角的转正方向不同，别混：theta_c 是 W 系里的方位角，从 +x 转向 +y
-// 为正，而 W 系 y 朝左，所以 theta_c 是左为正；gimbal.yaw 经 G 系定义成右为正。
+// 为正，而 +y 朝左，所以 theta_c 是左为正；gimbal.yaw 定义成右为正。
 // 两者只在观测模型里各用一次，各按各的定义，滤波器仍然自洽，不需要统一。
 // 与电控实际符号对不对只能上车确认，见 ArmorEkf.cpp 顶部的说明；若云台方向
 // 反了，把 gimbalToWorld 换成它的转置即可，只有那一处。
@@ -155,10 +159,11 @@ public:
     const Config& config() const { return config_; }
 
     // 坐标系变换：p_world = gimbalToWorld(yaw) * p_gimbal。
-    // M(yaw) = [ -sin  0  cos ]
-    //          [ -cos  0 -sin ]
-    //          [   0  -1   0  ]
-    // 绕世界 z 轴转动，行列式为 +1。
+    // M(yaw) = [  cos  sin  0 ]
+    //          [ -sin  cos  0 ]
+    //          [   0    0   1 ]
+    // 两系轴向相同，就只剩这个绕 z 轴的偏航，行列式为 +1。
+    // gimbal_yaw 取正值时云台向右转，世界系里的视线朝 -y 走。
     static Eigen::Matrix3d gimbalToWorld(double gimbal_yaw);
     static Eigen::Matrix3d worldToGimbal(double gimbal_yaw);
 

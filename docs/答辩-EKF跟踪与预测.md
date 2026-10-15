@@ -55,16 +55,20 @@ applyPrediction(translator, prediction)           src/AppSupport.cpp:74
 
 | 记号 | 各轴 | 原点 | 从哪来 |
 |---|---|---|---|
-| **G 云台系** | x 右、y 下、z 前 | 云台旋转中心 | `armor_solve` 输出的 `position_gimbal_m` 就在这个系里 |
+| **G 云台系** | x 前、y 左、z 上 | 云台旋转中心 | `armor_solve` 输出的 `position_gimbal_m` 就在这个系里 |
 | **W 世界系** | x 前、y 左、z 上 | 云台旋转中心在初始时刻的位置 | 与 `armor/include/BulletModel.hpp` 的弹道模型一致 |
 | **物体系**（装甲板） | x 板右、y 板下、z 指板背 | 板心 | `armor_solve` 里 `plateObjectPoints` |
 
-两个偏航角的转正方向**故意不同**，这不是笔误（`ArmorEkf.cpp:15-22` 有原话）：
+**G 与 W 的轴向完全相同**（学长 2026-10-15：「云台系和世界系一样」），两系只差一个绕竖直轴的偏航角，再外加原点平移。依据与推导过程见 `docs/上车前问题清单.md` 第 1.1 节，图见 `docs/img/坐标系方向.png`。
+
+两个偏航角的转正方向**故意不同**，这不是笔误（`ArmorEkf.cpp:16-22` 有原话）：
 
 - `theta_c` 是 W 系里的方位角，从 +x 转向 +y 为正，而 W 的 +y 朝左，所以 `theta_c` **左为正**。
-- `gimbal.yaw` 经 G 系（x 右、y 下、z 前）定义成 **右为正**。
+- `gimbal.yaw` 在 `atan2(-y, x)` 这个口径下定义成 **右为正**，与 `main.cpp` 的 `pnp_yaw_rad`、`armor_solve` 的 `armor_yaw` 同号。
 
 两者各自只在观测模型里用一次，滤波器因此仍然自洽，不需要强行统一。与电控实际符号对不对，仓库里没有任何一处写明，只能上车确认。
+
+> **（本节 2026-10-15 改过。）** 原先把云台系定义成与相机系各轴同向（x 右 / y 下 / z 前），G 与 W 之间因此要补一个 90° 的轴置换。学长 2026-10-15 定下云台系与世界系同向之后，那个 90° 从两系之间挪到了**相机系 -> 云台系的旋转外参 R** 上（见 `docs/答辩-位姿解算.md` §1.2），本节与 §1.3 的变换就只剩一个偏航。
 
 ## 1.2 唯一的变换函数
 
@@ -75,9 +79,9 @@ Eigen::Matrix3d ArmorEkf::gimbalToWorld(double gimbal_yaw) {
     const double s = std::sin(gimbal_yaw);
     const double c = std::cos(gimbal_yaw);
     Eigen::Matrix3d m;
-    m << -s,   0.0,  c,
-         -c,   0.0, -s,
-          0.0, -1.0, 0.0;
+    m << c,   s,   0.0,
+         -s,   c,   0.0,
+         0.0,  0.0, 1.0;
     return m;
 }
 
@@ -96,62 +100,44 @@ Eigen::Matrix3d ArmorEkf::worldToGimbal(double gimbal_yaw) {
 
 ## 1.3 这个矩阵怎么来的
 
-拆成两步，能一步步手算核对。
+**第一步，取 `gimbal_yaw = 0`（云台正对前方）。**
 
-**第一步，取 `gimbal_yaw = 0`（云台正对前方），只做轴改名。**
-
-`gimbalToWorld(0)` 把 `s=0, c=1` 代进去：
+两系轴向相同（前 / 左 / 上），所以这一步**一次改名都不用做**：
 
 ```
-M(0) = [ 0  0  1 ]
-       [-1  0  0 ]
-       [ 0 -1  0 ]
+M(0) = I
 ```
 
-读这个矩阵用「第 j 列 = 第 j 个基向量的像」：`M(0)` 的第 1 列 `(0,-1,0)` 就是 G 的 +x（右）在 W 系里的坐标，第 2 列第 3 列同理。注意 Eigen 的 `<<` 是**按行填**，写代码和读矩阵要对齐。
-
-直接代三个基向量核对（`d > 0`）。取 `p_G = (0, 0, d)`，即 G 系正前方 d 米：
-
-```
-M(0) * (0,0,d)^T = d * (第 3 列) = d * (1, 0, 0) = (d, 0, 0)     W 的 +x = 前
-```
-
-正前方在 W 里就是前方，对。取 `p_G = (d, 0, 0)`（G 系右侧 d 米）：
-
-```
-M(0) * (d,0,0)^T = d * (第 1 列) = d * (0, -1, 0) = (0, -d, 0)   W 的 -y = 右
-```
-
-G 的右边是 W 的右边，对。取 `p_G = (0, d, 0)`（G 系下方 d 米）：
-
-```
-M(0) * (0,d,0)^T = d * (第 2 列) = d * (0, 0, -1) = (0, 0, -d)   W 的 -z = 下
-```
-
-G 的下方是 W 的下方，对。所以 `M(0)` 就是一个纯轴改名的置换矩阵，行列式 +1。这三条正是 `tests/test_ekf_predict.cpp:102` 的坐标变换用例钉住的三个断言。
+这正是「云台系和世界系一样」的直接结果。旧口径下这里是一个 90° 的轴置换矩阵，现在它挪到了相机外参 `R` 上。
 
 **第二步，把云台的转动叠上去。**
 
-云台绕**自己的竖直轴**转 `gimbal_yaw`。关键是先分清「在哪个系里转」：
-
-- 物理上的竖直方向，在 W 系里是 z 轴，在 G 系里是 y 轴。云台是绕 G 系的 y 轴转的。
-- 所以正确的写法是：先在 G 系里做一个绕 y 的转动 `R_y(θg)`，再用 `M(0)` 把结果搬到 W 系。写成一个乘积：
+云台绕竖直轴转 `gimbal_yaw`。两系的竖直轴都是 z，所以转动就是绕 z 的一次旋转，唯一的自由度是符号：
 
 ```
-p_W = M(0) · R_y(θg) · p_G       即   M(θg) = M(0) · R_y(θg)
+M(θg) = R_z(-θg)
 ```
 
-拿 `s, c` 代进去展开，正好得到代码里那个矩阵（第一行 `[-s, 0, c]`、第二行 `[-c, 0, -s]`、第三行 `[0, -1, 0]`）。
+拿 `s, c` 代进去展开，正好得到代码里那个矩阵（第一行 `[c, s, 0]`、第二行 `[-s, c, 0]`、第三行 `[0, 0, 1]`）。
 
-**这里最容易看错的是把 `R_y` 写成 `R_z`。** 记法：「云台绕自己的 y 轴转，而 G 系的 y 是向下的竖直轴」，转动写在 G 系那一侧，`M(0)` 只负责最后改一次名。
-
-自检锚点（答辩时背这两条就够）：
+**那个负号就是「右为正」的核对**，答辩时值得当场推一遍。`s = sin θg`：取 G 系正前方 d 米的点 `p_G = (d, 0, 0)`：
 
 ```
-θg = 0,  正前方板 p_G = (0,0,d)  ->  p_W = (d,0,0)
-det(M(θg)) = +1（永远是纯转动，不翻转不缩放）
-worldToGimbal =  transpose（正交阵的逆就是转置，不用求逆）
+M(θg) * (d,0,0)^T = d * (第 1 列) = d * (c, -s, 0)
 ```
+
+`θg > 0` 时第二个分量是负的，而 W 的 +y 朝**左**，所以这个点在 W 里偏到了**右边** —— 云台往右转，正前方的点在世界上确实跑到右边。若写成 `R_z(+θg)`，正前方会被转到左边，与「右为正」相反。行列式恒 +1，永远是纯转动。
+
+自检锚点（答辩时背这几条就够）：
+
+```
+θg = 0,  M = I                              两系同向，不转就重合
+θg > 0（右正）,  p_G = (d,0,0)  ->  p_W = (d·cosθg, -d·sinθg, 0)   视线偏到右边
+det(M(θg)) = +1                             纯转动，不翻转不缩放
+worldToGimbal = transpose                   正交阵的逆就是转置，不用求逆
+```
+
+`tests/test_ekf_predict.cpp:102` 的坐标变换用例钉住的就是这几条。
 
 `tests/test_ekf_predict.cpp:114-119` 把 `θg = 0.2` 时的方向也钉住了：转完的视线方向再绕回云台角，方位角必须精确复原。
 
@@ -391,26 +377,34 @@ h_i(x) = M(theta_g)^T * u_i(x)                    换到 G 系, 3 维观测
 `ArmorEkf.cpp:132-155`。非零的四个列：
 
 ```cpp
-H.col(Px) << -s, 0.0, c;          // 平移
-H.col(Py) << -c, 0.0, -s;
-H.col(Pz) << 0.0, -1.0, 0.0;
-H.col(Yaw) << -radius * std::cos(psi_plus_gimbal), 0.0,
-              -radius * std::sin(psi_plus_gimbal);
-H.col(radiusIndex(i)) << -std::sin(psi_plus_gimbal), 0.0,
-                          std::cos(psi_plus_gimbal);
+ObservationJacobian H = ObservationJacobian::Zero();
+H.col(Px) = to_gimbal * Eigen::Vector3d(1.0, 0.0, 0.0);
+H.col(Py) = to_gimbal * Eigen::Vector3d(0.0, 1.0, 0.0);
+H.col(Pz) = to_gimbal * Eigen::Vector3d(0.0, 0.0, 1.0);
+//   u 对 theta_c 的偏导 = r * (-sin psi, cos psi, 0)   方位角转，切向
+//   u 对 r 的偏导       =     ( cos psi, sin psi, 0)   半径伸长，径向
+const Eigen::Vector3d tangential(-std::sin(psi), std::cos(psi), 0.0);
+const Eigen::Vector3d radial(std::cos(psi), std::sin(psi), 0.0);
+H.col(Yaw) = to_gimbal * (radius * tangential);
+H.col(radiusIndex(i)) = to_gimbal * radial;
 ```
 
-其中 `psi_plus_gimbal = psi_i + gimbal_yaw`。对 `vx/vy/vz/omega` 全为 0（观测模型里没有它们）。
+其中 `to_gimbal = worldToGimbal(gimbal_yaw)`，`psi = psi_i = theta_c + i·pi/2`。对 `vx/vy/vz/omega` 全为 0（观测模型里没有它们）。
 
-推导要点：`h = M^T u`，`M^T` 是常量，所以
+推导要点：`h = M^T u`，`M^T` 在这一步是常量，所以每一列就是 `M^T` 乘上 `u` 对那个分量在 W 系里的偏导。**代码里一律走 `worldToGimbal`，不手抄 `M^T` 的元素** —— 手抄等于把同一个约定写两遍，换约定时容易只改一处。
+
+展开成显式元素（`psi_plus_gimbal = psi_i + gimbal_yaw`，也是能一眼核对的形式）：
 
 ```
-dh/dpx = M^T * (1,0,0)^T = M 的第 1 行 = (-s, 0, c)      <- 与代码逐元素一致
-dh/dpy = M^T * (0,1,0)^T = (-c, 0, -s)
-dh/dpz = M^T * (0,0,1)^T = (0, -1, 0)
+dh/dpx = M^T * (1,0,0)^T = ( c,  s, 0)
+dh/dpy = M^T * (0,1,0)^T = (-s,  c, 0)
+dh/dpz = M^T * (0,0,1)^T = ( 0,  0, 1)
+
+H.col(Yaw)    = M^T * r_i * (-sin psi_i, cos psi_i, 0) = r_i * (-sin psi_plus_gimbal, cos psi_plus_gimbal, 0)
+H.col(radius) = M^T *       ( cos psi_i, sin psi_i, 0) =       ( cos psi_plus_gimbal, sin psi_plus_gimbal, 0)
 ```
 
-`u` 对 `theta_c` 的偏导是 `r_i * (-sin psi_i, cos psi_i, 0)`，左乘 `M^T` 后就是上面 `H.col(Yaw)` 那个式子。半径那一列同理，而且**只有该板对应的那一列非零**（另一列已在 `H = Zero()` 里置零）。
+**注意最后两列的方向差 90°**：方位角转一格是**切向**位移，半径伸长一笔是**径向**位移，两者不能共用同一个向量。共用会把半径那一列写成切向，滤波器不报错、也不发散的迹象，只有对拍差分的用例会红。半径列**只有该板对应的那一列非零**（另一列已在 `H = Zero()` 里置零）。
 
 **手推雅可比唯一的保险是解析对拍差分**，`tests/test_ekf_predict.cpp` 有一条用例逐元素比 `observationJacobian` 与有限差分，误差 < 1e-6。这个函数写错的话，滤波器会收敛慢或不收敛，而重投影误差之类的闸门都看不出来，是静默错误。
 
@@ -806,12 +800,18 @@ if (aim_index < 0) return PredictionResult{};
 const Eigen::Matrix3d to_gimbal = worldToGimbal(gimbal_yaw);
 const Eigen::Vector3d p_gimbal_aim = to_gimbal * platePositionWorld(x_pred, aim_index);
 
-const double rel_yaw = std::atan2(p_gimbal_aim.x(), p_gimbal_aim.z());
-const double rel_pitch = -std::atan2(p_gimbal_aim.y(),
-                                     std::hypot(p_gimbal_aim.x(), p_gimbal_aim.z()));
+const double rel_yaw = gimbalAzimuth(p_gimbal_aim);
+const double rel_pitch = gimbalElevation(p_gimbal_aim);
 ```
 
-**这两个式子与 `main.cpp:442-444` 的 `pnp_yaw_rad/pnp_pitch_rad` 逐字同式**：yaw 右为正（`atan2(x,z)`），pitch 抬头为正（因为 G 系 y 向下，取负才得到抬头为正）。差别只是「单帧原始观测」对「滤波 + 预测」。
+**这两个式子在 `ArmorEkf.cpp:44-50` 集中定义，与 `main.cpp:449-452` 的 `pnp_yaw_rad/pnp_pitch_rad`、与 `armor_solve` 的 `armor_yaw` 逐字同式**：云台系是 前 / 左 / 上，所以
+
+```
+rel_yaw   = atan2(-y, x)                  右为正，正前方是 0
+rel_pitch = atan2( z, hypot(x, y))        抬头为正，正前方是 0
+```
+
+yaw 取 `-y` 是因为云台系的 +y 朝**左**，取负才得到右为正。差别只是「单帧原始观测」对「滤波 + 预测」。
 
 输出绝对角（`:687-690`）：
 
@@ -971,7 +971,7 @@ if (!predictionIsFinite(result)) {
 
 | # | 用例 | 钉住什么 | 写错会怎样 |
 |---|---|---|---|
-| 1 | `testCoordinateTransforms` | `det(gimbalToWorld(0)) = +1`；三个基向量的像；`θg = 0.2` 时方位角复原；往返恒等；`wrapToPi` 边界 | G/W 变换符号写反，位置对方向错，静默 |
+| 1 | `testCoordinateTransforms` | `gimbalToWorld(0) = I`（两系同向，若又冒出一个 90° 置换就红）；三轴一一对应；`θg = 0.2` 时视线朝 −y，把「右为正」钉死；竖直轴不参与偏航；往返恒等；`wrapToPi` 边界 | G/W 变换符号写反，位置对方向错，静默 |
 | 2 | `testPlateAzimuthConvention` | `theta_c` 左为正、`gimbal.yaw` 右为正，两者确实相反 | 日后有人把两个符号「统一」掉 |
 | 3 | `testAnalyticJacobian` | 解析 `observationJacobian` 与中心差分逐元素差 < 1e-6，10 列 × 4 块板全查 | 手推雅可比错，滤波器收敛慢，闸门都看不出来 |
 | 4 | `testNoiselessConvergence` | 观测由 `observationModel` 自己生成（**只喂可见板**），**2400 帧**后中心/速度/角速度/板位四项 < 1e-6，且进了 `Stable` | 单位错、`h`/`H` 错，现场怎么调都救不回来 |
