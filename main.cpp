@@ -177,6 +177,39 @@ void logPrediction(const PredictionResult& result) {
     WEB_LOG("ekf_aim_index", result.aim_index);
     WEB_LOG("ekf_streak", result.hit_streak - result.miss_count);
     WEB_LOG("ekf_rejected_count", result.rejected_count);
+    // 以下三个是派生角，不参与任何控制，也不回流进滤波器。它们的作用是把「估出来的状态
+    // 到底符不符合物理」变成肉眼可判的形状：车体匀速自转时，这三个角各自有一条已知的
+    // 波形，形状、周期、幅值都能事先算出来，对不上就说明相应的状态没收敛或者模型写错了。
+    constexpr double kPi = 3.14159265358979323846;
+    constexpr double kHalfPi = 0.5 * kPi;
+
+    // 一、顶点在敌车旋转中心。一条边指向固定 0 号槽位的装甲板，另一条指向我方云台原点。
+    // 取无符号夹角，所以它是一路匀速涨到 pi 再匀速折回的三角波，速率恒为
+    // ekf_yaw_rate_rad_s，周期 2*pi/omega。
+    // 板方位用 body_yaw 拼，不用 aim_index：编号一旦跟着瞄点切换，这个角会塌成 0 附近的平线。
+    // 只记 0 号槽位，四块板的这个角只差 90 度的固定相位，形状完全一样。
+    const double to_me_azimuth = std::atan2(-result.center_y_m, -result.center_x_m);
+    WEB_LOG("ekf_plate_me_angle_rad",
+            std::abs(std::remainder(result.body_yaw - to_me_azimuth, 2.0 * kPi)));
+
+    // 二、车体相位折到八分之一圈。取值 0 到 pi/4，峰在 body_yaw 为 45 度加 90 度整数倍处，
+    // 谷在 0 度加 90 度整数倍处，周期是上面那条的四分之一。
+    // 它只由 body_yaw 决定，与位置和距离无关，所以能把两种病因分开：这条干净而上面那条毛，
+    // 问题在中心；两条一起毛，问题在 yaw。慢转时上面那条一个周期要几十秒，这条只要几分之一，
+    // 是现场唯一看得全的三角波。
+    WEB_LOG("ekf_slot_phase_rad", std::abs(std::remainder(result.body_yaw, kHalfPi)));
+
+    // 三、0 号槽位板对我方云台的方位角，减去车心对我方云台的方位角，即这块板相对车心的
+    // 视差角。角顶点在我方云台，所以它不随车体平移漂走，是绕 0 振荡的正弦，周期同样是
+    // 2*pi/omega，幅值上限 asin(radius_1_m / 距离)。
+    // 幅值偏大说明半径估大了，周期不对说明角速度不对，整条慢慢偏离 0 说明中心估偏了。
+    // 方位角口径与 pnp_yaw_rad 一致，右正。
+    const double slot0_x = result.center_x_m + result.radius_1_m * std::cos(result.body_yaw);
+    const double slot0_y = result.center_y_m + result.radius_1_m * std::sin(result.body_yaw);
+    const double to_center_azimuth = std::atan2(-result.center_y_m, result.center_x_m);
+    const double to_slot0_azimuth = std::atan2(-slot0_y, slot0_x);
+    WEB_LOG("ekf_plate0_parallax_rad",
+            std::remainder(to_slot0_azimuth - to_center_azimuth, 2.0 * kPi));
 }
 
 // main 中启动线程前先同步读一帧，保持参考工程的初始化顺序。
