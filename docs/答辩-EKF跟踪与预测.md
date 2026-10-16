@@ -3,11 +3,11 @@
 对应评分项：**EKF 跟踪与预测（20 分）**
 对应规格：`轨迹预测说明.md`「旋转车体 EKF 预测要求」、`docs/大作业任务书.md` §3.6
 代码位置：
-- `student/include/ArmorEkf.hpp`（227 行，类声明、状态下标、全部可调常量）
-- `student/src/ArmorEkf.cpp`（704 行，全部实现）
-- `student/src/StudentTasks.cpp:186-212`（`ekf_predict`，跨帧状态的适配器）
-- `tests/test_ekf_predict.cpp`（无噪收敛、雅可比对拍、状态机时序、安全不变量、
-  单板初始化回归；夹具只喂 80 度锥角内真实可见的板，与 `testrig/ekf_trace` 同源）
+- `student/include/ArmorEkf.hpp`（245 行，类声明、状态下标、全部可调常量）
+- `student/src/ArmorEkf.cpp`（770 行，全部实现）
+- `student/src/StudentTasks.cpp:190-212`（`ekf_predict`，跨帧状态的适配器）
+- `tests/test_ekf_predict.cpp`（847 行：无噪收敛、雅可比对拍、状态机时序、安全不变量、
+  单板初始化回归、下坠补偿回归；夹具只喂 80 度锥角内真实可见的板，与 `testrig/ekf_trace` 同源）
 
 本文按「一帧数据怎么流过这几百行」的顺序讲，每个小节末尾给行号锚点。答辩要独立解释实现时，照本文的节序讲即可。
 
@@ -27,7 +27,7 @@ observations: vector<ArmorPose>
            detection.target_id / size          <- 只记进槽位表，不参与关联
                     |
                     v
-ekf_predict(observations, gimbal, time_stamp)     StudentTasks.cpp:186
+ekf_predict(observations, gimbal, time_stamp)     StudentTasks.cpp:190
     内部 static ArmorEkf filter                   跨帧状态就活在这个 static 里
                     |
                     v
@@ -61,7 +61,7 @@ applyPrediction(translator, prediction)           src/AppSupport.cpp:74
 
 **G 与 W 的轴向完全相同**（学长 2026-10-15：「云台系和世界系一样」），两系只差一个绕竖直轴的偏航角，再外加原点平移。依据与推导过程见 `docs/上车前问题清单.md` 第 1.1 节，图见 `docs/img/坐标系方向.png`。
 
-两个偏航角的转正方向**故意不同**，这不是笔误（`ArmorEkf.cpp:15-22` 有原话）：
+两个偏航角的转正方向**故意不同**，这不是笔误（`ArmorEkf.cpp:15-18` 有原话）：
 
 - `theta_c` 是 W 系里的方位角，从 +x 转向 +y 为正，而 W 的 +y 朝左，所以 `theta_c` **左为正**。
 - `gimbal.yaw` 在 `atan2(-y, x)` 这个口径下定义成 **右为正**，与 `main.cpp` 的 `pnp_yaw_rad`、`armor_solve` 的 `armor_yaw` 同号。
@@ -72,7 +72,7 @@ applyPrediction(translator, prediction)           src/AppSupport.cpp:74
 
 ## 1.2 唯一的变换函数
 
-`ArmorEkf.cpp:94-106`：
+`ArmorEkf.cpp:113-125`：
 
 ```cpp
 Eigen::Matrix3d ArmorEkf::gimbalToWorld(double gimbal_yaw) {
@@ -94,9 +94,9 @@ Eigen::Matrix3d ArmorEkf::worldToGimbal(double gimbal_yaw) {
 
 | 调用点 | 方向 | 用途 |
 |---|---|---|
-| `tryInitialize:319` | G -> W | 把初始化的几帧观测搬进 W 系比一致性 |
-| `observationModel:129` | W -> G | 预测观测值，与 `position_gimbal_m` 同系才能相减 |
-| `selectArmorIndex:542,563` / `buildPrediction:632,650-651` | W -> G | 把 W 系的瞄准点搬回当前云台系算 `rel_yaw/rel_pitch` |
+| `tryInitialize:361` | G -> W | 把初始化的几帧观测搬进 W 系比一致性 |
+| `observationModel:164` | W -> G | 预测观测值，与 `position_gimbal_m` 同系才能相减 |
+| `selectArmorIndex:591` / `buildPrediction:682,707-708` | W -> G | 把 W 系的瞄准点搬回当前云台系算 `rel_yaw/rel_pitch` |
 
 ## 1.3 这个矩阵怎么来的
 
@@ -143,7 +143,7 @@ worldToGimbal = transpose                   正交阵的逆就是转置，不用
 
 ## 1.4 角度包裹
 
-`wrapToPi`（`:92-98`）：
+`wrapToPi`（`:127-133`）：
 
 ```cpp
 double ArmorEkf::wrapToPi(double angle) {
@@ -220,7 +220,7 @@ return filter.buildPrediction(gimbal, latency_s);   // :211
 
 ## 3.1 `predict(dt)`：先验
 
-`ArmorEkf.cpp:286-307`：
+`ArmorEkf.cpp:305-326`：
 
 ```cpp
 void ArmorEkf::predict(double dt) {
@@ -253,7 +253,7 @@ void ArmorEkf::predict(double dt) {
 
 ## 3.2 过程模型 `propagate` 与 `F`
 
-`ArmorEkf.cpp:190-203`：
+`ArmorEkf.cpp:209-222`：
 
 ```cpp
 void ArmorEkf::propagate(StateVector& x, double dt) const {
@@ -278,7 +278,7 @@ void ArmorEkf::fillTransition(double dt, Eigen::Matrix<double, 10, 10>& F) const
 
 ## 3.3 过程噪声 `Q`
 
-`ArmorEkf.cpp:205-234`。按随机加速度模型离散化，每个「位置 + 速度」轴对共享一个分块：
+`ArmorEkf.cpp:224-253`。按随机加速度模型离散化，每个「位置 + 速度」轴对共享一个分块：
 
 ```
 Q_pv = sigma_a^2 * [ dt^4/4   dt^3/2 ]
@@ -320,7 +320,7 @@ Q(Radius2, Radius2) = radius_variance;
 
 ## 3.4 `P0`
 
-`ArmorEkf.cpp:250-263`：
+`ArmorEkf.cpp:269-282`：
 
 ```cpp
 P(Px, Px) = 1.0;      P(Py, Py) = 1.0;      P(Pz, Pz) = 1.0;      // 位置 (m^2)
@@ -337,7 +337,7 @@ P(Radius1, Radius1) = 0.0225;  P(Radius2, Radius2) = 0.0225;      // m^2
 
 ## 4.1 `h`
 
-`ArmorEkf.cpp:134-146`：
+`ArmorEkf.cpp:153-165`：
 
 ```cpp
 Eigen::Vector3d ArmorEkf::observationModel(const StateVector& x, int armor_index,
@@ -374,7 +374,7 @@ h_i(x) = M(theta_g)^T * u_i(x)                    换到 G 系, 3 维观测
 
 ## 4.2 `H`
 
-`ArmorEkf.cpp:148-175`。非零的四个列：
+`ArmorEkf.cpp:167-194`。非零的四个列：
 
 ```cpp
 ObservationJacobian H = ObservationJacobian::Zero();
@@ -410,7 +410,7 @@ H.col(radius) = M^T *       ( cos psi_i, sin psi_i, 0) =       ( cos psi_plus_gi
 
 ## 4.3 关联用的 `radiusIndex` 与槽位
 
-`ArmorEkf.cpp:120-132`：
+`ArmorEkf.cpp:139-151`：
 
 ```cpp
 int ArmorEkf::normalizeIndex(int armor_index, int plate_count) {
@@ -430,7 +430,7 @@ int ArmorEkf::radiusIndex(int armor_index) {
 
 # 五、更新：一条观测怎么被吃下或拒绝
 
-`update`（`:290-298`）是分派器：
+`update`（`:332-340`）是分派器：
 
 ```cpp
 bool ArmorEkf::update(const ArmorPose& observation, double gimbal_yaw) {
@@ -444,7 +444,7 @@ bool ArmorEkf::update(const ArmorPose& observation, double gimbal_yaw) {
 
 ## 5.1 `associateAndUpdate`：三道闸
 
-`ArmorEkf.cpp:393-468`。进来先过两道「观测本身合不合法」的闸：
+`ArmorEkf.cpp:412-487`。进来先过两道「观测本身合不合法」的闸：
 
 ```cpp
 if (!z.allFinite() || !std::isfinite(observation.reprojection_error)) {
@@ -483,11 +483,11 @@ for (int i = 0; i < config_.plate_count; ++i) {
 
 关联用**马氏距离**（NIS）而不是最近欧氏距离，因为侧板的横向不确定度大，欧氏距离会把它误配进来。`S = H P H^T + R` 里已经把不确定度算进去了。
 
-**`residual.norm() > jump_gate_m` 用的是 `continue` 而不是直接拒绝整个观测**：一块板跳得远，不代表其他几块也跳，剩下的板还有机会配上。全都过不了才 `++rejected_count_; return false;`（`:440-447`）。
+**`residual.norm() > jump_gate_m` 用的是 `continue` 而不是直接拒绝整个观测**：一块板跳得远，不代表其他几块也跳，剩下的板还有机会配上。全都过不了才 `++rejected_count_; return false;`（`:459-466`）。
 
 ## 5.2 吃下观测：Joseph 形式
 
-`ArmorEkf.cpp:449-458`：
+`ArmorEkf.cpp:468-477`：
 
 ```cpp
 const Eigen::Vector3d residual = z - best_h;
@@ -532,7 +532,7 @@ P = (I - K H) P (I - K H)^T + K R K^T
 
 ## 6.1 每帧的四个计数器
 
-`ArmorEkf.cpp:474-513` 的前半段：
+`ArmorEkf.cpp:493-532` 的前半段：
 
 ```cpp
 if (updated_this_frame_) {
@@ -588,7 +588,7 @@ if (status_ == TrackingState::Unstable) {
 | `covarianceIsStable()` | 见下 | 协方差确实收缩了 |
 | `recentNisMean() < 8.0` | 最近 5 次 NIS 均值 | 没有持续偏离模型 |
 
-`covarianceIsStable`（`:492-500`）：
+`covarianceIsStable`（`:534-542`）：
 
 ```cpp
 const double center_std = std::sqrt(std::max(0.0, P_(Px, Px) + P_(Py, Py)));
@@ -607,7 +607,7 @@ return center_std < config_.stable_center_std_m &&    // 0.10 m
 
 # 七、初始化 `tryInitialize`
 
-`ArmorEkf.cpp:323-391`。这是整份代码里最需要关注的一段，也是曾经唯一出过问题的一段：
+`ArmorEkf.cpp:342-410`。这是整份代码里最需要关注的一段，也是曾经唯一出过问题的一段：
 反推中心的方位角方向反了 180 度，2026-10-13 已修（提交 `d3a7ff3`），下面 7.2 讲的就是它。
 
 ## 7.1 三帧一致门
@@ -643,7 +643,7 @@ if (init_count_ < config_.init_frames) {    // 3 帧
 
 ## 7.2 反推中心
 
-`ArmorEkf.cpp:367-373`：
+`ArmorEkf.cpp:386-392`：
 
 ```cpp
 x_.setZero();
@@ -715,7 +715,7 @@ return true;
 
 # 八、输出 `buildPrediction`
 
-`ArmorEkf.cpp:621-728`。这是把状态向量变成云台指令的一段，顺序上分六步。
+`ArmorEkf.cpp:640-770`。这是把状态向量变成云台指令的一段，顺序上分六步。
 
 ## 8.1 取云台角、bias，算 `t0`
 
@@ -728,13 +728,13 @@ const double latency = smoothedLatency(latency_s);
 const double t0 = std::clamp(latency + bias, 0.0, config_.max_prediction_s);
 ```
 
-**bias 允许为负**（`:609-610` 有注释）：电控若想「少预测一点」会下发负值，单边截正会把它吃掉。总时长 `t0` 仍然截在 `[0, 0.5]` 里，异常值照样挡得住。
+**bias 允许为负**（`:650-651` 有注释）：电控若想「少预测一点」会下发负值，单边截正会把它吃掉。总时长 `t0` 仍然截在 `[0, 0.5]` 里，异常值照样挡得住。
 
-`smoothedLatency`（`:523-542`）把 `latency_s` 过 20 帧滑动均值，抑制单帧抖动。
+`smoothedLatency`（`565-584`）把 `latency_s` 过 20 帧滑动均值，抑制单帧抖动。
 
 ## 8.2 弹道飞行时间：两次迭代解开循环
 
-`ArmorEkf.cpp:640-653`：
+`ArmorEkf.cpp:659-672`：
 
 ```cpp
 double flight_s = 0.0;
@@ -744,18 +744,32 @@ for (int iteration = 0; iteration < 2; ++iteration) {
     const int index = selectArmorIndex(x_step, gimbal_yaw, false);   // commit=false
     if (index < 0) break;
     const Eigen::Vector3d p_world = platePositionWorld(x_step, index);
-    flight_s = flightTimeSeconds(std::hypot(p_world.x(), p_world.y()), p_world.z());
+    // 这一轮只取飞行时间，第三个参数是回退仰角，用不到。
+    flight_s = solveBallistics(std::hypot(p_world.x(), p_world.y()),
+                               p_world.z(), 0.0).flight_time_s;
 }
 const double t_pred = std::clamp(t0 + flight_s, 0.0, config_.max_prediction_s);
 ```
 
 飞行时间依赖距离，距离又依赖预测时长，所以迭代两次。`selectArmorIndex` 第三个参数传 `false`（`commit=false`）表示**只试算，不写 `aim_index_`**，否则迟滞状态会被试算值写脏。
 
-`flightTimeSeconds`（`:40-51`）复用仓库里的 `Bullet_Model`（`armor/include/BulletModel.hpp`）：默认初速 24 m/s、`Kf = 0.08`、`gravity = 9.81`。它的坐标系就是 W 系。
+`solveBallistics`（`:64-85`）复用仓库里的 `Bullet_Model`（`armor/include/BulletModel.hpp`）：默认初速 24 m/s、`Kf = 0.08`、`gravity = 9.81`。它的坐标系就是 W 系。带空气阻力没有解析解，`Bullet_Model` 用 `do-while` 迭代最多 100 次、判据 `|z_diff| < 1e-4`。
+
+它一次返回三样东西：
+
+```cpp
+struct BallisticSolution {
+    double flight_time_s{0.0};     // 用来定 t_pred
+    double launch_pitch_rad{0.0};  // 炮口要抬到多少度，见 8.4
+    bool   converged{false};
+};
+```
+
+**不收敛时回落到调用方传进来的几何仰角**，等价于不作补偿。这里有个静默陷阱：撞上 100 次迭代上限时 `beta` 仍然是个有限数、不报错，直接发出去就是一个没落到位的中途值。所以判据必须是 `|model.z_diff| < model.err_max`，不能只看 `beta` 是不是有限。宁可少补，也不能发一个假解。
 
 ## 8.3 选板与迟滞
 
-`selectArmorIndex`（`:548-597`）：
+`selectArmorIndex`（`590-638`）：
 
 ```cpp
 for (int i = 0; i < config_.plate_count; ++i) {
@@ -790,7 +804,7 @@ if (aim_index_ >= 0 && current_facing && aim_index_ != best) {
 
 ## 8.4 `target_yaw/target_pitch`
 
-`ArmorEkf.cpp:655-667`：
+`ArmorEkf.cpp:674-688`：
 
 ```cpp
 StateVector x_pred = x_;
@@ -798,8 +812,10 @@ propagate(x_pred, t_pred);
 const int aim_index = selectArmorIndex(x_pred, gimbal_yaw, true);
 if (aim_index < 0) return PredictionResult{};
 const Eigen::Matrix3d to_gimbal = worldToGimbal(gimbal_yaw);
-const Eigen::Vector3d p_gimbal_aim = to_gimbal * platePositionWorld(x_pred, aim_index);
+const Eigen::Vector3d p_world_aim = platePositionWorld(x_pred, aim_index);
+const Eigen::Vector3d p_gimbal_aim = to_gimbal * p_world_aim;
 
+// 与 main.cpp 里 pnp_yaw_rad / pnp_pitch_rad 同式：yaw 右为正，pitch 抬头为正。
 const double rel_yaw = gimbalAzimuth(p_gimbal_aim);
 const double rel_pitch = gimbalElevation(p_gimbal_aim);
 ```
@@ -813,18 +829,54 @@ rel_pitch = atan2( z, hypot(x, y))        抬头为正，正前方是 0
 
 yaw 取 `-y` 是因为云台系的 +y 朝**左**，取负才得到右为正。差别只是「单帧原始观测」对「滤波 + 预测」。
 
-输出绝对角（`:687-690`）：
+### yaw 输出绝对角，pitch 输出**弹道发射角**
+
+输出（`:749-753`）：
 
 ```cpp
-result.target_yaw   = gimbal_yaw   + rel_yaw;
-result.target_pitch = gimbal_pitch + rel_pitch;
+// 输出绝对云台指令，不是相对角。依据是框架的 setSafeOutput：
+// 安全帧写成 target_yaw = message.yaw（保持当前），只有绝对角才自洽。
+result.target_yaw = static_cast<float>(gimbal_yaw + rel_yaw);
+// 下坠补偿在算法侧做，这里发的是弹道发射仰角，不是瞄准点的几何仰角。
+result.target_pitch = static_cast<float>(command_pitch);
 ```
 
-**为什么输出绝对角**：框架的 `setSafeOutput`（`AppSupport.cpp:66-67`）把安全帧写成 `target_yaw = message.yaw`（保持当前，误差 0 等于不动）。只有 `target` 是绝对角时这句才自洽。这一点已按学长口径（问题清单 §1.2）定案，不再加开关。
+`command_pitch` 由 8.2 那个 `solveBallistics` 在瞄准点上再解一次得到（`:690-695`）：
+
+```cpp
+const double command_pitch =
+    solveBallistics(std::hypot(p_world_aim.x(), p_world_aim.y()),
+                    p_world_aim.z(), gimbal_pitch + rel_pitch)
+        .launch_pitch_rad;
+```
+
+**yaw 和 pitch 的构造方式不一样，这是故意的。**
+
+yaw 是绕竖直轴的角度，跟重力无关，`gimbal_yaw + rel_yaw` 就是绝对方位角，直接发。
+
+pitch 不一样。`rel_pitch` 是**目标在哪**（几何视线仰角 $\eta$），而炮口要抬到的是 $\beta$，因为弹丸要飞一段水平距离 $d$ 之后落下 $\frac{1}{2}gt^2$。对打到 $(d, h)$：
+
+$$\tan\beta = \frac{h}{d} + \frac{g\,d}{2v^2\cos^2\beta}, \qquad \tan\eta = \frac{h}{d}$$
+
+两式相减得 $\tan\beta - \tan\eta = \dfrac{g\,d}{2v^2\cos^2\beta} > 0$，**$\beta$ 恒大于 $\eta$**，只有 $g = K_f = 0$ 时相等。小角近似下差值就是
+
+$$\beta - \eta \approx \frac{g\,d}{2v^2}$$
+
+**只跟距离和弹速有关，一阶与高度无关。** 初速 24 m/s 时每米约 0.00852 rad：3 m → 1.46°、5 m → 2.44°、10 m → 4.88°。空气阻力让它再大一点，5 m 处约多 0.03°，随 $d^3$ 增长，短距离可以忽略。
+
+这不是新引入的量，`Bullet_Model` 每次迭代都在算它，只是原先把收敛完的 `beta` 随局部对象丢掉了、只留了飞行时间。**接上它不引入任何新未知量**：$\beta$ 是 $\eta$ 与 $d$ 的函数，而 $d$、$h$ 在算 `p_world_aim` 时已经有了；唯一新增的依赖是弹速 $v$，而飞行时间那一步本来就在用同一个默认值 24 m/s。
+
+**分工的结论来自外部**：下坠补偿由算法侧做（学长 2026-10-16），所以发的是 $\beta$，不是 $\eta$。旁证是仓库参考实现 `armor/src/Planner.cpp:124` 的 `result(1) = final_bullet_model.beta` 也是这么做的。`Bullet_Model` 的初速仍吃构造函数的硬编码 24 m/s、不是实测值，这条挂在问题清单 §2.3。
+
+**顺带被改掉的一个真 bug**：开火门原来用 `|rel_pitch|` 判对准，那是「到几何瞄点」的偏差。命令既然改成 $\beta$，门也必须跟着改成对命令求差，否则门会在云台还差一整个补偿量时就放行 —— 5 m 处 2.44°，是 `fire_pitch_tolerance_rad = 0.02` 的 2.1 倍，落点低 `5·tan(2.44°) ≈ 21 cm`。见 8.6。
+
+**为什么 yaw 输出绝对角**：框架的 `setSafeOutput`（`AppSupport.cpp:66-67`）把安全帧写成 `target_yaw = message.yaw`（保持当前，误差 0 等于不动）。只有 `target` 是绝对角时这句才自洽。这一点已按学长口径（问题清单 §1.2）定案，不再加开关。
+
+（pitch 那边 `gimbal_pitch` 这一项恰好消失了，不是同一个理由：$\beta$ 本身就是相对水平面的绝对发射仰角，不需要再加云台当前角。回退分支除外，见 8.2。）
 
 ## 8.5 角速度：中心差分
 
-`ArmorEkf.cpp:669-687`。在 `t_pred ± 5 ms` 各推一次，两个 `rel_yaw/rel_pitch` 相减除以窗口：
+`ArmorEkf.cpp:697-725`。在 `t_pred ± 5 ms` 各推一次，两个 `rel_yaw/rel_pitch` 相减除以窗口：
 
 ```cpp
 const double yaw_velocity = wrapToPi(yaw_late - yaw_early) / dt_window;
@@ -833,9 +885,22 @@ const double pitch_velocity = (pitch_late - pitch_early) / dt_window;
 
 `yaw` 用 `wrapToPi` 包一次差值，防止在 $\pi$ 附近跨号；`pitch` 不会跨，直接相减。
 
+**`pitch` 的两端不是 `rel_pitch`，是补偿后的角**（`:711-720`）：
+
+```cpp
+// target_pitch 是补偿后的角，它的速率也必须来自补偿后的角，
+// 否则同一个上报结构里两个量对不上。
+const double pitch_early =
+    solveBallistics(std::hypot(p_world_early.x(), p_world_early.y()),
+                    p_world_early.z(), gimbal_pitch + gimbalElevation(p_early))
+        .launch_pitch_rad;
+```
+
+同一个 `PredictionResult` 里 `target_pitch` 是 $\beta$，它的速率就得是 $\dot\beta$。若这里仍用 $\eta$ 做差分，报给 Web Debug 的一条曲线是补偿后的角、它的导数是补偿前的角，答辩时对不上。
+
 ## 8.6 填 `PredictionResult` 与 `fire_allowed`
 
-`ArmorEkf.cpp:689-728`。要点：
+`ArmorEkf.cpp:727-770`。要点：
 
 ```cpp
 result.state = status_;                                   // 就是 crc
@@ -848,17 +913,21 @@ result.radius_1_m = std::max(0.0, x_[Radius1]);           // 负半径不往外�
 result.radius_2_m = std::max(0.0, x_[Radius2]);
 result.distance_m = p_gimbal_aim.norm();                  // 与 pnp_distance_m 同口径
 
-const bool aligned = std::fabs(rel_yaw)   < config_.fire_yaw_tolerance_rad &&    // 0.02
-                     std::fabs(rel_pitch) < config_.fire_pitch_tolerance_rad;    // 0.02
+// yaw 的指令是 gimbal_yaw + rel_yaw，误差就是 rel_yaw；pitch 的指令是
+// command_pitch，误差是它与当前绝对仰角 gimbal_pitch 之差。两者口径一致。
+const bool aligned =
+    std::fabs(rel_yaw) < config_.fire_yaw_tolerance_rad &&                    // 0.02
+    std::fabs(command_pitch - gimbal_pitch) < config_.fire_pitch_tolerance_rad; // 0.02
 const bool spin_ok = std::fabs(x_[YawRate]) < config_.fire_spin_tolerance_rad_s; // 1.0
 result.fire_allowed = status_ == TrackingState::Stable && aligned && spin_ok;
 ```
 
-三个细节：
+四个细节：
 
 1. **`armor_flag` 描述「正瞄着的那块板」**，不是「最后看到的那块」。多板同帧时两者不是同一块，所以从 `index_target_id_[aim_index]` 取；纯预测到一块没直接观测过的板时才退回 `target_id_`。
 2. **负半径不往外报**（`std::max(0.0, ...)`）。内部 `x_` 可能是负的（第七节那个符号错没修之前就会），但对外统一截成 0。这个截断本身会掩盖问题，也是那个 bug 靠日志看不出来、只能靠读内部状态才发现的原因，见第七节与第十二节。
-3. **`fire_allowed` 只在 `Stable` 且对准且车体别转太快时为真**。这是红线的第一道保险；第二道在 `applyPrediction`（`AppSupport.cpp:95-98`）。
+3. **仰角那个门的被减数是 `command_pitch`，不是 `rel_pitch`**。门问的是「云台到位了没有」，而云台要去的是 $\beta$，所以拿 $\beta - $ 当前绝对仰角。用 `rel_pitch` 的话，门在云台还差一整个补偿量时就会放行。对比一下两边的结构：yaw 的指令 `gimbal_yaw + rel_yaw` 减去当前 `gimbal_yaw` 正好剩 `rel_yaw`，所以那一项没变；pitch 的指令 `command_pitch` 减当前 `gimbal_pitch`，写出来就是上面那行。**两项现在口径一致了**，都是「指令减当前」。这条 2026-10-16 与仰角指令同步改，见 8.4。
+4. **`fire_allowed` 只在 `Stable` 且对准且车体别转太快时为真**。这是红线的第一道保险；第二道在 `applyPrediction`（`AppSupport.cpp:95-98`）。
 
 最后一道防线：
 
@@ -868,7 +937,7 @@ if (!predictionIsFinite(result)) {
 }
 ```
 
-`predictionIsFinite`（`:55-66`）把每个字段都查一遍，还额外查了 `center_x_m * 1000.0F`（因为通信帧里米转毫米还要再乘一次 1000，这一步也可能溢出成非有限值）。任一非有限就返回全零，交给框架降级成安全帧。
+`predictionIsFinite`（`:88-101`）把每个字段都查一遍，还额外查了 `center_x_m * 1000.0F`（因为通信帧里米转毫米还要再乘一次 1000，这一步也可能溢出成非有限值）。任一非有限就返回全零，交给框架降级成安全帧。
 
 ---
 
@@ -916,7 +985,7 @@ if (!predictionIsFinite(result)) {
 
 `ArmorEkf.cpp:30-34` 记了依据：仓库已实测的角点抖动是 1.08 m 处单次重投影 0.70~0.79 px、同一角点两帧间最多动 1.41 px。按 `delta_px * d / f`（`f` 约 1805 px）估横向约 `0.0006 * d`，再留约 3 倍余量取 `0.002 d + 0.005`。深度误差按同样比例放大取 `0.010 d + 0.010`。
 
-**两个数放到哪一维，跟着云台系走**（`observationNoise`，`ArmorEkf.cpp:236-248`）：
+**两个数放到哪一维，跟着云台系走**（`observationNoise`，`ArmorEkf.cpp:255-267`）：
 
 ```
 R = diag(depth², lateral², lateral²)
@@ -948,38 +1017,39 @@ R = diag(depth², lateral², lateral²)
 | 行 | 函数 |
 |---|---|
 | `:44-50` | `gimbalAzimuth` / `gimbalElevation`（匿名命名空间，右正 / 抬头正） |
-| `:52-65` | `flightTimeSeconds`（匿名命名空间，包 `Bullet_Model`） |
-| `:67-82` | `predictionIsFinite`（匿名命名空间） |
-| `:94-102` | `gimbalToWorld` |
-| `:104-106` | `worldToGimbal` |
-| `:108-114` | `wrapToPi` |
-| `:120-126` | `normalizeIndex` |
-| `:128-132` | `radiusIndex` |
-| `:134-146` | `observationModel` |
-| `:148-175` | `observationJacobian` |
-| `:177-184` | `platePositionWorld` |
-| `:190-195` | `propagate` |
-| `:197-203` | `fillTransition` |
-| `:205-234` | `fillProcessNoise` |
-| `:236-248` | `observationNoise` |
-| `:250-263` | `initialCovariance` |
-| `:265-284` | `reset` |
-| `:286-307` | `predict` |
-| `:313-321` | `update`（分派器） |
-| `:323-391` | `tryInitialize` |
-| `:393-468` | `associateAndUpdate` |
-| `:474-513` | `advanceStateMachine` |
-| `:515-523` | `covarianceIsStable` |
-| `:525-544` | `recordNis` / `recentNisMean` |
-| `:546-565` | `smoothedLatency` |
-| `:571-619` | `selectArmorIndex` |
-| `:621-728` | `buildPrediction` |
+| `:64-84` | `solveBallistics` + `BallisticSolution`（匿名命名空间，包 `Bullet_Model`，出时间与发射仰角） |
+| `:88-101` | `predictionIsFinite`（匿名命名空间） |
+| `:113-121` | `gimbalToWorld` |
+| `:123-125` | `worldToGimbal` |
+| `:127-133` | `wrapToPi` |
+| `:139-145` | `normalizeIndex` |
+| `:147-151` | `radiusIndex` |
+| `:153-165` | `observationModel` |
+| `:167-194` | `observationJacobian` |
+| `:196-203` | `platePositionWorld` |
+| `:209-214` | `propagate` |
+| `:216-222` | `fillTransition` |
+| `:224-253` | `fillProcessNoise` |
+| `:255-267` | `observationNoise` |
+| `:269-282` | `initialCovariance` |
+| `:284-303` | `reset` |
+| `:305-326` | `predict` |
+| `:332-340` | `update`（分派器） |
+| `:342-410` | `tryInitialize` |
+| `:412-487` | `associateAndUpdate` |
+| `:493-532` | `advanceStateMachine` |
+| `:534-542` | `covarianceIsStable` |
+| `:544-550` | `recordNis` |
+| `:552-563` | `recentNisMean` |
+| `:565-584` | `smoothedLatency` |
+| `:590-638` | `selectArmorIndex` |
+| `:640-770` | `buildPrediction` |
 
 ---
 
 # 十一、测试怎么钉住它
 
-`tests/test_ekf_predict.cpp` 有 **11 条用例**，都不需要相机、不需要真车，跑 `ctest` 就行。每条都直接对应上面某一节的一个具体错误模式。
+`tests/test_ekf_predict.cpp` 有 **13 条用例**，都不需要相机、不需要真车，跑 `ctest` 就行（`ctest` 里是 7 个可执行目标，`ekf_predict` 是其中之一）。每条都直接对应上面某一节的一个具体错误模式。
 
 **夹具只喂真实可见的板**（很关键，答辩时值得主动讲）：仿真器推进一份真值车体，每帧按 80 度可见锥角判据筛出「板面朝相机」的板再喂进去，与 `testrig/ekf_trace` 的 `visiblePlates` 同源。改之前夹具是无条件发全部四块板，等于每帧凭空补两块背对相机的板 —— 真实检测器永远给不出这种输入，而且它恰好让「径向 = 视线」这条写反的假设成立，于是**方向写反的那一版在测试里反而全绿**。这条 bug 就是靠改夹具口径才暴露出来的。
 
@@ -995,7 +1065,9 @@ R = diag(depth², lateral², lateral²)
 | 8 | `testInitializationTakesOneObservationPerFrame` | 一帧里多发几块板仍能初始化成功 | 一致门被板间距顶掉，计数永远凑不满 |
 | 9 | `testSinglePlateInitializationIsOnTheFarSide` | **只有一块板可见**时，初始化后中心误差 < 0.05 m、偏航误差 < 1e-6 rad，**且全程不许报 `Stable`** | 第七节那个 180 度符号错（改前这里是 0.5000 m 与 3.1416 rad） |
 | 10 | `testNegativePredictionBiasIsHonored` | 正 bias 与负 bias 把指令往相反方向推（乘积 < 0） | `bias` 被单边截正，电控想「少预测一点」时失效 |
-| 11 | `testSafetyInvariants` | `crc != 1` 时 `fire_allowed` 恒假；空观测连调 100 帧不崩、输出有限；观测不够时不建目标 | 踩红线 |
+| 11 | `testTrackingEvidenceFieldsReachPrediction` | 自转 2 rad/s 八百帧跑进 `Stable` 后，`aim_index` 确实换过板、`hit_streak` 与 `miss_count` 与 `rejected_count` 都从内部漏到了 `PredictionResult` 里 | 这三个诊断量漏不出来，Web Debug 上就看不见换板和遮挡 |
+| 12 | `testBallisticDropCompensation` | 目标与云台同高时几何仰角恰为 0，**指令仰角就等于补偿量本身**，落在闭式 `g·d/(2v²)` 的 ±15% 内；再断言云台只转方位、仰角留平时开火门必须**拒绝**，云台跟到指令时必须**放行** | 只改指令不改门：命令抬了门没抬，5 m 外永远不开火；只改门不改指令：放行早 2.44°，落点低 21 cm |
+| 13 | `testSafetyInvariants` | `crc != 1` 时 `fire_allowed` 恒假；空观测连调 100 帧不崩、输出有限；观测不够时不建目标 | 踩红线 |
 
 用例 4 的时序有个坑（文件里也写了）：真值必须先推进 `dt` 再让滤波器 `predict` 同样步长。顺序反了，滤波器会比真值落后一个 `v·dt`，误差恰好是 `0.5/165` 这种量级，看着像「没收敛」，其实是测试写错了。
 
@@ -1046,7 +1118,7 @@ R = diag(depth², lateral², lateral²)
 
 ## 12.5 弹速是默认值
 
-用仓库默认初速 24 m/s（`BulletModel.hpp`）。弹道飞行时间对初速极敏感，远距离提前量直接受影响。上车要确认实际弹速（问题清单 §2.3）。
+用仓库默认初速 24 m/s（`BulletModel.hpp`）。这不只影响飞行时间，也**直接影响补偿量**：`beta - eta` 约等于 `g·d/(2v²)`，与 v 的平方成反比。5 m 处 v = 20 时是 3.57°、23 → 2.69°、24 → 2.47°、25 → 2.27°。上车要确认实际弹速（问题清单 §2.3）。
 
 ## 12.6 只看得到一块板时的「半径」与「进 Stable 的三条闸」（2026-10-14 实测）
 
@@ -1062,7 +1134,7 @@ R = diag(depth², lateral², lateral²)
 
 ### 12.6.2 两个半径只要目标在转，都会收敛
 
-`H.col(radiusIndex(i))`（`ArmorEkf.cpp:173`）是雅可比里唯一非零的半径列，一条观测只修得动一个奇偶的半径。但可见槽位随车体旋转轮换，两个半径都会陆续拿到观测：
+`H.col(radiusIndex(i))`（`ArmorEkf.cpp:192`）是雅可比里唯一非零的半径列，一条观测只修得动一个奇偶的半径。但可见槽位随车体旋转轮换，两个半径都会陆续拿到观测：
 
 | 目标自转 omega (rad/s) | 末态 r1 / r2 | 真值 | 末态中心误差 |
 |---|---|---|---|
@@ -1120,7 +1192,7 @@ yaw 为什么不可观测：相机只看得到板，看不到车心。车心由�
 
 ### 12.6.5 顺带查出：`covarianceIsStable()` 是单向门
 
-它只在 Unstable 到 Stable 那一步被查（`ArmorEkf.cpp:505-512`）。进了 `Stable` 之后，只有连续丢 `stable_hold_misses = 3` 帧能降回 `Unstable`。所以 **`Stable` 可以和远超门槛的协方差共存**：`omega = 1.0` 第 704 帧进入 `Stable`，跑到第 2999 帧状态仍是 `Stable`，而末态 yaw sd 已经 0.1750，是门槛 0.10 的 3.5 倍。是刻意留的滞回还是漏了回退闸，需要定。
+它只在 Unstable 到 Stable 那一步被查（`ArmorEkf.cpp:524-531`）。进了 `Stable` 之后，只有连续丢 `stable_hold_misses = 3` 帧能降回 `Unstable`。所以 **`Stable` 可以和远超门槛的协方差共存**：`omega = 1.0` 第 704 帧进入 `Stable`，跑到第 2999 帧状态仍是 `Stable`，而末态 yaw sd 已经 0.1750，是门槛 0.10 的 3.5 倍。是刻意留的滞回还是漏了回退闸，需要定。
 
 ### 12.6.6 待定：整状态协方差闸换成「瞄准点自身的不确定度闸」
 

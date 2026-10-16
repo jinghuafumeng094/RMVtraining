@@ -766,6 +766,66 @@ void testTrackingEvidenceFieldsReachPrediction() {
     std::printf("[ekf] 跟踪证据字段 通过\n");
 }
 
+// 下坠补偿在算法侧做，上报的 target_pitch 必须是弹道发射仰角 beta，
+// 不是瞄准点的几何仰角。
+//
+// beta 与几何仰角之差有闭式：目标与云台同高、水平距离 d 时约等于
+// g * d / (2 * v^2)，v = 24 时每米约 0.0085 弧度，5 m 处约 0.043 弧度。
+// 空气阻力让飞行时间比无阻力长，补偿再大一点，5 m 处约 0.0006 弧度。
+// 所以带宽取 0.85 到 1.20 倍。
+void testBallisticDropCompensation() {
+    ArmorEkf::Config config = testConfig();
+    // 本条只验仰角门，把自转门放到不碍事，好让稳定态能进。
+    config.fire_spin_tolerance_rad_s = 100.0;
+
+    ArmorEkf filter(config);
+    const GimbalState level = makeGimbal(0.0, 0.0);
+
+    const double dt = 1.0 / 165.0;
+    double timestamp = 0.0;
+
+    // 目标与云台同高，于是到任何一块板的几何仰角都是 0，
+    // 上报的 target_pitch 全部来自下坠补偿。
+    Truth truth;
+    truth.center = Eigen::Vector3d(5.0, 0.3, 0.0);
+    truth.yaw = 0.4;
+    truth.yaw_rate = 2.0;
+
+    for (int frame = 0; frame < 800; ++frame) {
+        timestamp += dt;
+        filter.predict(dt);
+        feedFrame(filter, config, truth, 0.0);
+        filter.advanceStateMachine(timestamp);
+        trueStep(truth, dt);
+    }
+    assert(filter.status() == TrackingState::Stable);
+
+    const PredictionResult result = filter.buildPrediction(level, 0.001);
+    const double expected = 9.81 * result.distance_m / (2.0 * 24.0 * 24.0);
+    // 几何仰角是 0，所以指令仰角就是补偿量本身，不能用小于容差的数糊过去。
+    assert(result.target_pitch > 0.85 * expected);
+    assert(result.target_pitch < 1.20 * expected);
+
+    // 开火门必须与上报的指令同一个口径。云台先转到目标方位、仰角留在水平，
+    // 此时"到几何瞄点"的仰角误差是 0，而指令仰角还差一整个补偿量。
+    // 门若量的是前者，这一条会放行。
+    const GimbalState aimed = makeGimbal(result.target_yaw, 0.0);
+    const PredictionResult probe = filter.buildPrediction(aimed, 0.001);
+    assert(std::fabs(probe.target_pitch - aimed.pitch) >
+           config.fire_pitch_tolerance_rad);
+    assert(!probe.fire_allowed);
+
+    // 云台跟到指令上就该放行。门若量的是补偿前的几何角，这里永远进不去。
+    const GimbalState served = makeGimbal(probe.target_yaw, probe.target_pitch);
+    const PredictionResult settled = filter.buildPrediction(served, 0.001);
+    assert(std::fabs(settled.target_pitch - served.pitch) <
+           config.fire_pitch_tolerance_rad);
+    assert(settled.fire_allowed);
+    std::printf("[ekf] 下坠补偿 指令仰角 %.5f 闭式 %.5f 距离 %.3f 通过\n",
+                static_cast<double>(result.target_pitch), expected,
+                static_cast<double>(result.distance_m));
+}
+
 }  // namespace
 
 int main() {
@@ -780,6 +840,7 @@ int main() {
     testInitializationTakesOneObservationPerFrame();
     testNegativePredictionBiasIsHonored();
     testTrackingEvidenceFieldsReachPrediction();
+    testBallisticDropCompensation();
     testSafetyInvariants();
     std::printf("[ekf] 全部通过\n");
     return 0;

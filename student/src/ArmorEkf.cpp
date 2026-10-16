@@ -49,19 +49,38 @@ double gimbalElevation(const Eigen::Vector3d& p) {
     return std::atan2(p.z(), std::hypot(p.x(), p.y()));
 }
 
-// 弹道飞行时间。复用仓库里的 Bullet_Model（armor/include/BulletModel.hpp），
-// 它的坐标系就是 W（前 x、左 y、上 z），默认初速 24 m/s。
-double flightTimeSeconds(double horizontal_m, double vertical_m) {
+// 弹道解：飞完 (horizontal, vertical) 要多久，以及炮口要抬到多少度。
+// beta 是绝对发射仰角，高于水平面，恒大于瞄准点的几何仰角，差值就是重力与
+// 空气阻力造成的下坠补偿。复用仓库里的 Bullet_Model
+// (armor/include/BulletModel.hpp)，它的坐标系就是 W（前 x、左 y、上 z），
+// 默认初速 24 m/s。不收敛时 launch_pitch_rad 回落到调用方给的几何仰角，
+// 此时等价于不作补偿；宁可少补，也不能把一个没落到位的中途值发出去。
+struct BallisticSolution {
+    double flight_time_s{0.0};
+    double launch_pitch_rad{0.0};
+    bool converged{false};
+};
+
+BallisticSolution solveBallistics(double horizontal_m, double vertical_m,
+                                  double geometric_pitch_rad) {
+    BallisticSolution solution;
+    solution.launch_pitch_rad = geometric_pitch_rad;
     if (!std::isfinite(horizontal_m) || !std::isfinite(vertical_m)) {
-        return 0.0;
+        return solution;
     }
     Bullet_Model model(static_cast<float>(std::max(0.0, horizontal_m)),
                        static_cast<float>(vertical_m));
     const float time = model.bullet_iteration_cal();
     if (!std::isfinite(time) || time <= 0.0F) {
-        return 0.0;
+        return solution;
     }
-    return static_cast<double>(time);
+    solution.flight_time_s = static_cast<double>(time);
+    // 撞上 100 次迭代上限时 z_diff 仍然很大，此时 beta 是没落到位的中途值。
+    if (std::isfinite(model.beta) && std::fabs(model.z_diff) < model.err_max) {
+        solution.launch_pitch_rad = static_cast<double>(model.beta);
+        solution.converged = true;
+    }
+    return solution;
 }
 
 // 通信帧里是 float，米转毫米还要再乘一次 1000，两处都得是有限值，
@@ -648,7 +667,9 @@ PredictionResult ArmorEkf::buildPrediction(const GimbalState& gimbal, double lat
             break;
         }
         const Eigen::Vector3d p_world = platePositionWorld(x_step, index);
-        flight_s = flightTimeSeconds(std::hypot(p_world.x(), p_world.y()), p_world.z());
+        // 这一轮只取飞行时间，第三个参数是回退仰角，用不到。
+        flight_s = solveBallistics(std::hypot(p_world.x(), p_world.y()),
+                                   p_world.z(), 0.0).flight_time_s;
     }
     const double t_pred = std::clamp(t0 + flight_s, 0.0, config_.max_prediction_s);
 
@@ -659,12 +680,19 @@ PredictionResult ArmorEkf::buildPrediction(const GimbalState& gimbal, double lat
         return PredictionResult{};
     }
     const Eigen::Matrix3d to_gimbal = worldToGimbal(gimbal_yaw);
-    const Eigen::Vector3d p_gimbal_aim =
-        to_gimbal * platePositionWorld(x_pred, aim_index);
+    const Eigen::Vector3d p_world_aim = platePositionWorld(x_pred, aim_index);
+    const Eigen::Vector3d p_gimbal_aim = to_gimbal * p_world_aim;
 
     // 与 main.cpp 里 pnp_yaw_rad / pnp_pitch_rad 同式：yaw 右为正，pitch 抬头为正。
     const double rel_yaw = gimbalAzimuth(p_gimbal_aim);
     const double rel_pitch = gimbalElevation(p_gimbal_aim);
+
+    // 指令仰角取弹道发射仰角。下坠补偿在算法侧做，发的不是瞄准点的几何仰角；
+    // 第三个参数是弹道解不收敛时的回退值，即不作补偿的几何绝对仰角。
+    const double command_pitch =
+        solveBallistics(std::hypot(p_world_aim.x(), p_world_aim.y()),
+                        p_world_aim.z(), gimbal_pitch + rel_pitch)
+            .launch_pitch_rad;
 
     // 角速度用中心差分，窗口 +/-5 ms。
     constexpr double kRateHalfWindowS = 0.005;
@@ -674,12 +702,22 @@ PredictionResult ArmorEkf::buildPrediction(const GimbalState& gimbal, double lat
     StateVector x_late = x_;
     propagate(x_early, t_early);
     propagate(x_late, t_late);
-    const Eigen::Vector3d p_early = to_gimbal * platePositionWorld(x_early, aim_index);
-    const Eigen::Vector3d p_late = to_gimbal * platePositionWorld(x_late, aim_index);
+    const Eigen::Vector3d p_world_early = platePositionWorld(x_early, aim_index);
+    const Eigen::Vector3d p_world_late = platePositionWorld(x_late, aim_index);
+    const Eigen::Vector3d p_early = to_gimbal * p_world_early;
+    const Eigen::Vector3d p_late = to_gimbal * p_world_late;
     const double yaw_early = gimbalAzimuth(p_early);
     const double yaw_late = gimbalAzimuth(p_late);
-    const double pitch_early = gimbalElevation(p_early);
-    const double pitch_late = gimbalElevation(p_late);
+    // target_pitch 是补偿后的角，它的速率也必须来自补偿后的角，
+    // 否则同一个上报结构里两个量对不上。
+    const double pitch_early =
+        solveBallistics(std::hypot(p_world_early.x(), p_world_early.y()),
+                        p_world_early.z(), gimbal_pitch + gimbalElevation(p_early))
+            .launch_pitch_rad;
+    const double pitch_late =
+        solveBallistics(std::hypot(p_world_late.x(), p_world_late.y()),
+                        p_world_late.z(), gimbal_pitch + gimbalElevation(p_late))
+            .launch_pitch_rad;
     const double dt_window = t_late - t_early;
     const double yaw_velocity =
         dt_window > 0.0 ? wrapToPi(yaw_late - yaw_early) / dt_window : 0.0;
@@ -711,12 +749,16 @@ PredictionResult ArmorEkf::buildPrediction(const GimbalState& gimbal, double lat
     // 输出绝对云台指令，不是相对角。依据是框架的 setSafeOutput：
     // 安全帧写成 target_yaw = message.yaw（保持当前），只有绝对角才自洽。
     result.target_yaw = static_cast<float>(gimbal_yaw + rel_yaw);
-    result.target_pitch = static_cast<float>(gimbal_pitch + rel_pitch);
+    // 下坠补偿在算法侧做，这里发的是弹道发射仰角，不是瞄准点的几何仰角。
+    result.target_pitch = static_cast<float>(command_pitch);
     result.target_yaw_velocity = static_cast<float>(yaw_velocity);
     result.target_pitch_velocity = static_cast<float>(pitch_velocity);
 
-    const bool aligned = std::fabs(rel_yaw) < config_.fire_yaw_tolerance_rad &&
-                         std::fabs(rel_pitch) < config_.fire_pitch_tolerance_rad;
+    // yaw 的指令是 gimbal_yaw + rel_yaw，误差就是 rel_yaw；pitch 的指令是
+    // command_pitch，误差是它与当前绝对仰角 gimbal_pitch 之差。两者口径一致。
+    const bool aligned =
+        std::fabs(rel_yaw) < config_.fire_yaw_tolerance_rad &&
+        std::fabs(command_pitch - gimbal_pitch) < config_.fire_pitch_tolerance_rad;
     const bool spin_ok = std::fabs(x_[YawRate]) < config_.fire_spin_tolerance_rad_s;
     result.fire_allowed =
         status_ == TrackingState::Stable && aligned && spin_ok;
