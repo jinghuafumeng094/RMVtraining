@@ -826,6 +826,80 @@ void testBallisticDropCompensation() {
                 static_cast<double>(result.distance_m));
 }
 
+void testMuzzleOffsetIsSubtractedInGimbalFrame() {
+    ArmorEkf::Config config = testConfig();
+    const double offset = config.muzzle_offset_m;
+    assert(offset > 0.0);
+
+    // 接缝层：弹道输入从枪口量起。云台系的正前方是 +x，枪口在 P 轴前 offset。
+    const ArmorEkf::BallisticInputs forward =
+        ArmorEkf::ballisticInputsFromMuzzle(Eigen::Vector3d(5.0, 0.0, 0.0), offset);
+    assert(std::fabs(forward.horizontal_m - (5.0 - offset)) < 1e-12);
+    assert(std::fabs(forward.vertical_m) < 1e-12);
+
+    // 枪口与云台原点等高，所以高度差原样通过，只有水平距离少一个偏移。
+    const ArmorEkf::BallisticInputs raised =
+        ArmorEkf::ballisticInputsFromMuzzle(Eigen::Vector3d(5.0, 3.0, 0.4), offset);
+    assert(std::fabs(raised.horizontal_m - std::hypot(5.0 - offset, 3.0)) < 1e-12);
+    assert(std::fabs(raised.vertical_m - 0.4) < 1e-12);
+
+    // 同一个物理点在云台系里只有一个坐标，与云台转到哪无关。换成在 W 里减常向量
+    // (offset, 0, 0) 就随 yaw 漂：目标在云台系正前方 5 m、yaw = 90 度时它在 W 里
+    // 是 (0, -5, 0)，减出来 5.000549 m，比对的 4.9259 m 多出 74.649 mm。误差比
+    // 一个 offset 还多 0.55 mm，因为那个偏移在 W 里转成了垂直分量，hypot 会把
+    // 它的平方项加进来，约 offset^2/(2*5)。
+    const double subtracted_in_world = std::hypot(0.0 - offset, -5.0);
+    const double world_error = subtracted_in_world - forward.horizontal_m;
+    assert(world_error > offset);
+    assert(std::fabs(world_error - offset - offset * offset / (2.0 * 5.0)) < 1e-6);
+
+    // 端到端：同一个场景跑两遍，只差枪口偏移这一个数。偏移沿炮管，把弹道的
+    // 水平距离缩短一个 offset，指令仰角就少约 g*offset/(2v^2)，与距离无关。
+    const auto run = [](double muzzle_offset) {
+        ArmorEkf::Config run_config = testConfig();
+        run_config.fire_spin_tolerance_rad_s = 100.0;
+        run_config.muzzle_offset_m = muzzle_offset;
+        ArmorEkf filter(run_config);
+        const double dt = 1.0 / 165.0;
+        double timestamp = 0.0;
+        Truth truth;
+        truth.center = Eigen::Vector3d(5.0, 0.3, 0.0);
+        truth.yaw = 0.4;
+        truth.yaw_rate = 2.0;
+        for (int frame = 0; frame < 800; ++frame) {
+            timestamp += dt;
+            filter.predict(dt);
+            feedFrame(filter, run_config, truth, 0.0);
+            filter.advanceStateMachine(timestamp);
+            trueStep(truth, dt);
+        }
+        return filter.buildPrediction(makeGimbal(0.0, 0.0), 0.001);
+    };
+
+    const PredictionResult with_offset = run(offset);
+    const PredictionResult without_offset = run(0.0);
+
+    // 偏移只进弹道解，不进状态、不进观测：两遍的低层状态逐位相同。
+    // distance_m 却不完全一样，因为它量的是预测后的瞄点，而预测时长里含着
+    // 飞行时间，偏移让飞行时间少了约 3.2 ms，瞄点在这段时间里挪了 0.38 mm。
+    // 这一条同时钉住"distance_m 没有跟着挪到枪口"：若挪了，这里会差出
+    // 一个整偏移 74 mm。
+    const double distance_shift =
+        std::fabs(static_cast<double>(with_offset.distance_m) -
+                  static_cast<double>(without_offset.distance_m));
+    assert(distance_shift < 0.005);
+    assert(distance_shift > 0.0);
+
+    const double expected_drop = 9.81 * offset / (2.0 * 24.0 * 24.0);
+    const double drop = static_cast<double>(without_offset.target_pitch) -
+                        static_cast<double>(with_offset.target_pitch);
+    assert(drop > 0.85 * expected_drop);
+    assert(drop < 1.20 * expected_drop);
+    std::printf("[ekf] 枪口偏移 %.4f m 指令仰角差 %.3e rad 闭式 %.3e "
+                "距离漂移 %.4f mm 通过\n",
+                offset, drop, expected_drop, distance_shift * 1000.0);
+}
+
 }  // namespace
 
 int main() {
@@ -841,6 +915,7 @@ int main() {
     testNegativePredictionBiasIsHonored();
     testTrackingEvidenceFieldsReachPrediction();
     testBallisticDropCompensation();
+    testMuzzleOffsetIsSubtractedInGimbalFrame();
     testSafetyInvariants();
     std::printf("[ekf] 全部通过\n");
     return 0;

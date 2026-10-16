@@ -115,6 +115,16 @@ public:
         // 初始化时假定的装甲板半径 (m)。标准步兵两块板到中心同量级。
         double initial_radius_m{0.25};
 
+        // 枪口相对云台 P 轴原点的前移量 (m)。相机、云台 P 轴、摩擦轮三者刚体固定，
+        // 所以在云台系里这是个常向量 (muzzle_offset_m, 0, 0)，沿炮管前方，不随 yaw
+        // 或 pitch 变。来源 docs/云台外参.md 的「云台 P 轴 -> 摩擦轮」74.1 mm，与
+        // armor/src/Planner.cpp 的 translation_vector{74.1, 0.0, 0.0} 是同一个量。
+        //
+        // 弹丸从枪口飞出，所以弹道模型的两个输入必须从枪口量起。这一项只进
+        // buildPrediction 的弹道解，不进状态、不进观测。状态原点留在云台 P 轴：
+        // 观测天然相对它，而且它是三条转动轴的交点，在云台任何转动下都不动。
+        double muzzle_offset_m{0.0741};
+
         // 预测。
         double max_step_s{0.5};             // predict 的 dt 上限
         double max_latency_s{0.2};          // 单帧处理延迟上限
@@ -166,6 +176,18 @@ public:
     // gimbal_yaw 取正值时云台向右转，世界系里的视线朝 -y 走。
     static Eigen::Matrix3d gimbalToWorld(double gimbal_yaw);
     static Eigen::Matrix3d worldToGimbal(double gimbal_yaw);
+
+    // 弹道模型的两个输入：目标相对枪口的水平距离与高度差，都在云台系里量。
+    // 枪口 = 云台原点 + (muzzle_offset_m, 0, 0)。云台系跟世界系只差一个绕 z 的
+    // yaw，hypot(x, y) 与 z 都不过 yaw，所以在云台系里算，与在 W 里减掉旋转后的
+    // 那个向量逐位相同。反过来，若在 W 里直接减常向量 (muzzle_offset_m, 0, 0)，
+    // 误差随 yaw 走，yaw = 90 度时正好等于一整个 muzzle_offset_m。
+    struct BallisticInputs {
+        double horizontal_m{0.0};
+        double vertical_m{0.0};
+    };
+    static BallisticInputs ballisticInputsFromMuzzle(const Eigen::Vector3d& p_gimbal,
+                                                     double muzzle_offset_m);
 
     // 观测模型与雅可比，纯函数。测试用有限差分逐元素核对解析雅可比。
     // armor_index 必须已在 [0, plate_count) 内，调用方负责折算。

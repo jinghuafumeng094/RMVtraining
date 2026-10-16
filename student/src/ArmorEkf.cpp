@@ -28,9 +28,9 @@
 // 瞬时机动约 10 m/s^2，取一半。角加速度 12 rad/s^2 同理。
 //
 // 观测噪声来自仓库已实测的角点抖动：1.08 m 处单次重投影 0.70~0.79 px、
-// 同一角点两帧间最多动 1.41 px。按 delta_px * d / f（f 约 1805 px）估横向
-// 约 0.0006 * d，再留约 3 倍余量取 0.002 * d + 0.005。深度误差按同样的
-// 比例放大，取 0.010 * d + 0.010。
+// 同一角点两帧间最多动 1.41 px。按 delta_px * d / f 估横向约 0.0006 * d，
+// 再留约 3 倍余量取 0.002 * d + 0.005，深度按同比例放大取 0.010 * d + 0.010。
+// 那批 px 量于 2026-10-11，f 约 1805 px 是当时本机标定；车上那台约 1783 px。
 
 namespace {
 
@@ -122,6 +122,16 @@ Eigen::Matrix3d ArmorEkf::gimbalToWorld(double gimbal_yaw) {
 
 Eigen::Matrix3d ArmorEkf::worldToGimbal(double gimbal_yaw) {
     return gimbalToWorld(gimbal_yaw).transpose();
+}
+
+ArmorEkf::BallisticInputs ArmorEkf::ballisticInputsFromMuzzle(
+    const Eigen::Vector3d& p_gimbal, double muzzle_offset_m) {
+    const Eigen::Vector3d from_muzzle =
+        p_gimbal - Eigen::Vector3d(muzzle_offset_m, 0.0, 0.0);
+    BallisticInputs inputs;
+    inputs.horizontal_m = std::hypot(from_muzzle.x(), from_muzzle.y());
+    inputs.vertical_m = from_muzzle.z();
+    return inputs;
 }
 
 double ArmorEkf::wrapToPi(double angle) {
@@ -656,6 +666,9 @@ PredictionResult ArmorEkf::buildPrediction(const GimbalState& gimbal, double lat
     const double latency = smoothedLatency(latency_s);
     const double t0 = std::clamp(latency + bias, 0.0, config_.max_prediction_s);
 
+    // 云台系的点后面多处要用，先算一次，飞行时间迭代、瞄准、中心差分共用。
+    const Eigen::Matrix3d to_gimbal = worldToGimbal(gimbal_yaw);
+
     // 飞行时间依赖距离，距离又依赖预测时长。两次迭代解开这个循环。
     // 迭代里只试算，不提交 aim_index_，否则迟滞状态会被试算值写脏。
     double flight_s = 0.0;
@@ -668,8 +681,10 @@ PredictionResult ArmorEkf::buildPrediction(const GimbalState& gimbal, double lat
         }
         const Eigen::Vector3d p_world = platePositionWorld(x_step, index);
         // 这一轮只取飞行时间，第三个参数是回退仰角，用不到。
-        flight_s = solveBallistics(std::hypot(p_world.x(), p_world.y()),
-                                   p_world.z(), 0.0).flight_time_s;
+        const BallisticInputs inputs =
+            ballisticInputsFromMuzzle(to_gimbal * p_world, config_.muzzle_offset_m);
+        flight_s = solveBallistics(inputs.horizontal_m, inputs.vertical_m, 0.0)
+                       .flight_time_s;
     }
     const double t_pred = std::clamp(t0 + flight_s, 0.0, config_.max_prediction_s);
 
@@ -679,7 +694,6 @@ PredictionResult ArmorEkf::buildPrediction(const GimbalState& gimbal, double lat
     if (aim_index < 0) {
         return PredictionResult{};
     }
-    const Eigen::Matrix3d to_gimbal = worldToGimbal(gimbal_yaw);
     const Eigen::Vector3d p_world_aim = platePositionWorld(x_pred, aim_index);
     const Eigen::Vector3d p_gimbal_aim = to_gimbal * p_world_aim;
 
@@ -689,9 +703,11 @@ PredictionResult ArmorEkf::buildPrediction(const GimbalState& gimbal, double lat
 
     // 指令仰角取弹道发射仰角。下坠补偿在算法侧做，发的不是瞄准点的几何仰角；
     // 第三个参数是弹道解不收敛时的回退值，即不作补偿的几何绝对仰角。
+    const BallisticInputs aim_inputs =
+        ballisticInputsFromMuzzle(p_gimbal_aim, config_.muzzle_offset_m);
     const double command_pitch =
-        solveBallistics(std::hypot(p_world_aim.x(), p_world_aim.y()),
-                        p_world_aim.z(), gimbal_pitch + rel_pitch)
+        solveBallistics(aim_inputs.horizontal_m, aim_inputs.vertical_m,
+                        gimbal_pitch + rel_pitch)
             .launch_pitch_rad;
 
     // 角速度用中心差分，窗口 +/-5 ms。
@@ -710,13 +726,17 @@ PredictionResult ArmorEkf::buildPrediction(const GimbalState& gimbal, double lat
     const double yaw_late = gimbalAzimuth(p_late);
     // target_pitch 是补偿后的角，它的速率也必须来自补偿后的角，
     // 否则同一个上报结构里两个量对不上。
+    const BallisticInputs early_inputs =
+        ballisticInputsFromMuzzle(p_early, config_.muzzle_offset_m);
+    const BallisticInputs late_inputs =
+        ballisticInputsFromMuzzle(p_late, config_.muzzle_offset_m);
     const double pitch_early =
-        solveBallistics(std::hypot(p_world_early.x(), p_world_early.y()),
-                        p_world_early.z(), gimbal_pitch + gimbalElevation(p_early))
+        solveBallistics(early_inputs.horizontal_m, early_inputs.vertical_m,
+                        gimbal_pitch + gimbalElevation(p_early))
             .launch_pitch_rad;
     const double pitch_late =
-        solveBallistics(std::hypot(p_world_late.x(), p_world_late.y()),
-                        p_world_late.z(), gimbal_pitch + gimbalElevation(p_late))
+        solveBallistics(late_inputs.horizontal_m, late_inputs.vertical_m,
+                        gimbal_pitch + gimbalElevation(p_late))
             .launch_pitch_rad;
     const double dt_window = t_late - t_early;
     const double yaw_velocity =
