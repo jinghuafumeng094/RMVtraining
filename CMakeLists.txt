@@ -78,6 +78,7 @@ add_library(training_core STATIC
     student/src/ArmorDetector.cpp
     student/src/DigitClassifier.cpp
     student/src/ArmorEkf.cpp
+    student/src/MeasYawRate.cpp
 )
 target_include_directories(training_core
     PUBLIC
@@ -175,5 +176,9 @@ if(BUILD_TESTING)
     # 测试全是裸 assert，NDEBUG 会把它们整个编译掉，ctest 就变成假绿。
     target_compile_options(test_ekf_predict PRIVATE -UNDEBUG)
     add_test(NAME ekf_predict COMMAND test_ekf_predict)
+    add_executable(test_meas_yaw_rate tests/test_meas_yaw_rate.cpp)
+    target_link_libraries(test_meas_yaw_rate PRIVATE training_core)
+    target_compile_options(test_meas_yaw_rate PRIVATE -UNDEBUG)
+    add_test(NAME meas_yaw_rate COMMAND test_meas_yaw_rate)
     add_test(NAME cli_help COMMAND rmv_training --help)
 endif()

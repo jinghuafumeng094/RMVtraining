@@ -1,4 +1,5 @@
 #include "AppSupport.hpp"
+#include "MeasYawRate.hpp"
 #include "SerialPort.hpp"
 #include "StudentTasks.hpp"
 #include "WebLogger.hpp"
@@ -210,6 +211,58 @@ void logPrediction(const PredictionResult& result) {
     const double to_slot0_azimuth = std::atan2(-slot0_y, slot0_x);
     WEB_LOG("ekf_plate0_parallax_rad",
             std::remainder(to_slot0_azimuth - to_center_azimuth, 2.0 * kPi));
+}
+
+// 相机侧的两个量，与上面那一组的关键区别是不经过滤波器。
+//
+// 页面上其余的曲线全部来自 EKF，它自己算、自己报，错得前后一致时看不出来。
+// 这一组只用 armor_solve 给的板背方位角和串口给的云台角做差，得到一条独立于
+// 滤波器的车体角速度参照曲线：和 ekf_yaw_rate_rad_s 贴在一起说明滤波器跟得上相机，
+// 分叉说明它更信自己的模型。这正好把"跟不上"和"模型有偏"这两种病因分开。
+//
+// armor_orientation_yaw 是装甲板背向在云台系里的方位角，右正，板正对镜头时为 0。
+// 它单独画没有意义，云台一转它就动；要和 gimbal_yaw 一起看，两者相加才是板在
+// 世界系里的方位角，而世界系方位角的下降速率就是车体自转速率。
+//
+// 多块板同时可见时按"跟着上一帧那块板走"选取，取与上一帧方位角最接近的一块。
+// 这样物理换板才是一次 90 度跳变，而不是每帧在几块板之间乱跳；单块板可见时
+// 这条规则退化成"就取那一块"。跟随用的上一帧值由本函数自己维护，与滤波器无关。
+void logMeasYawRate(const std::vector<ArmorPose>& observations,
+                    const GimbalState& gimbal, double timestamp_s) {
+    static MeasYawRate meas;
+    static bool has_previous = false;
+    static double previous_yaw = 0.0;
+    constexpr double kTwoPi = 6.28318530717958647692;
+
+    WEB_LOG("gimbal_yaw", gimbal.yaw);
+
+    if (observations.empty()) {
+        // 没有观测就不喂角，MeasYawRate 会保持上一帧的输出；
+        // 参考时刻也不动，缺的这一帧的时间摊进下一帧的分母，速率不被放大。
+        WEB_LOG("ekf_meas_yaw_rate_rad_s", meas.rate());
+        return;
+    }
+
+    const ArmorPose* chosen = &observations.front();
+    if (has_previous) {
+        double best =
+            std::fabs(std::remainder(chosen->armor_yaw - previous_yaw, kTwoPi));
+        for (const ArmorPose& observation : observations) {
+            const double distance =
+                std::fabs(std::remainder(observation.armor_yaw - previous_yaw, kTwoPi));
+            if (distance < best) {
+                best = distance;
+                chosen = &observation;
+            }
+        }
+    }
+
+    const double rate = meas.update(chosen->armor_yaw, gimbal.yaw, timestamp_s);
+    has_previous = true;
+    previous_yaw = chosen->armor_yaw;
+
+    WEB_LOG("armor_orientation_yaw", chosen->armor_yaw);
+    WEB_LOG("ekf_meas_yaw_rate_rad_s", rate);
 }
 
 // main 中启动线程前先同步读一帧，保持参考工程的初始化顺序。
@@ -510,6 +563,8 @@ void *OperationFunction(void *arg) {
             std::chrono::duration<double, std::milli>(process_end - process_start).count());
         WEB_LOG("process_time_ms", translator.message.latency);
         logPrediction(prediction_valid ? prediction : PredictionResult{});
+        // 传采集时刻，不是帧间隔：缺观测的帧要把时间摊到下一帧的分母里。
+        logMeasYawRate(observations, gimbal, time_stamp);
 
         // 4. 将结果写回原 64 字节结构体。
         writeFrame(*serialPort, translator);
