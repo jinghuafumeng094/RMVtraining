@@ -1,0 +1,152 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  target_yaw 与 psi_i 是两个顶点不同的角。
+
+  两张面板画的是同一个俯视图，纸面上方 = 前方，纸面左方 = 车体左侧。
+
+  A 面板：target_yaw，顶点在「我」的云台。量的是「我方前方」到「视线」的夹角。
+          云台系是 前 x 左 y 上 z，所以 atan2(-y, x) 才得到右为正。
+          与 main.cpp 的 pnp_yaw_rad 同式，代码在 student/src/ArmorEkf.cpp:44-46 与 :751。
+
+  B 面板：psi_i，顶点在「敌车旋转中心」。量的是「车头朝向 theta_c」到「车心到板 i」的夹角。
+          它是状态向量里的 x[Yaw] 加板号偏移，只活在 platePositionWorld 内部，
+          代码在 student/src/ArmorEkf.cpp:198 到 :203，不出现在 PredictionResult 里。
+
+  编辑方式：直接改这个 svg，然后跑同目录的 render.sh 重新导出 png。
+  注意 XML 注释里不能出现连续两个减号，写分隔线用等号。
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="880" viewBox="0 0 1200 880"
+     font-family="Noto Sans CJK SC, Noto Sans CJK HK, sans-serif">
+
+  <defs>
+    <marker id="arrowGray" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#4a4a4a"/>
+    </marker>
+    <marker id="arrowRed" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#c0392b"/>
+    </marker>
+    <marker id="arrowBlue" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#2b5fd0"/>
+    </marker>
+  </defs>
+
+  <rect width="1200" height="880" fill="#ffffff"/>
+
+  <text x="600" y="46" font-size="30" text-anchor="middle" fill="#111111">
+    target_yaw 与 psi_i：两个顶点不同的角
+  </text>
+  <text x="600" y="76" font-size="19" text-anchor="middle" fill="#666666">
+    同一张俯视图。纸面上方 = 前方，纸面左方 = 车体左侧
+  </text>
+
+  <!-- ===================== 面板 A ===================== -->
+  <rect x="30" y="100" width="550" height="480" rx="10"
+        fill="#fcfcfd" stroke="#c8ccd4" stroke-width="2"/>
+  <text x="50" y="136" font-size="24" fill="#111111">
+    A. target_yaw 的顶点在「我」
+  </text>
+
+  <line x1="175" y1="445" x2="175" y2="180" stroke="#4a4a4a" stroke-width="3"
+        marker-end="url(#arrowGray)"/>
+  <text x="175" y="170" font-size="21" text-anchor="middle" fill="#4a4a4a">前 +x</text>
+
+  <line x1="175" y1="445" x2="80" y2="445" stroke="#4a4a4a" stroke-width="3"
+        marker-end="url(#arrowGray)"/>
+  <text x="80" y="472" font-size="21" text-anchor="middle" fill="#4a4a4a">左 +y</text>
+
+  <line x1="175" y1="445" x2="445" y2="250" stroke="#c0392b" stroke-width="3"
+        marker-end="url(#arrowRed)"/>
+  <text x="388" y="232" font-size="21" text-anchor="middle" fill="#c0392b">视线</text>
+
+  <line x1="462" y1="232" x2="484" y2="254" stroke="#c0392b" stroke-width="3"/>
+  <line x1="484" y1="232" x2="462" y2="254" stroke="#c0392b" stroke-width="3"/>
+  <text x="492" y="250" font-size="20" fill="#c0392b">瞄点</text>
+
+  <path d="M 175 325 A 120 120 0 0 1 272 375" fill="none"
+        stroke="#c08000" stroke-width="3"/>
+  <text x="282" y="352" font-size="21" fill="#c08000">target_yaw</text>
+
+  <circle cx="175" cy="445" r="9" fill="#2b5fd0"/>
+  <text x="212" y="452" font-size="21" fill="#2b5fd0">我（云台）</text>
+
+  <text x="50" y="508" font-size="19" fill="#666666">
+    角的两条边：「我方前方」与「视线」
+  </text>
+  <text x="50" y="538" font-size="20" fill="#c0392b">
+    往纸面右侧偏 = 我方右侧 = 取正
+  </text>
+  <text x="50" y="566" font-size="19" fill="#666666">
+    数学上 target_yaw = atan2(-y, x)，代码 ArmorEkf.cpp:44 与 :751
+  </text>
+
+  <!-- ===================== 面板 B ===================== -->
+  <rect x="620" y="100" width="550" height="480" rx="10"
+        fill="#fcfcfd" stroke="#c8ccd4" stroke-width="2"/>
+  <text x="640" y="136" font-size="24" fill="#111111">
+    B. psi_i 的顶点在「敌车旋转中心」
+  </text>
+
+  <circle cx="895" cy="310" r="120" fill="none" stroke="#c8ccd4"
+          stroke-width="2" stroke-dasharray="7 7"/>
+
+  <line x1="895" y1="310" x2="895" y2="210" stroke="#2b5fd0" stroke-width="3"
+        marker-end="url(#arrowBlue)"/>
+  <text x="908" y="258" font-size="21" fill="#2b5fd0">theta_c</text>
+
+  <path d="M 895 255 A 55 55 0 0 0 840 310" fill="none"
+        stroke="#c08000" stroke-width="3"/>
+  <text x="836" y="272" font-size="20" fill="#c08000">90 度</text>
+
+  <rect x="870" y="183" width="50" height="14" fill="#3c3c3c"/>
+  <rect x="768" y="285" width="14" height="50" fill="#3c3c3c"/>
+  <rect x="870" y="423" width="50" height="14" fill="#3c3c3c"/>
+  <rect x="1008" y="285" width="14" height="50" fill="#3c3c3c"/>
+
+  <text x="895" y="176" font-size="21" text-anchor="middle" fill="#3c3c3c">板 0</text>
+  <text x="756" y="318" font-size="21" text-anchor="end" fill="#3c3c3c">板 1</text>
+  <text x="895" y="462" font-size="21" text-anchor="middle" fill="#3c3c3c">板 2</text>
+  <text x="1034" y="318" font-size="21" fill="#3c3c3c">板 3</text>
+
+  <circle cx="895" cy="310" r="9" fill="#3c3c3c"/>
+  <text x="895" y="346" font-size="21" text-anchor="middle" fill="#3c3c3c">车心</text>
+
+  <text x="640" y="508" font-size="21" fill="#111111">
+    psi_i = theta_c + i * 90 度
+  </text>
+  <text x="640" y="538" font-size="19" fill="#666666">
+    四块板彼此差 90 度，是离散的四个值
+  </text>
+  <text x="640" y="566" font-size="19" fill="#666666">
+    代码 ArmorEkf.cpp:198
+  </text>
+
+  <!-- ===================== 底部连接 ===================== -->
+  <rect x="30" y="616" width="1140" height="130" rx="10"
+        fill="#f4f7fb" stroke="#c8ccd4" stroke-width="2"/>
+
+  <text x="60" y="656" font-size="22" fill="#111111">两者怎么接起来</text>
+
+  <text x="60" y="700" font-size="21" fill="#3c3c3c">
+    板心 = 车心 + r_i * (cos psi_i, sin psi_i)
+  </text>
+  <text x="520" y="700" font-size="20" fill="#888888">面板 B 提供方向</text>
+  <line x1="740" y1="692" x2="806" y2="692" stroke="#4a4a4a" stroke-width="3"
+        marker-end="url(#arrowGray)"/>
+  <text x="822" y="700" font-size="21" fill="#3c3c3c">换到我方云台系，取方位角</text>
+
+  <text x="60" y="732" font-size="21" fill="#c0392b">
+    target_yaw = 从「我」指向那个板心的方位角
+  </text>
+  <text x="520" y="732" font-size="20" fill="#888888">面板 A 提供顶点</text>
+
+  <text x="600" y="802" font-size="19" text-anchor="middle" fill="#666666">
+    角 A 随我与敌车的相对位置连续变化；角 B 只有四个取值，彼此差 90 度
+  </text>
+  <text x="600" y="834" font-size="19" text-anchor="middle" fill="#666666">
+    psi_i 不出现在 PredictionResult 里，aim_index 才是「选中第几块板」
+  </text>
+
+</svg>
