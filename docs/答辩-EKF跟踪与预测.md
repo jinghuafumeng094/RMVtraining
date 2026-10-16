@@ -3,11 +3,11 @@
 对应评分项：**EKF 跟踪与预测（20 分）**
 对应规格：`轨迹预测说明.md`「旋转车体 EKF 预测要求」、`docs/大作业任务书.md` §3.6
 代码位置：
-- `student/include/ArmorEkf.hpp`（267 行，类声明、状态下标、全部可调常量）
-- `student/src/ArmorEkf.cpp`（790 行，全部实现）
-- `student/src/StudentTasks.cpp:190-212`（`ekf_predict`，跨帧状态的适配器）
-- `tests/test_ekf_predict.cpp`（922 行：无噪收敛、雅可比对拍、状态机时序、安全不变量、
-  单板初始化回归、下坠补偿回归；夹具只喂 80 度锥角内真实可见的板，与 `testrig/ekf_trace` 同源）
+- `student/include/ArmorEkf.hpp`（271 行，类声明、状态下标、全部可调常量）
+- `student/src/ArmorEkf.cpp`（797 行，全部实现）
+- `student/src/StudentTasks.cpp:190-216`（`ekf_predict`，跨帧状态的适配器）
+- `tests/test_ekf_predict.cpp`（982 行：无噪收敛、雅可比对拍、状态机时序、安全不变量、
+  单板初始化回归、下坠补偿回归、NIS 出口契约；夹具只喂 80 度锥角内真实可见的板，与 `testrig/ekf_trace` 同源）
 
 本文按「一帧数据怎么流过这几百行」的顺序讲，每个小节末尾给行号锚点。答辩要独立解释实现时，照本文的节序讲即可。
 
@@ -198,7 +198,7 @@ x = [ px, py, pz,  vx, vy, vz,  theta_c,  omega,  r1,   r2 ]^T
 
 # 三、主循环：一帧调四次
 
-`ekf_predict` 这个适配器（`StudentTasks.cpp:186-212`）每帧固定做四件事：
+`ekf_predict` 这个适配器（`StudentTasks.cpp:186-216`）每帧固定做四件事：
 
 ```cpp
 filter.predict(dt);                                 // :206
@@ -1078,7 +1078,7 @@ R = diag(depth², lateral², lateral²)
 
 # 十一、测试怎么钉住它
 
-`tests/test_ekf_predict.cpp` 有 **14 条用例**，都不需要相机、不需要真车，跑 `ctest` 就行（`ctest` 里是 7 个可执行目标，`ekf_predict` 是其中之一）。每条都直接对应上面某一节的一个具体错误模式。
+`tests/test_ekf_predict.cpp` 有 **15 条用例**，都不需要相机、不需要真车，跑 `ctest` 就行（`ctest` 里是 8 个可执行目标，`ekf_predict` 是其中之一）。每条都直接对应上面某一节的一个具体错误模式。
 
 **夹具只喂真实可见的板**（很关键，答辩时值得主动讲）：仿真器推进一份真值车体，每帧按 80 度可见锥角判据筛出「板面朝相机」的板再喂进去，与 `testrig/ekf_trace` 的 `visiblePlates` 同源。改之前夹具是无条件发全部四块板，等于每帧凭空补两块背对相机的板 —— 真实检测器永远给不出这种输入，而且它恰好让「径向 = 视线」这条写反的假设成立，于是**方向写反的那一版在测试里反而全绿**。这条 bug 就是靠改夹具口径才暴露出来的。
 
@@ -1098,6 +1098,7 @@ R = diag(depth², lateral², lateral²)
 | 12 | `testBallisticDropCompensation` | 目标与云台同高时几何仰角恰为 0，**指令仰角就等于补偿量本身**，落在闭式 `g·d/(2v²)` 的 ±15% 内；再断言云台只转方位、仰角留平时开火门必须**拒绝**，云台跟到指令时必须**放行** | 只改指令不改门：命令抬了门没抬，5 m 外永远不开火；只改门不改指令：放行早 2.44°，落点低 21 cm |
 | 13 | `testMuzzleOffsetIsSubtractedInGimbalFrame` | 正前方 5 m 处，弹道输入的水平距离恰少一个 `muzzle_offset_m`；同一场景只差这一项跑两遍，指令仰角差落在闭式 `g·δ/(2v²)` 的 ±20% 内；**并断言 `distance_m` 没有跟着挪** | 在 W 里减常向量而不是在云台系里减，误差随 yaw 走，yaw 90 度时正好错一个偏移量 |
 | 14 | `testSafetyInvariants` | `crc != 1` 时 `fire_allowed` 恒假；空观测连调 100 帧不崩、输出有限；观测不够时不建目标 | 踩红线 |
+| 15 | `testNisMeanReachesPrediction` | 窗口里没有样本时 `PredictionResult::nis_mean` 是负的哨兵值而不是无穷大；同一段真值只改观测扰动的大小跑两遍，扰动版必须真的比干净版大（实测 0.000000 对 3.7019）。**故意不断言「均值等于 3」**：夹具的观测由真值加扰动造，`R` 用的是滤波器自己那套，等于用同一把尺子量自己，`R` 整体系数填错均值照样是 3。这条标定只能上车做（`docs/上车手册.md` 第 4 节） | 哨兵换成 -1 会让「没有 NIS 历史」也满足进 Stable 的门；接成常数或错接到 `P` 的对角线都倒在这条上 |
 
 用例 4 的时序有个坑（文件里也写了）：真值必须先推进 `dt` 再让滤波器 `predict` 同样步长。顺序反了，滤波器会比真值落后一个 `v·dt`，误差恰好是 `0.5/165` 这种量级，看着像「没收敛」，其实是测试写错了。
 

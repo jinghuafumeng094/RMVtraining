@@ -178,6 +178,14 @@ void logPrediction(const PredictionResult& result) {
     WEB_LOG("ekf_aim_index", result.aim_index);
     WEB_LOG("ekf_streak", result.hit_streak - result.miss_count);
     WEB_LOG("ekf_rejected_count", result.rejected_count);
+    // 调参唯一能自查的一个数：残差相对「H P H^T + R」的马氏距离平方，取最近几次
+    // 被接受的更新的均值。三维观测下理论均值等于观测维数，也就是 3。持续大于 3
+    // 说明 R 给小了、滤波器比实际更自信，持续小于 3 说明给大了。它和别处的曲线
+    // 不同，不描述目标，只描述滤波器对自己有多信。
+    // 窗口里还没有样本时是 -1，这一帧不打点，免得 -1 和无穷大把纵轴拉飞。
+    if (result.nis_mean >= 0.0F) {
+        WEB_LOG("ekf_nis_mean", result.nis_mean);
+    }
     // 以下三个是派生角，不参与任何控制，也不回流进滤波器。它们的作用是把「估出来的状态
     // 到底符不符合物理」变成肉眼可判的形状：车体匀速自转时，这三个角各自有一条已知的
     // 波形，形状、周期、幅值都能事先算出来，对不上就说明相应的状态没收敛或者模型写错了。

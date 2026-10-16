@@ -167,6 +167,11 @@ public:
     const StateVector& state() const { return x_; }
     const Covariance& covariance() const { return P_; }
     const Config& config() const { return config_; }
+    // 最近 nis_window 次被接受的更新的 NIS 均值。窗口里没有样本时返回正无穷，
+    // 好让进入 Stable 的那条闸「< nis_mean_gate」判成假：没有样本就不许进稳态。
+    // 这个哨兵值是为闸门挑的，往 Web Debug 打点前要先判 std::isfinite，
+    // 见 PredictionResult::nis_mean 与 main.cpp 的 logPrediction。
+    double recentNisMean() const;
 
     // 坐标系变换：p_world = gimbalToWorld(yaw) * p_gimbal。
     // M(yaw) = [  cos  sin  0 ]
@@ -220,7 +225,6 @@ private:
     Eigen::Matrix3d observationNoise(const Eigen::Vector3d& z) const;
 
     bool covarianceIsStable() const;
-    double recentNisMean() const;
     void recordNis(double nis);
     double smoothedLatency(double raw_latency_s);
 

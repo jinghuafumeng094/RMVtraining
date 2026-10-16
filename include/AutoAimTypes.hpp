@@ -96,6 +96,11 @@ struct PredictionResult {
     int hit_streak{0};
     int miss_count{0};
     int rejected_count{0};
+
+    // 最近若干次被接受的更新的 NIS 均值。NIS 是残差相对「H P H^T + R」的马氏距离
+    // 平方，三维观测下理论均值等于观测维数，也就是 3；明显偏离就说明 Q 或 R 填得
+    // 不准，是唯一能把这两种病因分开的量。窗口里还没有样本时取 -1，打点跳过。
+    float nis_mean{-1.0F};
 };
 
 // 读取 OpenCV YAML，将矩阵统一为 CV_64F，并拒绝占位数据或几何上无效的标定结果。

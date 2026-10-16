@@ -134,14 +134,23 @@ double worstPlateMatch(const ArmorEkf::StateVector& x, const Truth& truth,
 // 代价是观测变少：一辆四板车每次只有一到两块可见（现场口径也是"同车最多
 // 同时见两块、多数只有一块"），于是偏航与半径只在车自己转起来时才可辨识。
 // 所以下面的用例都让车带角速度，帧数预算也按实测重新定过，见各用例注释。
+// noise_sigma_m 大于零时给板心叠一层扰动，用来检验 NIS 这类残差统计量是不是活的。
+// 扰动用确定性的三角叠加而不是随机数：同一个 frame 永远得到同一个值，
+// 跑多少遍结果都一样，断言不会偶发。三个轴取不成比例的角频率,看上去就是噪声。
 void feedFrame(ArmorEkf& filter, const ArmorEkf::Config& config, const Truth& truth,
-               double gimbal_yaw) {
+               double gimbal_yaw, double noise_sigma_m = 0.0, int frame = 0) {
     const Eigen::Matrix3d to_gimbal = ArmorEkf::worldToGimbal(gimbal_yaw);
     for (int index = 0; index < config.plate_count; ++index) {
         if (!plateFacesCamera(truth, index, config)) {
             continue;
         }
-        const Eigen::Vector3d z = to_gimbal * truePlateWorld(truth, index, config);
+        Eigen::Vector3d z = to_gimbal * truePlateWorld(truth, index, config);
+        if (noise_sigma_m > 0.0) {
+            const double n = static_cast<double>(frame) + 0.37 * static_cast<double>(index);
+            z.x() += noise_sigma_m * std::sin(1.7 * n + 0.3);
+            z.y() += noise_sigma_m * std::sin(2.3 * n + 1.1);
+            z.z() += noise_sigma_m * std::sin(3.1 * n + 2.7);
+        }
         ArmorPose observation;
         observation.position_gimbal_m = cv::Vec3d(z.x(), z.y(), z.z());
         observation.position_camera_m = observation.position_gimbal_m;
@@ -165,6 +174,56 @@ ArmorEkf::Config testConfig() {
     ArmorEkf::Config config;
     config.plate_height_m = testHeights();
     return config;
+}
+
+// NIS 是残差相对「H P H^T + R」的马氏距离平方，3 维观测下理论均值等于观测维数 3，
+// 是唯一能检验 Q/R 填得准不准的量。这里钉住出口的两条契约：
+// 窗口里没有样本时给负的哨兵值，页面据此跳过不打点，而不是打一个会污染
+// 曲线的无穷大；有样本时这个数必须真的随观测残差动。
+//
+// 不拿「均值等于 3」当断言。夹具的观测是真值加扰动造的，R 用的是滤波器自己那套，
+// 等于用同一把尺子量自己：R 整体系数填错，NIS 均值照样是 3。那个校准只能上车实测，
+// 见 docs/上车手册.md 第六节。
+void testNisMeanReachesPrediction() {
+    const ArmorEkf::Config config = testConfig();
+    const GimbalState gimbal = makeGimbal(0.0, 0.0);
+    const double dt = 1.0 / 165.0;
+
+    // 还没建起滤波器时窗口里没有样本，出口必须是负的哨兵值。
+    ArmorEkf idle(config);
+    assert(idle.buildPrediction(gimbal, 0.001).nis_mean < 0.0);
+
+    // 同一段真值跑两遍，只差观测扰动的大小，其余完全一样，这样比较才有意义。
+    const auto run = [&](double noise_sigma_m) {
+        ArmorEkf filter(config);
+        Truth truth;
+        truth.center = Eigen::Vector3d(4.0, 0.3, 0.6);
+        truth.yaw = 0.4;
+        truth.yaw_rate = 2.0;
+        double timestamp = 0.0;
+        for (int frame = 0; frame < 800; ++frame) {
+            timestamp += dt;
+            filter.predict(dt);
+            feedFrame(filter, config, truth, 0.0, noise_sigma_m, frame);
+            filter.advanceStateMachine(timestamp);
+            trueStep(truth, dt);
+        }
+        assert(filter.status() == TrackingState::Stable);
+        return filter.buildPrediction(gimbal, 0.001).nis_mean;
+    };
+
+    const float clean = run(0.0);
+    const float perturbed = run(0.02);
+
+    // 干净观测下残差只剩线性化误差，远小于滤波器自己声明的 R；
+    // 实测这个量在 1e-6 量级，界留得很宽。
+    assert(clean >= 0.0F);
+    assert(clean < 1.0F);
+    // 换上真实存在的扰动必须涨上来。恒等于常数、或者接错成 P 的对角线，都会倒在这条上。
+    assert(std::isfinite(perturbed));
+    assert(perturbed > clean);
+    assert(perturbed < 50.0F);
+    std::printf("[ekf] NIS 均值 干净 %.6f 扰动 %.4f 通过\n", clean, perturbed);
 }
 
 // ---------------------------------------------------------------------------
@@ -914,6 +973,7 @@ int main() {
     testInitializationTakesOneObservationPerFrame();
     testNegativePredictionBiasIsHonored();
     testTrackingEvidenceFieldsReachPrediction();
+    testNisMeanReachesPrediction();
     testBallisticDropCompensation();
     testMuzzleOffsetIsSubtractedInGimbalFrame();
     testSafetyInvariants();

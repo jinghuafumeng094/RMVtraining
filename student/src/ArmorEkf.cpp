@@ -754,6 +754,13 @@ PredictionResult ArmorEkf::buildPrediction(const GimbalState& gimbal, double lat
     result.hit_streak = hit_streak_;
     result.miss_count = miss_count_;
     result.rejected_count = rejected_count_;
+    // recentNisMean 在窗口为空时返回正无穷，那是给 Stable 闸用的哨兵。
+    // 打点要的是"没有样本"这个语义，换成 -1，页面据此跳过这一帧。
+    // 不能直接把正无穷放进 PredictionResult：predictionIsFinite 不查这个字段，
+    // 无穷大会一路打到页面上把曲线的纵轴拉飞。
+    const double nis_mean = recentNisMean();
+    result.nis_mean =
+        std::isfinite(nis_mean) ? static_cast<float>(nis_mean) : -1.0F;
     // 车体状态报在跟踪系（W：x 前、y 左、z 上）里，与 PredictionResult 的注释一致。
     result.center_x_m = static_cast<float>(x_[Px]);
     result.center_y_m = static_cast<float>(x_[Py]);
