@@ -292,6 +292,50 @@ void testGimbalRotationDoesNotBreakIdentity() {
     assert(rotated.track_id == first.track_id);
 }
 
+void testBridgePlateDoesNotMergeVehicles() {
+    // v4.avi 第 137 帧的实测位置：近车 id3、远车 id1，中间一块被误识别成 id0 的板
+    // 离近车 0.77 m、离远车 0.42 m。单链接聚簇会把三块串成一簇，两辆车一起进 EKF。
+    const std::vector<ArmorPose> poses{
+        singlePlate(Eigen::Vector3d(1.23, 0.21, 0.14), 3, 30.0),
+        singlePlate(Eigen::Vector3d(1.65, -0.40, 0.35), 0, 260.0),
+        singlePlate(Eigen::Vector3d(2.06, -0.47, 0.28), 1, 470.0),
+    };
+    const TargetSelectorConfig config;
+    const std::vector<TargetCluster> clusters =
+        TargetSelector::buildClusters(poses, 0.0, config);
+
+    assert(clusters.size() == 2);
+    // 桥接板跟远车走，近车自己一簇。
+    bool found_near = false;
+    bool found_far = false;
+    for (const TargetCluster& cluster : clusters) {
+        if (cluster.indices.size() == 1) {
+            assert(cluster.indices[0] == 0);
+            assert(cluster.target_id == 3);
+            found_near = true;
+        } else {
+            assert(cluster.indices.size() == 2);
+            assert(cluster.target_id == 1);
+            found_far = true;
+        }
+    }
+    assert(found_near && found_far);
+}
+
+void testAdjacentPlatesOfOneVehicleStayTogether() {
+    // 同一辆车上相邻两块板实测间距 0.43 到 0.49 m，聚簇阈值不能低到把车自己拆开。
+    const std::vector<ArmorPose> poses{
+        singlePlate(Eigen::Vector3d(2.0, 0.0, 0.0), 3, 40.0),
+        singlePlate(Eigen::Vector3d(2.0 + 0.48, 0.0, 0.0), 3, 140.0),
+    };
+    const TargetSelectorConfig config;
+    const std::vector<TargetCluster> clusters =
+        TargetSelector::buildClusters(poses, 0.0, config);
+
+    assert(clusters.size() == 1);
+    assert(clusters[0].indices.size() == 2);
+}
+
 void testEmptyInputFromStart() {
     TargetSelector selector;
     const std::vector<ArmorPose> empty;
@@ -325,6 +369,10 @@ int main() {
     std::printf("coast_expire_empty ok\n");
     testGimbalRotationDoesNotBreakIdentity();
     std::printf("gimbal_rotation ok\n");
+    testBridgePlateDoesNotMergeVehicles();
+    std::printf("bridge_plate ok\n");
+    testAdjacentPlatesOfOneVehicleStayTogether();
+    std::printf("adjacent_plates ok\n");
     testEmptyInputFromStart();
     std::printf("empty_input ok\n");
     return 0;

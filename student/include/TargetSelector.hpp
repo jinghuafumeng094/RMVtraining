@@ -33,9 +33,10 @@ enum class TargetSelectionMode {
 struct TargetSelectorConfig {
     TargetSelectionMode mode{TargetSelectionMode::Weighted};
 
-    // 同车相邻两块板间距 2*r*sin(45) 约 0.35 m，板环直径不到 0.7 m；
-    // 两辆车相距常在 1 m 以上。0.80 m 把两者分开。
-    double cluster_link_m{0.80};
+    // v4.avi 实测同车相邻两块板间距 0.43 到 0.49 m。阈值降到 0.45 会开始把一辆车
+    // 拆成两簇，0.50 起不再拆。取 0.55 留出 60 mm 余量。
+    // 误识别出的桥接板能把两车串成一簇，0.80 时 v4 有 417 帧跨车合簇，0.55 降到 66 帧。
+    double cluster_link_m{0.55};
 
     // 跨帧认同：新簇心与上次选中簇心在世界系中的距离不超过此值，视为同一辆车。
     // 必须小于两车典型间距，否则会吃掉另一辆车。
