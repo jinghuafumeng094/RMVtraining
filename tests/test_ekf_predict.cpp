@@ -137,6 +137,16 @@ double worstPlateMatch(const ArmorEkf::StateVector& x, const Truth& truth,
 // noise_sigma_m 大于零时给板心叠一层扰动，用来检验 NIS 这类残差统计量是不是活的。
 // 扰动用确定性的三角叠加而不是随机数：同一个 frame 永远得到同一个值，
 // 跑多少遍结果都一样，断言不会偶发。三个轴取不成比例的角频率,看上去就是噪声。
+ArmorPose makeObservation(const Eigen::Vector3d& z, int target_id) {
+    ArmorPose observation;
+    observation.position_gimbal_m = cv::Vec3d(z.x(), z.y(), z.z());
+    observation.position_camera_m = observation.position_gimbal_m;
+    observation.armor_yaw = 0.0;
+    observation.reprojection_error = 0.3;
+    observation.detection.target_id = target_id;
+    return observation;
+}
+
 void feedFrame(ArmorEkf& filter, const ArmorEkf::Config& config, const Truth& truth,
                double gimbal_yaw, double noise_sigma_m = 0.0, int frame = 0) {
     const Eigen::Matrix3d to_gimbal = ArmorEkf::worldToGimbal(gimbal_yaw);
@@ -151,13 +161,7 @@ void feedFrame(ArmorEkf& filter, const ArmorEkf::Config& config, const Truth& tr
             z.y() += noise_sigma_m * std::sin(2.3 * n + 1.1);
             z.z() += noise_sigma_m * std::sin(3.1 * n + 2.7);
         }
-        ArmorPose observation;
-        observation.position_gimbal_m = cv::Vec3d(z.x(), z.y(), z.z());
-        observation.position_camera_m = observation.position_gimbal_m;
-        observation.armor_yaw = 0.0;
-        observation.reprojection_error = 0.3;
-        observation.detection.target_id = index + 1;
-        filter.update(observation, gimbal_yaw);
+        filter.update(makeObservation(z, index + 1), gimbal_yaw);
     }
 }
 
@@ -177,9 +181,10 @@ ArmorEkf::Config testConfig() {
 }
 
 // NIS 是残差相对「H P H^T + R」的马氏距离平方，3 维观测下理论均值等于观测维数 3，
-// 是唯一能检验 Q/R 填得准不准的量。这里钉住出口的两条契约：
-// 窗口里没有样本时给负的哨兵值，页面据此跳过不打点，而不是打一个会污染
-// 曲线的无穷大；有样本时这个数必须真的随观测残差动。
+// 是唯一能检验 Q/R 填得准不准的量。这里钉住"有样本时这个数必须真的随观测残差动"。
+// 窗口为空时的哨兵语义由 testNisSentinelBeforeFirstUpdate 单独负责：本用例开头
+// 那个未初始化的滤波器走的是 buildPrediction 的 NoTarget 提前返回，拿到的只是
+// 结构体默认值，钉不住任何一行转换。
 //
 // 不拿「均值等于 3」当断言。夹具的观测是真值加扰动造的，R 用的是滤波器自己那套，
 // 等于用同一把尺子量自己：R 整体系数填错，NIS 均值照样是 3。那个校准只能上车实测，
@@ -224,6 +229,55 @@ void testNisMeanReachesPrediction() {
     assert(perturbed > clean);
     assert(perturbed < 50.0F);
     std::printf("[ekf] NIS 均值 干净 %.6f 扰动 %.4f 通过\n", clean, perturbed);
+}
+
+// NIS 的两个哨兵值服务两处语义不同的判据，任何一个写成另一个都会静默失效。
+//
+// 内部：recentNisMean() 在窗口为空时返回正无穷，使「< nis_mean_gate」为假，
+// 也就是没有 NIS 历史就不许进 Stable。改成 -1 会让这道门恒真，整组闸门白设。
+// 出口：buildPrediction() 把正无穷换成 -1，页面据此跳过这一帧。
+// predictionIsFinite 不查 nis_mean，漏了转换会把无穷大一路打到曲线上。
+//
+// 必须用「刚初始化、还没接受过更新」这一刻来测。未初始化的滤波器在
+// buildPrediction 里对 NoTarget 提前返回，拿到的是结构体默认值，两条契约都走不到。
+// 这一时刻在真实运行里必然出现：tryInitialize 把状态置成 Unstable 并清零 NIS 窗口。
+void testNisSentinelBeforeFirstUpdate() {
+    const ArmorEkf::Config config = testConfig();
+    const GimbalState gimbal = makeGimbal(0.0, 0.0);
+    const double dt = 1.0 / 165.0;
+
+    ArmorEkf filter(config);
+    Truth truth;
+    truth.center = Eigen::Vector3d(4.0, 0.3, 0.6);
+    truth.yaw = 0.4;
+
+    // 每帧只喂一块板。同一帧的第二条观测会走关联更新，把 NIS 写进窗口，
+    // 那样就测不到"窗口为空"这一刻了。
+    const Eigen::Vector3d plate = truePlateWorld(truth, 0, config);
+    double timestamp = 0.0;
+    for (int frame = 0; frame < config.init_frames; ++frame) {
+        timestamp += dt;
+        filter.predict(dt);
+        filter.update(makeObservation(plate, 1), 0.0);
+        filter.advanceStateMachine(timestamp);
+    }
+    assert(filter.status() == TrackingState::Unstable);
+
+    // 内部哨兵：窗口为空必须是正无穷，绝不满足 Stable 门。
+    const double nis_mean = filter.recentNisMean();
+    assert(std::isinf(nis_mean));
+    assert(nis_mean > 0.0);
+    assert(!(nis_mean < config.nis_mean_gate));
+
+    // 出口哨兵：同一时刻打进 PredictionResult 的必须是负值。
+    // 顺带断言这条预测确实走到了提前返回之外，否则又是在默认值上打转。
+    const PredictionResult prediction = filter.buildPrediction(gimbal, 0.001);
+    assert(prediction.state == TrackingState::Unstable);
+    assert(prediction.nis_mean < 0.0F);
+    assert(std::isfinite(prediction.distance_m));
+    assert(prediction.distance_m > 0.0F);
+    std::printf("[ekf] NIS 哨兵 窗口空 %.1f 出口 %.1f 通过\n", nis_mean,
+                static_cast<double>(prediction.nis_mean));
 }
 
 // ---------------------------------------------------------------------------
@@ -974,6 +1028,7 @@ int main() {
     testNegativePredictionBiasIsHonored();
     testTrackingEvidenceFieldsReachPrediction();
     testNisMeanReachesPrediction();
+    testNisSentinelBeforeFirstUpdate();
     testBallisticDropCompensation();
     testMuzzleOffsetIsSubtractedInGimbalFrame();
     testSafetyInvariants();
