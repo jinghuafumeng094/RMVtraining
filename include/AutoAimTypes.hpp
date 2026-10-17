@@ -58,11 +58,13 @@ struct ArmorDetection {
 struct ArmorPose {
     // 平移向量单位为米。armor_yaw 是云台坐标系中的偏航角（弧度），
     // reprojection_error 是单个观测的重投影误差（像素）。
+    // center_offset_px 是板心投影点到画面中心的像素距离，供多目标筛选用。
     ArmorDetection detection;
     cv::Vec3d position_camera_m{0.0, 0.0, 0.0};
     cv::Vec3d position_gimbal_m{0.0, 0.0, 0.0};
     double armor_yaw{0.0};
     double reprojection_error{0.0};
+    double center_offset_px{0.0};
 };
 
 struct PredictionResult {

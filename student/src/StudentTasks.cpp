@@ -3,6 +3,7 @@
 #include "ArmorDetector.hpp"
 #include "ArmorEkf.hpp"
 #include "HikCamera.hpp"
+#include "TargetSelector.hpp"
 
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
@@ -158,6 +159,18 @@ std::vector<ArmorPose> armor_solve(const std::vector<ArmorDetection>& detections
         pose.position_camera_m = tvec;
         pose.reprojection_error = error_px;
 
+        // 板心到画面中心的像素距离，多目标筛选按它排序。
+        // 取实测四角点的均值，不再投一次物体系原点：物体系四角点关于原点对称，
+        // 两者只差透视下的二阶小量，而实测角点不依赖 PnP，含义也更直接。
+        cv::Point2f center_px(0.0F, 0.0F);
+        for (const cv::Point2f& corner : detection.corners) {
+            center_px += corner;
+        }
+        center_px *= 0.25F;
+        pose.center_offset_px =
+            std::hypot(center_px.x - 0.5 * camera.image_width,
+                       center_px.y - 0.5 * camera.image_height);
+
         // 相机系 -> 云台系：一条刚体变换，全函数就这一处用到外参。
         // 这里的 R 不是单位阵：相机系是 右 / 下 / 前，云台系是 前 / 左 / 上，
         // 两者差一个 90 度置换，见 config/camera.yaml 顶部。若把 R 当单位阵，
@@ -187,10 +200,23 @@ std::vector<ArmorPose> armor_solve(const std::vector<ArmorDetection>& detections
 //
 // 跨帧状态放在函数内的 static 里。main.cpp 的操作线程是唯一调用者，
 // 不存在并发问题；ArmorEkf 本身可以独立构造，单测直接测类，不走这个适配器。
+//
+// 一帧可能出现两辆车。ArmorEkf 只有一套状态和一个四槽关联器，两辆车的板
+// 同时灌进去会互相抢槽位，所以在滤波之前先用 TargetSelector 选出一辆车。
 PredictionResult ekf_predict(const std::vector<ArmorPose>& observations,
                              const GimbalState& gimbal, double timestamp_seconds) {
     static ArmorEkf filter;
+    static armor::TargetSelector selector;
     static double last_timestamp = 0.0;
+
+    const armor::TargetSelection selection =
+        selector.select(observations, static_cast<double>(gimbal.yaw), timestamp_seconds);
+
+    // 换车等于换了一个物理对象，旧状态会把新车挡在跳变闸外，
+    // 等状态机超时重置又要 1.5 s，所以这里直接重置。
+    if (selection.switched) {
+        filter.reset();
+    }
 
     // timestamp_seconds 是 steady_clock 自纪元起的秒数，两帧相减就是帧间隔；
     // 用"现在"减它，得到的是这一帧从采集到此刻消耗掉的检测与解算时间，也就是延迟。
@@ -208,8 +234,9 @@ PredictionResult ekf_predict(const std::vector<ArmorPose>& observations,
     const double latency_s = std::clamp(now_seconds - timestamp_seconds, 0.0, 0.2);
 
     filter.predict(dt);
-    for (const ArmorPose& observation : observations) {
-        filter.update(observation, static_cast<double>(gimbal.yaw));
+    for (int index : selection.observation_indices) {
+        filter.update(observations[static_cast<std::size_t>(index)],
+                      static_cast<double>(gimbal.yaw));
     }
     filter.advanceStateMachine(timestamp_seconds);
     return filter.buildPrediction(gimbal, latency_s);
