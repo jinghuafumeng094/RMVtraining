@@ -209,6 +209,27 @@ int main() {
         small_left, tilted(232.0F - 15.0F, 100.0F, 30.0F, 51.96152F)};
     assert(armor::pairLightBars(not_parallel).empty());
 
+    // 判据 3 的第二半：每根灯条自己也要接近竖直，倾角差小不够。
+    // 这组数直接来自 v4.avi 第 300 帧那块 id=0 的假板：两条 41/43x7 的
+    // 横亮片，长度比、y 对齐、倾角差（都是 +90°）、间距比全部合格，
+    // 只有"横着"这一件事不对。物理上灯条只有竖着的。
+    const std::vector<armor::LightBar> horizontal{
+        armor::LightBar{{1072.0F, 243.5F}, {1113.0F, 243.5F}},
+        armor::LightBar{{1262.0F, 249.5F}, {1305.0F, 249.5F}}};
+    assert(armor::pairLightBars(horizontal).empty());
+
+    // 绝对倾角闸不能误伤真实的倾斜：两根同样倾斜的真灯条仍然成对。
+    // 44° 在门槛内、50° 在门槛外，一起把 45° 钉住。
+    // 实测两段回放里 id!=0 的块最大倾角 14.04°，45° 已有三倍余量。
+    const std::vector<armor::LightBar> tilt44{
+        barFrom(100.0F, 130.0F, 60.0F, 44.0F),
+        barFrom(232.0F, 130.0F, 60.0F, 44.0F)};
+    assert(armor::pairLightBars(tilt44).size() == 1);
+    const std::vector<armor::LightBar> tilt50{
+        barFrom(100.0F, 130.0F, 60.0F, 50.0F),
+        barFrom(232.0F, 130.0F, 60.0F, 50.0F)};
+    assert(armor::pairLightBars(tilt50).empty());
+
     // 判据 4：间距比 480 / 60 = 8.0 → 太远，拒绝
     const std::vector<armor::LightBar> too_far{small_left,
                                                bar(580.0F, 100.0F, 160.0F)};

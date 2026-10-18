@@ -36,6 +36,10 @@ struct PairCriteria {
     float max_length_ratio{1.8F};         // 长灯条 / 短灯条 的上限
     float max_center_y_diff_ratio{0.6F};  // |Δy| / 平均灯条长度 的上限
     float max_tilt_diff_deg{15.0F};       // 两根灯条倾角差的上限
+    // 单根灯条与竖直方向夹角的上限。灯条物理上只有竖着的，横着的亮带不是灯条；
+    // 两根都横着时倾角差为 0，只看差值挡不住。
+    // 实测 v1/v4 回放里 id!=0 的块最大 14.04°，45° 有三倍余量。
+    float max_abs_tilt_deg{45.0F};
     float min_gap_ratio{1.2F};            // 中心距 / 平均灯条长度 的下限
     float max_gap_ratio{6.0F};            // 同上，上限
 };

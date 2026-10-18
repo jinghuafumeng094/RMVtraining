@@ -168,9 +168,18 @@ std::vector<LightBarPair> pairLightBars(const std::vector<LightBar>& bars,
                 continue;
             }
 
-            // 判据 3：倾角接近（同一块板的两根灯条近似平行）
-            const float tilt_diff =
-                angleDifferenceDegrees(a.tiltDegrees(), b.tiltDegrees());
+            // 判据 3：倾角。两半都要过。
+            //   每根灯条自己接近竖直。灯条物理上只有竖着的，横着的亮带
+            //   是灯条上的反光或环境里的高亮边缘，不是装甲板。
+            //   两根灯条近似平行。只看差值的话，两根都是水平的亮片
+            //   倾角差为 0，会以满分通过。
+            const float tilt_a = a.tiltDegrees();
+            const float tilt_b = b.tiltDegrees();
+            if (std::fabs(tilt_a) > criteria.max_abs_tilt_deg ||
+                std::fabs(tilt_b) > criteria.max_abs_tilt_deg) {
+                continue;
+            }
+            const float tilt_diff = angleDifferenceDegrees(tilt_a, tilt_b);
             if (tilt_diff > criteria.max_tilt_diff_deg) {
                 continue;
             }
