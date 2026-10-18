@@ -39,8 +39,13 @@ struct TargetSelectorConfig {
     double cluster_link_m{0.55};
 
     // 跨帧认同：新簇心与上次选中簇心在世界系中的距离不超过此值，视为同一辆车。
-    // 必须小于两车典型间距，否则会吃掉另一辆车。
+    // 距离先加贴纸惩罚再比，所以这一个数管两件事：编号相同认 identity_match_m，
+    // 不同或读不出只剩 identity_match_m - identity_sticker_penalty_m。
     double identity_match_m{1.20};
+
+    // 贴纸对不上时加到距离上的惩罚。1.20 - 0.65 = 0.55，正好等于 cluster_link_m：
+    // 没有编号作证时，只认同一辆车上两处能相距的那点距离。
+    double identity_sticker_penalty_m{0.65};
 
     // 挑战者分数要高出当前目标这么多才记一次切换票，抑制两车分数胶着时来回跳。
     double switch_margin{0.08};
@@ -306,15 +311,20 @@ inline TargetSelection TargetSelector::select(const std::vector<ArmorPose>& obse
     }
 
     // 找和上次选中簇在世界系里对得上的那一簇。
+    // 距离不直接比：贴纸对不上时加惩罚。同一辆车换板造成的簇心跳变只有编号能兜住，
+    // 没有编号作证就只认 cluster_link_m 那么远。
     int matched = -1;
-    double matched_distance = std::numeric_limits<double>::infinity();
+    double matched_key = std::numeric_limits<double>::infinity();
     for (int i = 0; i < static_cast<int>(clusters.size()); ++i) {
-        const double distance =
-            (clusters[static_cast<std::size_t>(i)].center_world_m - tracked_center_world_m_)
-                .norm();
-        if (distance <= config_.identity_match_m && distance < matched_distance) {
+        const TargetCluster& cluster = clusters[static_cast<std::size_t>(i)];
+        const double distance = (cluster.center_world_m - tracked_center_world_m_).norm();
+        const bool sticker_agrees =
+            cluster.target_id != 0 && target_id_ != 0 && cluster.target_id == target_id_;
+        const double key =
+            sticker_agrees ? distance : distance + config_.identity_sticker_penalty_m;
+        if (key <= config_.identity_match_m && key < matched_key) {
             matched = i;
-            matched_distance = distance;
+            matched_key = key;
         }
     }
 

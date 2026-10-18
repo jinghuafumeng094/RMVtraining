@@ -292,6 +292,80 @@ void testGimbalRotationDoesNotBreakIdentity() {
     assert(rotated.track_id == first.track_id);
 }
 
+void testStickerChangeDoesNotHijackTrack() {
+    // 跟丢之后，0.9 m 外的另一辆车编号不同，不能被当成本车。
+    // 距离在 identity_match_m 以内，只有编号能挡住它。
+    TargetSelectorConfig config;
+    config.coast_timeout_s = 0.5;
+    TargetSelector selector(config);
+
+    const std::vector<ArmorPose> tracked{
+        singlePlate(Eigen::Vector3d(3.0, 0.0, 0.0), 3, 40.0),
+    };
+    const TargetSelection first = selector.select(tracked, 0.0, 0.0);
+    assert(first.switched);
+    assert(first.target_id == 3);
+
+    const std::vector<ArmorPose> rival{
+        singlePlate(Eigen::Vector3d(3.0, 0.9, 0.0), 5, 40.0),
+    };
+    const TargetSelection selection = selector.select(rival, 0.0, 0.01);
+    assert(selection.has_target);
+    assert(selection.coasting);
+    assert(!selection.switched);
+    assert(selection.target_id == 3);
+    assert(selection.track_id == first.track_id);
+    assert(selection.observation_indices.empty());
+}
+
+void testUnknownStickerFallsBackToGeometry() {
+    // 读不出编号时没有贴纸信用，只剩几何：0.55 m 以内仍认，0.9 m 不认。
+    const std::vector<ArmorPose> tracked{
+        singlePlate(Eigen::Vector3d(3.0, 0.0, 0.0), 3, 40.0),
+    };
+
+    TargetSelector near_selector;
+    const TargetSelection first = near_selector.select(tracked, 0.0, 0.0);
+    assert(first.target_id == 3);
+    const std::vector<ArmorPose> near_unknown{
+        singlePlate(Eigen::Vector3d(3.0, 0.4, 0.0), 0, 40.0),
+    };
+    const TargetSelection near = near_selector.select(near_unknown, 0.0, 0.01);
+    assert(!near.coasting);
+    assert(near.track_id == first.track_id);
+    assert(near.observation_indices.size() == 1);
+
+    TargetSelector far_selector;
+    far_selector.select(tracked, 0.0, 0.0);
+    const std::vector<ArmorPose> far_unknown{
+        singlePlate(Eigen::Vector3d(3.0, 0.9, 0.0), 0, 40.0),
+    };
+    const TargetSelection far = far_selector.select(far_unknown, 0.0, 0.01);
+    assert(far.coasting);
+    assert(far.target_id == 3);
+    assert(far.observation_indices.empty());
+}
+
+void testStickerKeepsIdentityAcrossLargeJump() {
+    // 编号相同，0.9 m 的簇心跳变仍算同一辆车，不许断跟。
+    TargetSelector selector;
+    const std::vector<ArmorPose> tracked{
+        singlePlate(Eigen::Vector3d(3.0, 0.0, 0.0), 3, 40.0),
+    };
+    const TargetSelection first = selector.select(tracked, 0.0, 0.0);
+    assert(first.switched);
+
+    const std::vector<ArmorPose> jumped{
+        singlePlate(Eigen::Vector3d(3.0, 0.9, 0.0), 3, 40.0),
+    };
+    const TargetSelection selection = selector.select(jumped, 0.0, 0.01);
+    assert(!selection.coasting);
+    assert(!selection.switched);
+    assert(selection.target_id == 3);
+    assert(selection.track_id == first.track_id);
+    assert(selection.observation_indices.size() == 1);
+}
+
 void testBridgePlateDoesNotMergeVehicles() {
     // v4.avi 第 137 帧的实测位置：近车 id3、远车 id1，中间一块被误识别成 id0 的板
     // 离近车 0.77 m、离远车 0.42 m。单链接聚簇会把三块串成一簇，两辆车一起进 EKF。
@@ -369,6 +443,12 @@ int main() {
     std::printf("coast_expire_empty ok\n");
     testGimbalRotationDoesNotBreakIdentity();
     std::printf("gimbal_rotation ok\n");
+    testStickerChangeDoesNotHijackTrack();
+    std::printf("sticker_change ok\n");
+    testUnknownStickerFallsBackToGeometry();
+    std::printf("unknown_sticker ok\n");
+    testStickerKeepsIdentityAcrossLargeJump();
+    std::printf("sticker_large_jump ok\n");
     testBridgePlateDoesNotMergeVehicles();
     std::printf("bridge_plate ok\n");
     testAdjacentPlatesOfOneVehicleStayTogether();
