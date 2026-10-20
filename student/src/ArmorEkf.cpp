@@ -6,11 +6,20 @@
 #include <cmath>
 #include <limits>
 
-// 观测量只用板心的三维坐标，不用任何角度。
+// 观测是板心的三维坐标，外加一条板面偏航角。
 //
-// 这样绕开了 armor_yaw 的语义歧义：它实现成"板面法向的偏航角"
-// （见 StudentTasks.cpp 的 armor_solve），而任务书三处措辞指的是"板心方位角"。
-// 两者差 90 度，当作观测量会把整个滤波带偏。三维板心没有这个问题。
+// 只有三维板心不够用。一帧一块板只给两个位置约束，而车心两个分量、车体偏航、
+// 半径一共四个未知量：偏航与车心沿切向的分量在单板下完全混在一起，位置残差
+// 只能按方差分配，偏航与半径都失去可辨识性。v4 回放里半径塌到几厘米、yaw 跑到
+// 7~8 rad/s 就是这条。2026-10-20 补上 ArmorPose::armor_yaw 作第四条观测。
+//
+// armor_yaw 实现成板面法向的偏航角（StudentTasks.cpp 的 armor_solve）。板面
+// 朝外，法向就是板心径向的反向，所以它直接读出车体偏航：
+//     armor_yaw = wrapToPi(pi - (theta_c + i * spacing + gimbal_yaw))
+// 对 theta_c 的偏导恒为 -1。初值按同一条公式定，第一条观测的新息只有
+// asin(r/d) 量级。与任务书"板心方位角"的措辞相差的是常值，已并进上式。
+// 位置观测仍是三维，NIS 闸与 nis_mean_gate 的口径不变；偏航那条按标量更新
+// 单独做，闸门是 armor_yaw_gate_rad，不进 NIS 窗口。
 //
 // 符号约定：两个偏航角转正的方向并不相同，这不是笔误。
 // theta_c 是 W 系（x 前、y 左）里的方位角，从 +x 转向 +y 为正，而 +y 朝左，
@@ -212,6 +221,21 @@ Eigen::Vector3d ArmorEkf::platePositionWorld(const StateVector& x, int armor_ind
                            x[Pz] + config_.plate_height_m[static_cast<std::size_t>(i)]);
 }
 
+// 半径不是普通的连续状态：它是车体几何，物理上落在一个窄区间里。估计跑出
+// 边界时夹回来，同时把车心沿同一径向平移同样的量，使 observed_index 这块板
+// 在世界系里的位置不变，刚吃下的观测仍然成立。不平移车心的话，夹完模型的
+// 板位立刻偏离观测，下一帧的 NIS 会把所有观测判成离群。
+void ArmorEkf::clampRadii(int observed_index) {
+    const Eigen::Vector3d before = platePositionWorld(x_, observed_index);
+    for (int i = 0; i < config_.plate_count; ++i) {
+        double& radius = x_[radiusIndex(i)];
+        radius = std::min(config_.max_radius_m, std::max(config_.min_radius_m, radius));
+    }
+    const Eigen::Vector3d after = platePositionWorld(x_, observed_index);
+    x_[Px] += before.x() - after.x();
+    x_[Py] += before.y() - after.y();
+}
+
 // ---------------------------------------------------------------------------
 // 预测
 // ---------------------------------------------------------------------------
@@ -395,10 +419,14 @@ bool ArmorEkf::tryInitialize(const ArmorPose& observation, double gimbal_yaw) {
     // delta 是该板被看到的斜角，可见范围内不超过锥角。
     x_.setZero();
     x_[Yaw] = wrapToPi(std::atan2(-init_mean_.y(), -init_mean_.x()));
-    x_[Radius1] = config_.initial_radius_m;
-    x_[Radius2] = config_.initial_radius_m;
-    x_[Px] = init_mean_.x() - config_.initial_radius_m * std::cos(x_[Yaw]);
-    x_[Py] = init_mean_.y() - config_.initial_radius_m * std::sin(x_[Yaw]);
+    // 先夹半径再反推中心，否则滤波器一建立就与这条观测矛盾，下一帧起全被拒。
+    const double initial_radius =
+        std::min(config_.max_radius_m, std::max(config_.min_radius_m,
+                                                config_.initial_radius_m));
+    x_[Radius1] = initial_radius;
+    x_[Radius2] = initial_radius;
+    x_[Px] = init_mean_.x() - initial_radius * std::cos(x_[Yaw]);
+    x_[Py] = init_mean_.y() - initial_radius * std::sin(x_[Yaw]);
     x_[Pz] = init_mean_.z() - config_.plate_height_m[0];
     P_ = initialCovariance();
 
@@ -486,6 +514,36 @@ bool ArmorEkf::associateAndUpdate(const ArmorPose& observation, double gimbal_ya
          K * R * K.transpose();
     x_[Yaw] = wrapToPi(x_[Yaw]);
 
+    // 第四条观测：板面法向的偏航角。板面朝外，法向是板心径向的反向，云台系里
+    // 它的方位角是 pi - (Yaw + i * spacing + gimbal_yaw)，对 Yaw 的偏导恒为 -1。
+    // 只更新 Yaw 一个分量，按标量卡尔曼做，Joseph 形式保住正定性。
+    // 不进 NIS 窗口：那是三维卡方的统计量，掺一条一维观测均值就不再是 3。
+    if (std::isfinite(observation.armor_yaw)) {
+        const double psi = x_[Yaw] + static_cast<double>(best_index) *
+                                           config_.plate_spacing_rad;
+        const double predicted_yaw = wrapToPi(kPi - (psi + gimbal_yaw));
+        const double yaw_residual = wrapToPi(observation.armor_yaw - predicted_yaw);
+        const double yaw_noise_variance =
+            config_.armor_yaw_noise_rad * config_.armor_yaw_noise_rad;
+        const double yaw_variance = P_(Yaw, Yaw) + yaw_noise_variance;
+        if (std::fabs(yaw_residual) <= config_.armor_yaw_gate_rad &&
+            yaw_variance > 0.0) {
+            const Eigen::Matrix<double, 10, 1> yaw_gain = -P_.col(Yaw) / yaw_variance;
+            Eigen::Matrix<double, 1, 10> yaw_row = Eigen::Matrix<double, 1, 10>::Zero();
+            yaw_row[Yaw] = -1.0;
+            const Covariance yaw_identity_minus_kh =
+                Covariance::Identity() - yaw_gain * yaw_row;
+            P_ = yaw_identity_minus_kh * P_ * yaw_identity_minus_kh.transpose() +
+                 yaw_gain * yaw_noise_variance * yaw_gain.transpose();
+            x_ += yaw_gain * yaw_residual;
+            x_[Yaw] = wrapToPi(x_[Yaw]);
+        }
+    }
+
+    // 半径是估计量，但必须落在车体几何可能的范围里。夹的同时把车心对齐，
+    // 保证这块板的模型位置仍然等于刚吃下的观测。
+    clampRadii(best_index);
+
     used_indices_[static_cast<std::size_t>(best_index)] = true;
     // 记住这一槽位读到的编号，供选板后回填 armor_flag。target_id_ 另存
     // 最近一次观测的编号，仅用于槽位编号未知时兜底。
@@ -524,6 +582,20 @@ void ArmorEkf::advanceStateMachine(double timestamp_seconds) {
         timestamp_seconds - last_obs_ts_ > config_.reset_timeout_s) {
         reset();
         return;
+    }
+
+    // 连续拒收时放大协方差。拒收既不改进状态也不改进协方差，收敛后的 P 很小，
+    // 一条偏离较远的正确观测算出的马氏距离会永久超过 nis_gate，更新永远进不来，
+    // 只剩整段重置一条路。v4 回放里连续 115 帧 no-target 就是它。
+    //
+    // 每连续 reject_recovery_frames 帧一条都没吃下就放大一次对角线。放大只增
+    // 对角元，保正定；上限取初始协方差，超过它还不如重新初始化。丢帧也算在内：
+    // 遮挡期间目标可能在动，观测回来时同样需要把闸门重新撑开。
+    if (miss_count_ > 0 && miss_count_ % config_.reject_recovery_frames == 0) {
+        const Covariance ceiling = initialCovariance();
+        for (int i = 0; i < Dimension; ++i) {
+            P_(i, i) = std::min(ceiling(i, i), P_(i, i) * config_.reject_inflation_factor);
+        }
     }
 
     // 短时丢失的滞回：丢几帧以内仍按 Stable 处理，纯预测足够准。

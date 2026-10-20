@@ -121,6 +121,20 @@ double worstPlateMatch(const ArmorEkf::StateVector& x, const Truth& truth,
     return worst;
 }
 
+// 真值板面法向在云台系里的偏航角，右为正，与 armor_solve 的 armor_yaw 同口径。
+//
+// 物体系 +z 指板背（背离相机），板面朝外，所以它就是板心径向 u(psi) 的反向。
+// 云台系里 u(psi) 的方位角是 -(psi + gimbal_yaw)，反向再加 pi，
+// atan2(-y, x) 读出来正好是 pi - (psi + gimbal_yaw)。
+// 这条式子与 tests/test_armor_solve.cpp 第 5 节同源：那里相机转 phi 时
+// armor_yaw 必须等于 phi，把置换方向与 atan2 的两个符号都钉住了。
+double trueArmorYaw(const Truth& truth, int index, const ArmorEkf::Config& config,
+                    double gimbal_yaw) {
+    const double psi =
+        truth.yaw + static_cast<double>(index) * config.plate_spacing_rad;
+    return ArmorEkf::wrapToPi(kPi - (psi + gimbal_yaw));
+}
+
 // 一帧的观测生成。只喂此刻真实可见的板，判据与 testrig/ekf_trace 的
 // visiblePlates 同源：板装在外侧、板面朝外，法向就是板心相对旋转中心的
 // 径向，能被检出的板必须满足"法向与指向相机的方向夹角在锥角以内"，
@@ -137,11 +151,11 @@ double worstPlateMatch(const ArmorEkf::StateVector& x, const Truth& truth,
 // noise_sigma_m 大于零时给板心叠一层扰动，用来检验 NIS 这类残差统计量是不是活的。
 // 扰动用确定性的三角叠加而不是随机数：同一个 frame 永远得到同一个值，
 // 跑多少遍结果都一样，断言不会偶发。三个轴取不成比例的角频率,看上去就是噪声。
-ArmorPose makeObservation(const Eigen::Vector3d& z, int target_id) {
+ArmorPose makeObservation(const Eigen::Vector3d& z, int target_id, double armor_yaw) {
     ArmorPose observation;
     observation.position_gimbal_m = cv::Vec3d(z.x(), z.y(), z.z());
     observation.position_camera_m = observation.position_gimbal_m;
-    observation.armor_yaw = 0.0;
+    observation.armor_yaw = armor_yaw;
     observation.reprojection_error = 0.3;
     observation.detection.target_id = target_id;
     return observation;
@@ -161,7 +175,8 @@ void feedFrame(ArmorEkf& filter, const ArmorEkf::Config& config, const Truth& tr
             z.y() += noise_sigma_m * std::sin(2.3 * n + 1.1);
             z.z() += noise_sigma_m * std::sin(3.1 * n + 2.7);
         }
-        filter.update(makeObservation(z, index + 1), gimbal_yaw);
+        filter.update(makeObservation(z, index + 1, trueArmorYaw(truth, index, config, gimbal_yaw)),
+                      gimbal_yaw);
     }
 }
 
@@ -258,7 +273,7 @@ void testNisSentinelBeforeFirstUpdate() {
     for (int frame = 0; frame < config.init_frames; ++frame) {
         timestamp += dt;
         filter.predict(dt);
-        filter.update(makeObservation(plate, 1), 0.0);
+        filter.update(makeObservation(plate, 1, trueArmorYaw(truth, 0, config, 0.0)), 0.0);
         filter.advanceStateMachine(timestamp);
     }
     assert(filter.status() == TrackingState::Unstable);
@@ -576,6 +591,215 @@ void testSinglePlateInitializationIsOnTheFarSide() {
     assert(worst_yaw < 1e-6);
     std::printf("[ekf] 单板初始化落在远侧 通过\n");
 }
+
+// armor_yaw 是板面法向在云台系里的偏航角，板面朝外，所以它就是车体偏航的
+// 直接读数：h = pi - (Yaw + i * spacing + gimbal_yaw)，对 Yaw 的偏导恒为 -1。
+//
+// 为什么必须要它：一帧一块板只给两个位置约束，车心 (2 个) 加偏航加半径共
+// 四个未知量。偏航与车心沿切向的分量在单板下完全混在一起，位置残差按方差
+// 分配，谁方差大谁吃，于是滤出的偏航和半径都是编的。v4 回放里半径塌到几
+// 厘米、yaw 跑飞就是这条。接上第四维观测后偏航单独被钉住，位置观测只剩
+// 车心与半径的径向分量要分。
+//
+// 用例：板心固定不动，位置观测对任何偏航都成立，所以只靠位置的旧版会一直
+// 停在初始值。先喂一串错的 armor_yaw，确认闸门挡得住；再喂正确的那条，
+// 偏航必须转过去。
+void testArmorYawObservationPinsBodyYaw() {
+    const ArmorEkf::Config config = testConfig();
+    ArmorEkf filter(config);
+
+    Truth truth;
+    truth.center = Eigen::Vector3d(4.0, 0.0, 0.5);
+    truth.yaw = kPi;
+    truth.yaw_rate = 0.0;
+    truth.radius1 = config.initial_radius_m;
+    truth.radius2 = config.initial_radius_m;
+
+    const Eigen::Vector3d plate = truePlateWorld(truth, 0, config);
+    const double dt = 1.0 / 165.0;
+    double timestamp = 0.0;
+    const auto step = [&](double armor_yaw) {
+        timestamp += dt;
+        filter.predict(dt);
+        filter.update(makeObservation(plate, 1, armor_yaw), 0.0);
+        filter.advanceStateMachine(timestamp);
+    };
+
+    for (int frame = 0; frame < config.init_frames; ++frame) {
+        step(trueArmorYaw(truth, 0, config, 0.0));
+    }
+    assert(filter.status() != TrackingState::NoTarget);
+    assert(std::fabs(ArmorEkf::wrapToPi(filter.state()[ArmorEkf::Yaw] - kPi)) < 1e-6);
+
+    // 错 1.5 rad，远在 armor_yaw_gate_rad 之外，一条都不许吃。
+    for (int frame = 0; frame < 50; ++frame) {
+        step(-1.5);
+    }
+    assert(std::fabs(ArmorEkf::wrapToPi(filter.state()[ArmorEkf::Yaw] - kPi)) < 0.02);
+
+    // 板面法向对应 Yaw = pi + 0.2，板心位置不变，位置观测分不出这两种偏航。
+    const double target_yaw = kPi + 0.2;
+    const double measurement = ArmorEkf::wrapToPi(kPi - target_yaw);
+    for (int frame = 0; frame < 150; ++frame) {
+        step(measurement);
+    }
+    const double settled = filter.state()[ArmorEkf::Yaw];
+    const double error = std::fabs(ArmorEkf::wrapToPi(settled - target_yaw));
+    std::printf("[ekf] armor_yaw 钉偏航 误差 %.4f rad\n", error);
+    assert(error < 0.03);
+    std::printf("[ekf] armor_yaw 钉住车体偏航 通过\n");
+}
+
+// 半径是估计量，不是连续量里的普通状态：它必须落在车体几何可能的范围里。
+// 旧版没有任何边界，初始化给 0.9 m 就一路 0.9 m，更新能把 r2 拉到 -0.14，
+// 回放里 r=0.05 / -0.03 那次就是它。夹回来的时候中心要按夹过的半径反推，
+// 否则滤波器一建立就与刚吃下的那条观测矛盾，下一帧起全被 NIS 拒掉。
+void testRadiusStaysWithinPhysicalBounds() {
+    const double dt = 1.0 / 165.0;
+    for (const double initial : {0.9, 0.01}) {
+        ArmorEkf::Config config = testConfig();
+        config.initial_radius_m = initial;
+        ArmorEkf filter(config);
+
+        Truth truth;
+        truth.center = Eigen::Vector3d(4.0, 0.0, 0.5);
+        truth.yaw = kPi;
+        truth.yaw_rate = 0.0;
+        truth.radius1 = 0.25;
+        truth.radius2 = 0.25;
+
+        const Eigen::Vector3d plate = truePlateWorld(truth, 0, config);
+        double timestamp = 0.0;
+        for (int frame = 0; frame < config.init_frames; ++frame) {
+            timestamp += dt;
+            filter.predict(dt);
+            filter.update(makeObservation(plate, 1, trueArmorYaw(truth, 0, config, 0.0)), 0.0);
+            filter.advanceStateMachine(timestamp);
+        }
+        const ArmorEkf::StateVector x = filter.state();
+        assert(x[ArmorEkf::Radius1] >= config.min_radius_m - 1e-12);
+        assert(x[ArmorEkf::Radius1] <= config.max_radius_m + 1e-12);
+        assert(x[ArmorEkf::Radius2] >= config.min_radius_m - 1e-12);
+        assert(x[ArmorEkf::Radius2] <= config.max_radius_m + 1e-12);
+        // 夹过之后模型仍要复现刚吃下的那条观测。
+        const Eigen::Vector3d model = modelPlateWorld(x, 0, config);
+        assert((model - plate).norm() < 1e-9);
+    }
+
+    // 跑起来之后也不许越界。
+    const ArmorEkf::Config config = testConfig();
+    ArmorEkf filter(config);
+    Truth truth;
+    truth.center = Eigen::Vector3d(4.0, 0.3, 0.6);
+    truth.yaw = 0.4;
+    truth.yaw_rate = 2.0;
+    double timestamp = 0.0;
+    double lowest = std::numeric_limits<double>::infinity();
+    double highest = -std::numeric_limits<double>::infinity();
+    for (int frame = 0; frame < 800; ++frame) {
+        timestamp += dt;
+        filter.predict(dt);
+        feedFrame(filter, config, truth, 0.0);
+        filter.advanceStateMachine(timestamp);
+        trueStep(truth, dt);
+        const ArmorEkf::StateVector x = filter.state();
+        if (filter.status() == TrackingState::NoTarget) {
+            continue;
+        }
+        lowest = std::min({lowest, x[ArmorEkf::Radius1], x[ArmorEkf::Radius2]});
+        highest = std::max({highest, x[ArmorEkf::Radius1], x[ArmorEkf::Radius2]});
+        assert(x[ArmorEkf::Radius1] >= config.min_radius_m - 1e-12);
+        assert(x[ArmorEkf::Radius1] <= config.max_radius_m + 1e-12);
+        assert(x[ArmorEkf::Radius2] >= config.min_radius_m - 1e-12);
+        assert(x[ArmorEkf::Radius2] <= config.max_radius_m + 1e-12);
+    }
+    std::printf("[ekf] 半径边界 全程 [%.3f, %.3f]\n", lowest, highest);
+    std::printf("[ekf] 半径不越界 通过\n");
+}
+
+// 连续拒收必须能自己爬出来，不能只等 reset_timeout_s 的整段重置。
+//
+// 拒收不改状态也不改协方差，收敛之后的 P 又被压得极小，一条偏差半米的
+// 正确观测算出的马氏距离远超 nis_gate，于是永远进不去：v4 回放里连续 115
+// 帧 no-target、f=840-980 每帧全拒都是这个自锁。修法是在连拒达到
+// reject_recovery_frames 帧后按 reject_inflation_factor 放大 P 的对角线，
+// 把闸门重新撑开。
+void testRejectedObservationsInflateCovarianceAndRecover() {
+    // 两板模型：四板时把板心横向挪开半米，最近的那一槽就换人了，关联会跳到
+    // 相邻槽位上，测到的是换板而不是自锁。两板间距 pi，挪 0.3 m 之后 0 号槽
+    // 仍是最近的一槽。
+    ArmorEkf::Config config = testConfig();
+    config.plate_count = 2;
+    config.plate_spacing_rad = kPi;
+    ArmorEkf filter(config);
+
+    Truth truth;
+    truth.center = Eigen::Vector3d(4.0, 0.0, 0.5);
+    truth.yaw = kPi;
+    truth.yaw_rate = 0.0;
+    truth.radius1 = config.initial_radius_m;
+    truth.radius2 = config.initial_radius_m;
+
+    const Eigen::Vector3d plate = truePlateWorld(truth, 0, config);
+    const double armor_yaw = trueArmorYaw(truth, 0, config, 0.0);
+    const double dt = 1.0 / 165.0;
+    double timestamp = 0.0;
+    const auto feed = [&](const Eigen::Vector3d& p) {
+        timestamp += dt;
+        filter.predict(dt);
+        filter.update(makeObservation(p, 1, armor_yaw), 0.0);
+        filter.advanceStateMachine(timestamp);
+    };
+
+    // 收敛。静态单板跑 200 帧后 P 的横向分量已经很小。
+    for (int frame = 0; frame < 200; ++frame) {
+        feed(plate);
+    }
+    assert(filter.hitStreak() > 0);
+
+    // 每帧横向挪 3 mm，把状态带到偏 0.3 m 的地方。每步都在闸内，滤波器会
+    // 老实跟过去。偏移量取 0.3 而不是 0.18：收敛后的横向方差很小，0.18 的
+    // 马氏距离仍可能落在 nis_gate 里，那样测的就不是自锁。上限是 jump_gate_m
+    // 的 0.6，超过它走的是另一条分支。
+    const double offset_m = 0.3;
+    Eigen::Vector3d shifted = plate;
+    const int ramp_frames = static_cast<int>(offset_m / 0.003);
+    for (int frame = 0; frame < ramp_frames; ++frame) {
+        shifted.y() += 0.003;
+        feed(shifted);
+    }
+    // 再原地停住，让横向方差收回去。斜坡本身是持续机动，方差会一直撑着，
+    // 不等它收下来就切回真值，这条观测会被正常吃下，测不到任何东西。
+    for (int frame = 0; frame < 200; ++frame) {
+        feed(shifted);
+    }
+    assert(std::fabs(filter.state()[ArmorEkf::Py] - offset_m) < 0.06);
+    const double locked_std =
+        std::sqrt(std::max(0.0, filter.covariance()(ArmorEkf::Py, ArmorEkf::Py)));
+
+    // 真值回到原位。偏差 0.45 m 对已经收小的 P 是远超 nis_gate 的马氏距离，
+    // 头几帧必须被拒；连拒之后 P 被放大，同一批观测必须重新被吃下。
+    const int rejected_before = filter.rejectedCount();
+    int recovered_at = -1;
+    for (int frame = 0; frame < 60; ++frame) {
+        feed(plate);
+        if (recovered_at < 0 && filter.hitStreak() > 0) {
+            recovered_at = frame;
+        }
+        if (frame == 10) {
+            assert(filter.rejectedCount() > rejected_before);
+        }
+        assert(filter.status() != TrackingState::NoTarget);
+    }
+    std::printf("[ekf] 连续拒收恢复 锁定横向 %.3f m 标准差 %.2e 第 %d 帧重新吃下 "
+                "横向 %.4f m\n",
+                offset_m, locked_std, recovered_at, filter.state()[ArmorEkf::Py]);
+    assert(recovered_at >= 0);
+    assert(recovered_at < 60);
+    assert(std::fabs(filter.state()[ArmorEkf::Py]) < 0.03);
+    std::printf("[ekf] 连续拒收后自行恢复 通过\n");
+}
+
 void testGimbalRotationIsNotTargetMotion() {
     const ArmorEkf::Config config = testConfig();
     ArmorEkf filter(config);
@@ -1022,6 +1246,9 @@ int main() {
     testNoiselessConvergence();
     testTwoPlateVehicleObservesRadiusTwo();
     testSinglePlateInitializationIsOnTheFarSide();
+    testArmorYawObservationPinsBodyYaw();
+    testRadiusStaysWithinPhysicalBounds();
+    testRejectedObservationsInflateCovarianceAndRecover();
     testGimbalRotationIsNotTargetMotion();
     testStateMachineTiming();
     testInitializationTakesOneObservationPerFrame();

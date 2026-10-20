@@ -99,6 +99,18 @@ public:
         double nis_gate{11.34};                 // 卡方分布 (3 自由度, 99%) 的分位点
         double max_reprojection_error_px{5.0};  // 单次观测重投影误差上限
 
+        // armor_yaw 是第四条观测：板面法向在云台系里的偏航角，直接读出车体偏航。
+        //
+        // 一帧一块板只给两个位置约束，偏航与车心沿切向的分量在单板下混在一起，
+        // 位置残差按方差分配，偏航与半径都失去可辨识性。接上这条观测后偏航
+        // 单独被钉住，位置观测只剩车心与半径的径向分量要分。
+        // 噪声按 PnP 法向的实测抖动取 0.05 rad。闸门取 0.5 rad：初始化已经按
+        // 同一条公式定了偏航，正常新息是 asin(r/d) 量级，0.5 rad 挡得住换板与
+        // 错关联，又不至于卡住收敛。这条观测不进 NIS 窗口，nis_mean_gate 的口径
+        // 仍是三维卡方。
+        double armor_yaw_noise_rad{0.05};
+        double armor_yaw_gate_rad{0.5};
+
         // 状态机。
         int init_frames{3};                 // 建滤波器前的连续一致帧数
         double init_consistency_m{0.3};     // 初始化窗口内板心的最大允许离散
@@ -112,8 +124,25 @@ public:
         double stable_radius_std_m{0.05};   // 进入 Stable 的半径标准差上限
         double stable_yaw_std_rad{0.10};    // 进入 Stable 的 yaw 标准差上限
 
+        // 连续拒收后的协方差放大。拒收既不改进状态也不改进协方差，收敛后的 P
+        // 很小，一条偏离真值的坏观测能把门永久锁死，只能等 reset_timeout_s 做
+        // 整段重置。连续 reject_recovery_frames 帧一条都没吃下时，把 P 的对角线
+        // 乘上 reject_inflation_factor，上限是 initialCovariance() 的对角线。
+        //
+        // 3 帧与 stable_hold_misses 对齐：不再信任 Stable 的那一刻起就让自己
+        // 愿意重新接受观测。每 3 帧翻一倍，位置标准差从毫米级抬到厘米级只要
+        // 十几帧，远快于 1.5 秒的重置；上限保证不会比初始化时更不确定。
+        int reject_recovery_frames{3};
+        double reject_inflation_factor{2.0};
+
         // 初始化时假定的装甲板半径 (m)。标准步兵两块板到中心同量级。
         double initial_radius_m{0.25};
+
+        // 装甲板半径的物理范围 (m)。测量的是旋转中心到板面，标准步兵与哨兵都在
+        // 0.15~0.30，这里留足余量。估计越界时夹回边界，并且让车心按夹过的半径
+        // 重新对齐刚吃下的观测，否则滤波器一建立就与那条观测矛盾。
+        double min_radius_m{0.10};
+        double max_radius_m{0.50};
 
         // 枪口相对云台 P 轴原点的前移量 (m)。相机、云台 P 轴、摩擦轮三者刚体固定，
         // 所以在云台系里这是个常向量 (muzzle_offset_m, 0, 0)，沿炮管前方，不随 yaw
@@ -218,6 +247,9 @@ private:
     // commit=false 只查询不写 aim_index_，供弹道迭代这类"试算"使用。
     int selectArmorIndex(const StateVector& x, double gimbal_yaw, bool commit);
     Eigen::Vector3d platePositionWorld(const StateVector& x, int armor_index) const;
+    // 把两个半径夹进 [min_radius_m, max_radius_m]，并平移车心，保持
+    // observed_index 这块板的位置不动，刚吃下的观测仍然成立。
+    void clampRadii(int observed_index);
 
     void propagate(StateVector& x, double dt) const;
     void fillTransition(double dt, Eigen::Matrix<double, 10, 10>& F) const;
