@@ -25,8 +25,11 @@ struct Truth {
     Eigen::Vector3d velocity{0.0, 0.0, 0.0};
     double yaw{0.0};
     double yaw_rate{0.0};
-    double radius1{0.28};
-    double radius2{0.22};
+    // 2026-10-20 车上实测半径 9.75 cm 左右，四块板近似等大。夹具留一点不等，
+    // 是为了让两个半径各自的观测性在这些用例里也能被测到；两个数都必须落在
+    // Config 的物理范围内，否则 clamp 会先把真值吃掉。
+    double radius1{0.105};
+    double radius2{0.090};
 };
 
 // 板高一律取 0，走共面这一支，与 config 的出厂默认一致。
@@ -488,6 +491,16 @@ void testTwoPlateVehicleObservesRadiusTwo() {
     ArmorEkf::Config config = testConfig();
     config.plate_count = 2;
     config.plate_spacing_rad = kPi;
+    // 本用例验两个半径各自的观测性。半径差是弱可观测方向，信噪比靠差值本身
+    // 撑起来：产线真车 9.75 cm 的半径差只有几毫米，比 5 cm 量级的深度噪声
+    // 还小，24000 帧内学不出来。这里用一辆 0.30/0.19 的大车，先验和过程
+    // 噪声也放回旧值，保持原有帧数与 1e-4 的收敛预算。
+    config.initial_radius_m = 0.25;
+    config.initial_radius_std_m = 0.15;
+    config.min_radius_m = 0.05;
+    config.max_radius_m = 0.50;
+    config.radius_drift_m = 0.2;
+    config.radius_variance_floor_m2 = 1.0e-6;
     ArmorEkf filter(config);
 
     Truth truth;
@@ -554,7 +567,11 @@ void testTwoPlateVehicleObservesRadiusTwo() {
 // 同时盯住"别在欠定状态上报 Stable"：只看见一块板时旋转中心沿视线可推近，
 // 半径也没有第二块板作参照，这时报 Stable 会直接放行开火。
 void testSinglePlateInitializationIsOnTheFarSide() {
-    const ArmorEkf::Config config = testConfig();
+    ArmorEkf::Config config = testConfig();
+    // 本用例盯的是"半径只有先验支撑时不许报 Stable"。生产配置把半径按实测值
+    // 钉到 1 cm，P 的半径门会直接放开，单板也会进 Stable；那不是这条用例要
+    // 证明的欠定场景，所以这里保留旧版的松先验。
+    config.initial_radius_std_m = 0.15;
     ArmorEkf filter(config);
 
     Truth truth;
@@ -857,8 +874,10 @@ void testSameFrameDuplicatePlateIsRejectedByYaw() {
     }
     std::printf("[ekf] 同帧重复框 第二框拒收 状态最大变化 %.2e\n", worst);
     assert(worst < 1e-9);
-    assert(after_second[ArmorEkf::Radius1] > 0.2);
-    assert(after_second[ArmorEkf::Radius2] > 0.2);
+    assert(after_second[ArmorEkf::Radius1] >= config.min_radius_m - 1e-12);
+    assert(after_second[ArmorEkf::Radius2] >= config.min_radius_m - 1e-12);
+    assert(after_second[ArmorEkf::Radius1] <= config.max_radius_m + 1e-12);
+    assert(after_second[ArmorEkf::Radius2] <= config.max_radius_m + 1e-12);
     std::printf("[ekf] 同帧重复框按 armor_yaw 判重 通过\n");
 }
 
@@ -931,6 +950,9 @@ void testGimbalRotationIsNotTargetMotion() {
     truth.velocity = Eigen::Vector3d::Zero();
     truth.yaw = 0.7;
     truth.yaw_rate = 0.0;
+    // 实车四块板近似等大。这条用例只盯云台转动，真值半径与先验取同一个数。
+    truth.radius1 = config.initial_radius_m;
+    truth.radius2 = config.initial_radius_m;
 
     const double dt = 1.0 / 165.0;
     for (int frame = 0; frame < 500; ++frame) {
@@ -1074,8 +1096,11 @@ void testNegativePredictionBiasIsHonored() {
     const PredictionResult earlier = convergeAndPredict(-0.03);
     const double d_later = later.target_yaw - none.target_yaw;
     const double d_earlier = earlier.target_yaw - none.target_yaw;
-    assert(std::fabs(d_later) > 1e-3);
-    assert(std::fabs(d_earlier) > 1e-3);
+    // 同样 30 ms 的 bias 推出的角度正比于瞄准点的切向速度。半径从 0.25 收到
+    // 实测 9.75 cm 后，板随车转的那一份速度小了，实测 9.3e-4 rad，仍比数值
+    // 噪声大六个量级。阈值按新几何放到 5e-4。
+    assert(std::fabs(d_later) > 5e-4);
+    assert(std::fabs(d_earlier) > 5e-4);
     // 正 bias 把事情往前推，负 bias 往后推，两个方向必须相反。
     // 负值若被单边截成 0，d_earlier 会退化成 0，这条立刻红。
     assert(d_later * d_earlier < 0.0);

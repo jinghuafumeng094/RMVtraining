@@ -300,7 +300,7 @@ Eigen::Matrix3d ArmorEkf::observationNoise(const Eigen::Vector3d& z) const {
     return R;
 }
 
-ArmorEkf::Covariance ArmorEkf::initialCovariance() {
+ArmorEkf::Covariance ArmorEkf::initialCovariance() const {
     Covariance P = Covariance::Zero();
     P(Px, Px) = 1.0;
     P(Py, Py) = 1.0;
@@ -310,8 +310,11 @@ ArmorEkf::Covariance ArmorEkf::initialCovariance() {
     P(Vz, Vz) = 9.0;
     P(Yaw, Yaw) = 0.25;
     P(YawRate, YawRate) = 9.0;
-    P(Radius1, Radius1) = 0.0225;
-    P(Radius2, Radius2) = 0.0225;
+    // 半径按车上实测值初始化。旧值 0.0225 对应 15 cm，在单板帧里正好给了
+    // 半径吸收径向残差的空间。
+    const double radius_variance = config_.initial_radius_std_m * config_.initial_radius_std_m;
+    P(Radius1, Radius1) = radius_variance;
+    P(Radius2, Radius2) = radius_variance;
     return P;
 }
 

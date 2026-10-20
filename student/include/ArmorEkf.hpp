@@ -85,8 +85,10 @@ public:
         // 过程噪声，按随机加速度模型离散化。
         double accel_noise_m_s2{6.0};               // 旋转中心三轴加速度标准差
         double angular_accel_noise_rad_s2{12.0};    // 车体 yaw 角加速度标准差
-        double radius_drift_m{0.2};                 // 半径随机游走强度
-        double radius_variance_floor_m2{1.0e-6};    // 半径过程噪声下限，(1 mm)^2
+        // 半径已在车上量过，只剩几毫米的装配与量法误差，随机游走给到
+        // 0.12 mm/帧即可；166 fps 下真正生效的是下面的下限。
+        double radius_drift_m{0.02};                // 半径随机游走强度 (m/s)
+        double radius_variance_floor_m2{9.0e-8};    // 半径过程噪声下限，(0.3 mm)^2
 
         // 观测噪声 sigma = scale * 距离 + base，横向与深度分开。
         double lateral_noise_scale{0.002};
@@ -144,14 +146,18 @@ public:
         // 3 帧与 init_frames 对齐：正是初始化本身要求的帧数。
         int reinit_after_misses{3};
 
-        // 初始化时假定的装甲板半径 (m)。标准步兵两块板到中心同量级。
-        double initial_radius_m{0.25};
+        // 初始化时假定的装甲板半径 (m)。2026-10-20 在车上量得旋转中心到
+        // 板面 9.75 cm 左右，四块板基本等距，r1 与 r2 同取这个值。
+        double initial_radius_m{0.0975};
+        // 初始半径的标准差 (m)。按车上实测值初始化，只留量法与装配的几毫米。
+        double initial_radius_std_m{0.01};
 
-        // 装甲板半径的物理范围 (m)。测量的是旋转中心到板面，标准步兵与哨兵都在
-        // 0.15~0.30，这里留足余量。估计越界时夹回边界，并且让车心按夹过的半径
-        // 重新对齐刚吃下的观测，否则滤波器一建立就与那条观测矛盾。
-        double min_radius_m{0.10};
-        double max_radius_m{0.50};
+        // 装甲板半径的物理范围 (m)。以实测 9.75 cm 为中心，两侧各留约 3 cm，
+        // 覆盖量板面与量板心的差别和少量装配偏差。估计越界时夹回边界，并且让
+        // 车心按夹过的半径重新对齐刚吃下的观测，否则滤波器一建立就与那条
+        // 观测矛盾。注意下界必须低于实测值，否则真值根本不在状态空间里。
+        double min_radius_m{0.07};
+        double max_radius_m{0.13};
 
         // 枪口相对云台 P 轴原点的前移量 (m)。相机、云台 P 轴、摩擦轮三者刚体固定，
         // 所以在云台系里这是个常向量 (muzzle_offset_m, 0, 0)，沿炮管前方，不随 yaw
@@ -273,7 +279,7 @@ private:
     void recordNis(double nis);
     double smoothedLatency(double raw_latency_s);
 
-    static Covariance initialCovariance();
+    Covariance initialCovariance() const;
 
     Config config_;
     StateVector x_{StateVector::Zero()};
