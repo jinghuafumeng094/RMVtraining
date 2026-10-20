@@ -25,11 +25,11 @@ struct Truth {
     Eigen::Vector3d velocity{0.0, 0.0, 0.0};
     double yaw{0.0};
     double yaw_rate{0.0};
-    // 2026-10-20 车上实测半径 9.75 cm 左右，四块板近似等大。夹具留一点不等，
-    // 是为了让两个半径各自的观测性在这些用例里也能被测到；两个数都必须落在
-    // Config 的物理范围内，否则 clamp 会先把真值吃掉。
-    double radius1{0.105};
-    double radius2{0.090};
+    // 2026-10-20 靶车实测旋转中心到板心 27.3 cm，四块板近似等大。夹具留一点
+    // 不等，是为了让两个半径各自的观测性在这些用例里也能被测到；两个数都必须
+    // 落在 Config 的物理范围内，否则 clamp 会先把真值吃掉。
+    double radius1{0.30};
+    double radius2{0.285};
 };
 
 // 板高一律取 0，走共面这一支，与 config 的出厂默认一致。
@@ -492,7 +492,7 @@ void testTwoPlateVehicleObservesRadiusTwo() {
     config.plate_count = 2;
     config.plate_spacing_rad = kPi;
     // 本用例验两个半径各自的观测性。半径差是弱可观测方向，信噪比靠差值本身
-    // 撑起来：产线真车 9.75 cm 的半径差只有几毫米，比 5 cm 量级的深度噪声
+    // 撑起来：产线真车 27.3 cm 的半径差只有几毫米，比 5 cm 量级的深度噪声
     // 还小，24000 帧内学不出来。这里用一辆 0.30/0.19 的大车，先验和过程
     // 噪声也放回旧值，保持原有帧数与 1e-4 的收敛预算。
     config.initial_radius_m = 0.25;
@@ -569,7 +569,7 @@ void testTwoPlateVehicleObservesRadiusTwo() {
 void testSinglePlateInitializationIsOnTheFarSide() {
     ArmorEkf::Config config = testConfig();
     // 本用例盯的是"半径只有先验支撑时不许报 Stable"。生产配置把半径按实测值
-    // 钉到 1 cm，P 的半径门会直接放开，单板也会进 Stable；那不是这条用例要
+    // 钉到 2 cm，P 的半径门会直接放开，单板也会进 Stable；那不是这条用例要
     // 证明的欠定场景，所以这里保留旧版的松先验。
     config.initial_radius_std_m = 0.15;
     ArmorEkf filter(config);
@@ -955,7 +955,10 @@ void testGimbalRotationIsNotTargetMotion() {
     truth.radius2 = config.initial_radius_m;
 
     const double dt = 1.0 / 165.0;
-    for (int frame = 0; frame < 500; ++frame) {
+    // 半径与偏航是弱可观测方向，收敛速度随半径变大而变慢。半径 9.75 cm 时
+    // 500 帧的 yaw_rate 残差已经远低于 1e-6；半径按实测改成 27.3 cm 后，
+    // 500 帧只到 4.2e-6，1500 帧降到 6.6e-9，留出三个数量级余量。
+    for (int frame = 0; frame < 1500; ++frame) {
         const double t = static_cast<double>(frame) * dt;
         const double gimbal_yaw = 0.35 * std::sin(2.0 * kPi * 0.7 * t);
         filter.predict(dt);
@@ -1096,9 +1099,9 @@ void testNegativePredictionBiasIsHonored() {
     const PredictionResult earlier = convergeAndPredict(-0.03);
     const double d_later = later.target_yaw - none.target_yaw;
     const double d_earlier = earlier.target_yaw - none.target_yaw;
-    // 同样 30 ms 的 bias 推出的角度正比于瞄准点的切向速度。半径从 0.25 收到
-    // 实测 9.75 cm 后，板随车转的那一份速度小了，实测 9.3e-4 rad，仍比数值
-    // 噪声大六个量级。阈值按新几何放到 5e-4。
+    // 同样 30 ms 的 bias 推出的角度正比于瞄准点的切向速度。半径按实测
+    // 27.3 cm 取值后，板随车转的那一份速度约为旧几何 9.75 cm 时的三倍，
+    // 角度差仍远大于数值噪声。阈值保持 5e-4。
     assert(std::fabs(d_later) > 5e-4);
     assert(std::fabs(d_earlier) > 5e-4);
     // 正 bias 把事情往前推，负 bias 往后推，两个方向必须相反。

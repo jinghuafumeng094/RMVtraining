@@ -306,7 +306,7 @@ Q(Radius1, Radius1) = radius_variance;
 Q(Radius2, Radius2) = radius_variance;
 ```
 
-给半径一点自由度是为了防止滤波器把它「冻死」在初值上；`radius_variance_floor_m2 = 1e-6`（即 1 mm 的平方）是下限，`dt` 很小时靠它兜底。
+给半径一点自由度是为了防止滤波器把它「冻死」在初值上；`radius_variance_floor_m2 = 9e-8`（即 0.3 mm 的平方）是下限，`dt` 很小时靠它兜底。
 
 ### 这些数从哪来
 
@@ -314,7 +314,7 @@ Q(Radius2, Radius2) = radius_variance;
 |---|---|---|
 | `accel_noise_m_s2` | 6.0 | RM 步兵 0 到 20 m/s 约 1 到 2 秒，瞬时机动约 10 m/s²，取一半（`ArmorEkf.cpp:27-29`） |
 | `angular_accel_noise_rad_s2` | 12.0 | 车能快速起旋停旋，同量级取整 |
-| `radius_drift_m` | 0.2 | 半径近乎恒定，只给随机游走强度 0.2 m/√s |
+| `radius_drift_m` | 0.02 | 半径近乎恒定，只给随机游走强度 0.02 m/√s |
 
 调参顺序按博客 §3.7：**先验单位与模型 -> 固定 `R` 调 `Q` -> 最后才谈动态噪声**。`Q` 大则跟得快但抖，小则平滑但滞后。
 
@@ -326,7 +326,7 @@ Q(Radius2, Radius2) = radius_variance;
 P(Px, Px) = 1.0;      P(Py, Py) = 1.0;      P(Pz, Pz) = 1.0;      // 位置 (m^2)
 P(Vx, Vx) = 25.0;     P(Vy, Vy) = 25.0;     P(Vz, Vz) = 9.0;      // 速度 (m/s)^2
 P(Yaw, Yaw) = 0.25;   P(YawRate, YawRate) = 9.0;                  // rad^2 / (rad/s)^2
-P(Radius1, Radius1) = 0.0225;  P(Radius2, Radius2) = 0.0225;      // m^2
+P(Radius1, Radius1) = 0.0004;  P(Radius2, Radius2) = 0.0004;      // m^2
 ```
 
 `P0` 给大一点，等于说「初始化时先信观测」，随后靠 `P_ = F P F^T + Q` 和更新自然收缩。位置给 1 m² 是「中心可能离这块板一米左右」的量级；速度给 5 m/s 的标准差是「不知道车怎么动」。
@@ -648,7 +648,7 @@ if (init_count_ < config_.init_frames) {    // 3 帧
 ```cpp
 x_.setZero();
 x_[Yaw] = wrapToPi(std::atan2(-init_mean_.y(), -init_mean_.x()));
-x_[Radius1] = config_.initial_radius_m;    // 0.25
+x_[Radius1] = config_.initial_radius_m;    // 0.273
 x_[Radius2] = config_.initial_radius_m;
 x_[Px] = init_mean_.x() - config_.initial_radius_m * std::cos(x_[Yaw]);
 x_[Py] = init_mean_.y() - config_.initial_radius_m * std::sin(x_[Yaw]);
@@ -980,8 +980,8 @@ if (!predictionIsFinite(result)) {
 | `plate_spacing_rad` | 90° | 相邻板夹角，前哨站 120° |
 | `accel_noise_m_s2` | 6.0 | `Q` 的中心三轴加速度强度 |
 | `angular_accel_noise_rad_s2` | 12.0 | `Q` 的车体角加速度强度 |
-| `radius_drift_m` | 0.2 | 半径随机游走强度 |
-| `radius_variance_floor_m2` | 1e-6 | 半径过程噪声下限，(1 mm)² |
+| `radius_drift_m` | 0.02 | 半径随机游走强度 |
+| `radius_variance_floor_m2` | 9e-8 | 半径过程噪声下限，(0.3 mm)² |
 | `lateral_noise_scale` / `base_m` | 0.002 / 0.005 | 观测横向噪声 `sigma = 0.002 d + 0.005` |
 | `depth_noise_scale` / `base_m` | 0.010 / 0.010 | 观测深度噪声 `sigma = 0.010 d + 0.010` |
 | `jump_gate_m` | 0.6 | 物理跳变闸 |
@@ -998,7 +998,7 @@ if (!predictionIsFinite(result)) {
 | `stable_center_std_m` | 0.10 | 位置标准差上限 |
 | `stable_radius_std_m` | 0.05 | 半径标准差上限 |
 | `stable_yaw_std_rad` | 0.10 | yaw 标准差上限 |
-| `initial_radius_m` | 0.25 | 初始化假定的半径 |
+| `initial_radius_m` | 0.273 | 初始化半径，2026-10-20 靶车实测 |
 | `muzzle_offset_m` | 0.0741 | 枪口相对云台 P 轴原点的前移量，弹道输入从枪口量起。来源外参 handout，**不是调参旋钮** |
 | `max_step_s` | 0.5 | `predict` 的 `dt` 上限 |
 | `max_latency_s` | 0.2 | 单帧延迟上限 |
@@ -1174,7 +1174,7 @@ R = diag(depth², lateral², lateral²)
 | 0.7 | 0.2502 / 0.2497 | 0.25 / 0.25 | 0.0003 m |
 | 2.0 | 0.2498 / 0.2503 | 0.25 / 0.25 | 0.0005 m |
 
-只有 `omega = 0`（目标完全不转）时另一个半径才拿不到观测：它是初始化先验 0.25 靠交叉协方差漂出来的数，sd 单调增长。此时 `ekf_radius_2_m` 报的是先验，不是测量。
+只有 `omega = 0`（目标完全不转）时另一个半径才拿不到观测：它是初始化先验（现行配置 0.273，上表那一跑为 0.25）靠交叉协方差漂出来的数，sd 单调增长。此时 `ekf_radius_2_m` 报的是先验，不是测量。
 
 ### 12.6.3 卡住 `Stable` 的是 yaw 闸，不是半径闸
 
