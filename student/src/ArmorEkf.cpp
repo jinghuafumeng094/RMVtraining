@@ -390,53 +390,65 @@ bool ArmorEkf::tryInitialize(const ArmorPose& observation, double gimbal_yaw) {
         return false;
     }
 
-    // 先把观测板心转到世界系，再检查连续若干帧是否彼此接近。
-    // 不接近说明这几帧看到的不是同一块板（或不是同一个目标），重新开始计数。
-    const Eigen::Vector3d u = gimbalToWorld(gimbal_yaw) * z;
+    if (!accumulateInitWindow(gimbalToWorld(gimbal_yaw) * z)) {
+        return false;
+    }
+    startTracking(init_mean_, observation.detection.target_id);
+    ever_stable_ = false;
+    return true;
+}
+
+// 先把观测板心转到世界系，再检查连续若干帧是否彼此接近。
+// 不接近说明这几帧看到的不是同一块板（或不是同一个目标），重新开始计数。
+bool ArmorEkf::accumulateInitWindow(const Eigen::Vector3d& plate_world) {
     if (init_count_ == 0) {
-        init_mean_ = u;
+        init_mean_ = plate_world;
         init_count_ = 1;
-    } else if ((u - init_mean_).norm() <= config_.init_consistency_m) {
-        init_mean_ = (init_mean_ * static_cast<double>(init_count_) + u) /
+    } else if ((plate_world - init_mean_).norm() <= config_.init_consistency_m) {
+        init_mean_ = (init_mean_ * static_cast<double>(init_count_) + plate_world) /
                      static_cast<double>(init_count_ + 1);
         ++init_count_;
     } else {
-        init_mean_ = u;
+        init_mean_ = plate_world;
         init_count_ = 1;
     }
-    if (init_count_ < config_.init_frames) {
-        return false;
-    }
+    return init_count_ >= config_.init_frames;
+}
 
-    // 把观测到的板心当作 0 号板，反推旋转中心。编号是任意的全局相位，
-    // 取 0 号不影响物理，后续会随观测自动纠正。
-    //
-    // 反推要用的方位角是"旋转中心指向板心"的径向方位。板装在外侧、板面朝外，
-    // 而检测条件是板面法向朝向相机，所以这块板的径向方向与"板心指向相机"
-    // 同向，也就是板心视线的反方位。取板心相对世界原点的方位角是反的 180 度，
-    // 只有车心恰在世界原点时才碰巧相等。
-    // 初始中心误差由此从 2r*cos(delta/2) 降到 2r*sin(delta/2)，
-    // delta 是该板被看到的斜角，可见范围内不超过锥角。
+// 按一块世界系板心反推旋转中心，建起滤波器。
+//
+// 把观测到的板心当作 0 号板，编号是任意的全局相位，取 0 号不影响物理，
+// 后续会随观测自动纠正。
+//
+// 反推要用的方位角是"旋转中心指向板心"的径向方位。板装在外侧、板面朝外，
+// 而检测条件是板面法向朝向相机，所以这块板的径向方向与"板心指向相机"
+// 同向，也就是板心视线的反方位。取板心相对世界原点的方位角是反的 180 度，
+// 只有车心恰在世界原点时才碰巧相等。
+// 初始中心误差由此从 2r*cos(delta/2) 降到 2r*sin(delta/2)，
+// delta 是该板被看到的斜角，可见范围内不超过锥角。
+//
+// ever_stable_ 不在这里动：首次初始化要清掉它，跳闸外重建面对的是同一辆车，
+// 重建后该按 recover_frames 恢复稳态，不该退回 stable_frames。
+void ArmorEkf::startTracking(const Eigen::Vector3d& plate_world, std::uint8_t target_id) {
     x_.setZero();
-    x_[Yaw] = wrapToPi(std::atan2(-init_mean_.y(), -init_mean_.x()));
+    x_[Yaw] = wrapToPi(std::atan2(-plate_world.y(), -plate_world.x()));
     // 先夹半径再反推中心，否则滤波器一建立就与这条观测矛盾，下一帧起全被拒。
     const double initial_radius =
         std::min(config_.max_radius_m, std::max(config_.min_radius_m,
                                                 config_.initial_radius_m));
     x_[Radius1] = initial_radius;
     x_[Radius2] = initial_radius;
-    x_[Px] = init_mean_.x() - initial_radius * std::cos(x_[Yaw]);
-    x_[Py] = init_mean_.y() - initial_radius * std::sin(x_[Yaw]);
-    x_[Pz] = init_mean_.z() - config_.plate_height_m[0];
+    x_[Px] = plate_world.x() - initial_radius * std::cos(x_[Yaw]);
+    x_[Py] = plate_world.y() - initial_radius * std::sin(x_[Yaw]);
+    x_[Pz] = plate_world.z() - config_.plate_height_m[0];
     P_ = initialCovariance();
 
     status_ = TrackingState::Unstable;
-    target_id_ = observation.detection.target_id;
+    target_id_ = target_id;
     index_target_id_.fill(0);
-    index_target_id_[0] = observation.detection.target_id;
+    index_target_id_[0] = target_id;
     hit_streak_ = 0;
     miss_count_ = 0;
-    ever_stable_ = false;
     updated_this_frame_ = true;
     nis_count_ = 0;
     nis_head_ = 0;
@@ -444,7 +456,6 @@ bool ArmorEkf::tryInitialize(const ArmorPose& observation, double gimbal_yaw) {
     used_indices_.fill(false);
     init_count_ = 0;
     init_mean_.setZero();
-    return true;
 }
 
 bool ArmorEkf::associateAndUpdate(const ArmorPose& observation, double gimbal_yaw) {
@@ -461,6 +472,34 @@ bool ArmorEkf::associateAndUpdate(const ArmorPose& observation, double gimbal_ya
     }
 
     const Eigen::Matrix3d R = observationNoise(z);
+
+    // 先用 armor_yaw 认一下这是哪一块板。板面法向的偏航角里 theta_c 与
+    // gimbal_yaw 都已知，只剩槽位编号未知，解出来的编号与位置无关。
+    // 认不出时（法向被 PnP 的双解翻掉，或传感器没给）返回 -1，不影响关联。
+    //
+    // 只拿它判重，不拿它接管关联：位置与偏航给出互相矛盾的槽位时，
+    // 规定以位置为准。让偏航改关联会让"板心不动、法向错 1.5 rad"这种
+    // 输入被解释成换了一块板，反而把状态带偏。
+    int yaw_index = -1;
+    if (std::isfinite(observation.armor_yaw)) {
+        for (int i = 0; i < config_.plate_count; ++i) {
+            const double psi =
+                x_[Yaw] + static_cast<double>(i) * config_.plate_spacing_rad;
+            const double predicted_yaw = wrapToPi(kPi - (psi + gimbal_yaw));
+            if (std::fabs(wrapToPi(observation.armor_yaw - predicted_yaw)) <=
+                config_.armor_yaw_gate_rad) {
+                yaw_index = i;
+                break;
+            }
+        }
+    }
+    if (yaw_index >= 0 && used_indices_[static_cast<std::size_t>(yaw_index)]) {
+        // 这块板本帧已经配过一条观测。同一块板出两个检测框时，第二个框只能
+        // 去找剩下的槽位，两板间距 pi 时对面那一槽就在 2r 外、落在跳变闸里，
+        // 一次更新就把半径拉到边界。按 armor_yaw 认出来就当场丢掉。
+        ++rejected_count_;
+        return false;
+    }
 
     // 在四块板里挑一块来配这条观测。用马氏距离而不是最近欧氏距离：
     // 侧板的横向不确定度大，直接用欧氏距离会把它误配进来。
@@ -496,6 +535,18 @@ bool ArmorEkf::associateAndUpdate(const ArmorPose& observation, double gimbal_ya
 
     if (best_index < 0) {
         ++rejected_count_;
+        // 每一块板都在跳变闸之外：模型与观测已经对不上。跳变闸是物理闸，
+        // 与 P 无关，放大协方差撑不开它，旧版只能等 reset_timeout_s 的整段
+        // 重置。丢了这么多帧之后就地重建：把这条观测喂进初始化窗口，攒够
+        // init_frames 条彼此一致的观测就按它们反推旋转中心。
+        if (status_ != TrackingState::NoTarget && !updated_this_frame_ &&
+            !init_used_this_frame_ && miss_count_ >= config_.reinit_after_misses) {
+            init_used_this_frame_ = true;
+            if (accumulateInitWindow(gimbalToWorld(gimbal_yaw) * z)) {
+                startTracking(init_mean_, observation.detection.target_id);
+                return true;
+            }
+        }
         return false;
     }
     if (best_nis > config_.nis_gate) {

@@ -800,6 +800,128 @@ void testRejectedObservationsInflateCovarianceAndRecover() {
     std::printf("[ekf] 连续拒收后自行恢复 通过\n");
 }
 
+// 同一帧里同一块板出两个检测框，第二条必须认出来是同一块板。
+//
+// 一帧内一个槽位只配一条观测，第二条只能去找剩下的槽位。两板间距 pi 时
+// 对面那一槽就在 2r = 0.5 m 外，落在跳变闸 0.6 m 以内；协方差被放大之后
+// 马氏距离也进得了 nis_gate，于是旧版把它配到对面那一槽，一次更新就把
+// 两个半径拉到边界。v4 回放 f=137 那次就是这条，r=0.234 -> 0.100/0.100。
+// armor_yaw 直接读出是第几块板：它解出来的槽位本帧已经被占用，就说明这条
+// 是同一块板的重复框，当场丢掉。
+void testSameFrameDuplicatePlateIsRejectedByYaw() {
+    ArmorEkf::Config config = testConfig();
+    config.plate_count = 2;
+    config.plate_spacing_rad = kPi;
+
+    Truth truth;
+    truth.center = Eigen::Vector3d(4.0, 0.0, 0.5);
+    truth.yaw = kPi;
+    truth.radius1 = config.initial_radius_m;
+    truth.radius2 = config.initial_radius_m;
+
+    const Eigen::Vector3d plate = truePlateWorld(truth, 0, config);
+    const double armor_yaw = trueArmorYaw(truth, 0, config, 0.0);
+    const double dt = 1.0 / 165.0;
+
+    ArmorEkf settled(config);
+    double timestamp = 0.0;
+    for (int frame = 0; frame < 200; ++frame) {
+        timestamp += dt;
+        settled.predict(dt);
+        settled.update(makeObservation(plate, 1, armor_yaw), 0.0);
+        settled.advanceStateMachine(timestamp);
+    }
+    assert(settled.hitStreak() > 0);
+
+    // 丢一段时间，让协方差按拒收放大到初始量级。这正是同一块板出两个框
+    // 时能穿过 nis_gate 的条件：收敛后的方差太小，对面那一槽算出来的马氏
+    // 距离大到根本进不来，测不到本条要测的东西。
+    for (int frame = 0; frame < 12; ++frame) {
+        timestamp += dt;
+        settled.predict(dt);
+        settled.advanceStateMachine(timestamp);
+    }
+
+    timestamp += dt;
+    settled.predict(dt);
+    assert(settled.update(makeObservation(plate, 1, armor_yaw), 0.0));
+    const ArmorEkf::StateVector after_first = settled.state();
+    const int rejected_before = settled.rejectedCount();
+
+    assert(!settled.update(makeObservation(plate, 1, armor_yaw), 0.0));
+    assert(settled.rejectedCount() == rejected_before + 1);
+    const ArmorEkf::StateVector after_second = settled.state();
+    double worst = 0.0;
+    for (int i = 0; i < ArmorEkf::Dimension; ++i) {
+        worst = std::max(worst, std::fabs(after_second[i] - after_first[i]));
+    }
+    std::printf("[ekf] 同帧重复框 第二框拒收 状态最大变化 %.2e\n", worst);
+    assert(worst < 1e-9);
+    assert(after_second[ArmorEkf::Radius1] > 0.2);
+    assert(after_second[ArmorEkf::Radius2] > 0.2);
+    std::printf("[ekf] 同帧重复框按 armor_yaw 判重 通过\n");
+}
+
+// 模型离每一块板都超过 jump_gate_m 时，旧状态已经和观测无关了。
+// 旧版只有 reset_timeout_s = 1.5 s 一条出口，回放里 493 条观测就这么被
+// 跳变闸挡掉，车明明在视野里却一直 no-target。新行为：连续丢
+// reinit_after_misses 帧之后，把新观测喂进初始化窗口，攒够 init_frames 条
+// 彼此一致的观测就地重建滤波器。
+void testDivergedFilterReinitializesFromConsistentObservations() {
+    ArmorEkf::Config config = testConfig();
+    config.plate_count = 2;
+    config.plate_spacing_rad = kPi;
+
+    Truth truth;
+    truth.center = Eigen::Vector3d(4.0, 0.0, 0.5);
+    truth.yaw = kPi;
+    truth.radius1 = config.initial_radius_m;
+    truth.radius2 = config.initial_radius_m;
+
+    const Eigen::Vector3d plate = truePlateWorld(truth, 0, config);
+    const double armor_yaw = trueArmorYaw(truth, 0, config, 0.0);
+    const Eigen::Vector3d far_plate = plate + Eigen::Vector3d(0.0, 3.0, 0.0);
+
+    ArmorEkf filter(config);
+    const double dt = 1.0 / 165.0;
+    double timestamp = 0.0;
+    const auto feed = [&](const Eigen::Vector3d& p) {
+        timestamp += dt;
+        filter.predict(dt);
+        const bool taken = filter.update(makeObservation(p, 1, armor_yaw), 0.0);
+        filter.advanceStateMachine(timestamp);
+        return taken;
+    };
+    for (int frame = 0; frame < 200; ++frame) {
+        feed(plate);
+    }
+    assert(filter.hitStreak() > 0);
+
+    // 车在两帧之间瞬移到 3 m 外。物理上不可能，但它是"模型彻底错了"的最小
+    // 复现：每一条观测都在所有槽位的跳变闸之外。真实回放里它由换车或
+    // 回放循环造成。
+    const int rejected_before = filter.rejectedCount();
+    int rebuilt_at = -1;
+    for (int frame = 0; frame < 10; ++frame) {
+        feed(far_plate);
+        if (rebuilt_at < 0) {
+            const Eigen::Vector3d model =
+                modelPlateWorld(filter.state(), 0, config);
+            if ((model - far_plate).norm() < 0.1) {
+                rebuilt_at = frame;
+            }
+        }
+        assert(filter.status() != TrackingState::NoTarget);
+    }
+    std::printf("[ekf] 跳闸外重建 第 %d 帧 拒收 %d 条\n", rebuilt_at,
+                filter.rejectedCount() - rejected_before);
+    assert(rebuilt_at >= 0);
+    assert(rebuilt_at < 10);
+    // 重建之后必须继续正常吃观测。
+    assert(feed(far_plate));
+    std::printf("[ekf] 模型偏离跳闸外时按新观测重建 通过\n");
+}
+
 void testGimbalRotationIsNotTargetMotion() {
     const ArmorEkf::Config config = testConfig();
     ArmorEkf filter(config);
@@ -1249,6 +1371,8 @@ int main() {
     testArmorYawObservationPinsBodyYaw();
     testRadiusStaysWithinPhysicalBounds();
     testRejectedObservationsInflateCovarianceAndRecover();
+    testSameFrameDuplicatePlateIsRejectedByYaw();
+    testDivergedFilterReinitializesFromConsistentObservations();
     testGimbalRotationIsNotTargetMotion();
     testStateMachineTiming();
     testInitializationTakesOneObservationPerFrame();

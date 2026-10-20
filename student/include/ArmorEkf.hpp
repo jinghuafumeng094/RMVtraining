@@ -135,6 +135,15 @@ public:
         int reject_recovery_frames{3};
         double reject_inflation_factor{2.0};
 
+        // 模型离每一块板都超过 jump_gate_m 时的重建门槛。
+        //
+        // 跳变闸是物理闸，与 P 无关，放大协方差撑不开它。一旦状态被带偏，
+        // 所有槽位都在闸外，观测永远进不来，只能等 reset_timeout_s 的整段
+        // 重置。丢了这么多帧之后，把新观测喂进初始化窗口，攒够 init_frames
+        // 条彼此一致的观测就地重建，比整段重置快一个数量级。
+        // 3 帧与 init_frames 对齐：正是初始化本身要求的帧数。
+        int reinit_after_misses{3};
+
         // 初始化时假定的装甲板半径 (m)。标准步兵两块板到中心同量级。
         double initial_radius_m{0.25};
 
@@ -244,6 +253,10 @@ private:
 
     bool tryInitialize(const ArmorPose& observation, double gimbal_yaw);
     bool associateAndUpdate(const ArmorPose& observation, double gimbal_yaw);
+    // 把一帧板心喂进初始化窗口，返回窗口是否已经攒够。
+    bool accumulateInitWindow(const Eigen::Vector3d& plate_world);
+    // 按一块世界系板心反推旋转中心，建起滤波器。初始化与跳闸外重建共用。
+    void startTracking(const Eigen::Vector3d& plate_world, std::uint8_t target_id);
     // commit=false 只查询不写 aim_index_，供弹道迭代这类"试算"使用。
     int selectArmorIndex(const StateVector& x, double gimbal_yaw, bool commit);
     Eigen::Vector3d platePositionWorld(const StateVector& x, int armor_index) const;
