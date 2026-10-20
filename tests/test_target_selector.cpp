@@ -396,6 +396,60 @@ void testBridgePlateDoesNotMergeVehicles() {
     assert(found_near && found_far);
 }
 
+void testClusterDiameterCap() {
+    // v4.avi 第 801 帧实测：本车两块板相距 0.44 m，远车一块板离本车近的那块 0.54 m。
+    // 两段都在 cluster_link_m 之内，单链接会把三块串成一簇，簇直径 0.94 m；一辆车
+    // 四块板最远也就 0.69 m，所以要么本车两块走、要么远车那块被拉走，取决于谁先
+    // 当种子。卡直径后最近的一对先合并，远车那块单独成簇。
+    const std::vector<ArmorPose> poses{
+        singlePlate(Eigen::Vector3d(2.04, -0.46, 0.28), 1, 470.0),
+        singlePlate(Eigen::Vector3d(1.82, 0.03, 0.27), 3, 40.0),
+        singlePlate(Eigen::Vector3d(1.88, 0.47, 0.16), 3, 150.0),
+    };
+    const TargetSelectorConfig config;
+    const std::vector<TargetCluster> clusters =
+        TargetSelector::buildClusters(poses, 0.0, config);
+
+    assert(clusters.size() == 2);
+    assert(clusters[0].indices.size() == 1);
+    assert(clusters[0].indices[0] == 0);
+    assert(clusters[0].target_id == 1);
+    assert(clusters[1].indices.size() == 2);
+    assert(clusters[1].indices[0] == 1);
+    assert(clusters[1].indices[1] == 2);
+    assert(clusters[1].target_id == 3);
+
+    // 反证：把直径上限放到 1.0 m，同一组观测就串回一簇。差别只能来自上限本身。
+    TargetSelectorConfig loose = config;
+    loose.cluster_max_extent_m = 1.0;
+    const std::vector<TargetCluster> merged =
+        TargetSelector::buildClusters(poses, 0.0, loose);
+    assert(merged.size() == 1);
+    assert(merged[0].indices.size() == 3);
+}
+
+void testStickerDecidesAmbiguousPairing() {
+    // v4.avi 第 733 帧实测：远车 id1 的板离本车近的那块只有 0.39 m，比本车两块
+    // 之间 0.43 m 还近。两两都能连，先连哪一对就决定了结果。纯按距离会把本车
+    // 拆开、把远车那块并进来；编号相同的一对必须优先。
+    const std::vector<ArmorPose> poses{
+        singlePlate(Eigen::Vector3d(2.05, -0.46, 0.28), 1, 470.0),
+        singlePlate(Eigen::Vector3d(1.93, -0.09, 0.18), 3, 150.0),
+        singlePlate(Eigen::Vector3d(1.87, 0.34, 0.26), 3, 60.0),
+    };
+    const TargetSelectorConfig config;
+    const std::vector<TargetCluster> clusters =
+        TargetSelector::buildClusters(poses, 0.0, config);
+
+    assert(clusters.size() == 2);
+    assert(clusters[0].indices.size() == 1);
+    assert(clusters[0].indices[0] == 0);
+    assert(clusters[1].indices.size() == 2);
+    assert(clusters[1].indices[0] == 1);
+    assert(clusters[1].indices[1] == 2);
+    assert(clusters[1].target_id == 3);
+}
+
 void testAdjacentPlatesOfOneVehicleStayTogether() {
     // 同一辆车上相邻两块板实测间距 0.43 到 0.49 m，聚簇阈值不能低到把车自己拆开。
     const std::vector<ArmorPose> poses{
@@ -451,6 +505,10 @@ int main() {
     std::printf("sticker_large_jump ok\n");
     testBridgePlateDoesNotMergeVehicles();
     std::printf("bridge_plate ok\n");
+    testStickerDecidesAmbiguousPairing();
+    std::printf("sticker_pairing ok\n");
+    testClusterDiameterCap();
+    std::printf("cluster_diameter_cap ok\n");
     testAdjacentPlatesOfOneVehicleStayTogether();
     std::printf("adjacent_plates ok\n");
     testEmptyInputFromStart();

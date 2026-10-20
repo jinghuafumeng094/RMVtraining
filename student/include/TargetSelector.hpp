@@ -38,6 +38,19 @@ struct TargetSelectorConfig {
     // 误识别出的桥接板能把两车串成一簇，0.80 时 v4 有 417 帧跨车合簇，0.55 降到 66 帧。
     double cluster_link_m{0.55};
 
+    // 一簇里最远两块板的距离上限。单链接只卡相邻两步，一块误检就有桥可搭：
+    // v4 里第二辆车有一块板离本车的板只有 0.39 m，单看这一步完全合规，串起来
+    // 之后整簇直径到 0.95 m。一辆车四块板最远的一对就是矩形对角线，边长实测
+    // 0.43 到 0.49 m 时最多 0.69 m，取 0.75 留 60 mm 余量。
+    double cluster_max_extent_m{0.75};
+
+    // 编号相同的一对板在合并顺序上提前这么远。只在直径上限拦掉某条边时起作用：
+    // 三块板里本车两块 0.43 m、另一辆车一块 0.39 m 时，两两都能连，先连哪一对
+    // 决定了结果，纯按距离会先把本车拆开。V4 实测本车两块编号相同的 42 帧里，
+    // 不加偏置拆散 7 帧，加 0.10 m 只剩 1 帧。这是排序上的优先，不是屏障：
+    // 编号读不出的板照常参与，本车编号被读错也不会因此被拆出去。
+    double id_agreement_bias_m{0.10};
+
     // 跨帧认同：新簇心与上次选中簇心在世界系中的距离不超过此值，视为同一辆车。
     // 距离先加贴纸惩罚再比，所以这一个数管两件事：编号相同认 identity_match_m，
     // 不同或读不出只剩 identity_match_m - identity_sticker_penalty_m。
@@ -170,31 +183,103 @@ inline std::vector<TargetCluster> TargetSelector::buildClusters(
 
     // 单链接聚簇：只要两块板间距不超过阈值就连成一簇。不用 target_id 当屏障，
     // 同一辆车四块板的编号可能被分类器读错，硬拆会把一辆车劈成两辆。
-    std::vector<int> label(count, -1);
-    for (std::size_t seed = 0; seed < count; ++seed) {
-        if (label[seed] >= 0) {
+    //
+    // 按板间距从小到大合并，而不是按观测下标逐个当种子。加了直径上限之后顺序
+    // 会改变结果：种子先落在哪块板上，就决定了另一辆车的那块板跟着谁走。
+    //
+    // 排序键把编号相同的边提前 id_agreement_bias_m。三块板两两都能连的时候，
+    // 纯按距离会先把本车拆开。
+    struct Edge {
+        double key;
+        double distance;
+        std::size_t a;
+        std::size_t b;
+    };
+    std::vector<Edge> edges;
+    for (std::size_t i = 0; i < count; ++i) {
+        for (std::size_t j = i + 1; j < count; ++j) {
+            const double distance = cv::norm(observations[i].position_gimbal_m -
+                                             observations[j].position_gimbal_m);
+            if (distance > config.cluster_link_m) {
+                continue;
+            }
+            const int id_i = observations[i].detection.target_id;
+            const int id_j = observations[j].detection.target_id;
+            const bool sticker_agrees = id_i != 0 && id_i == id_j;
+            edges.push_back(
+                Edge{distance - (sticker_agrees ? config.id_agreement_bias_m : 0.0), distance,
+                     i, j});
+        }
+    }
+    std::sort(edges.begin(), edges.end(), [](const Edge& left, const Edge& right) {
+        if (left.key != right.key) {
+            return left.key < right.key;
+        }
+        if (left.distance != right.distance) {
+            return left.distance < right.distance;
+        }
+        if (left.a != right.a) {
+            return left.a < right.a;
+        }
+        return left.b < right.b;
+    });
+
+    std::vector<std::size_t> parent(count);
+    std::vector<std::vector<std::size_t>> members(count);
+    for (std::size_t i = 0; i < count; ++i) {
+        parent[i] = i;
+        members[i].assign(1, i);
+    }
+    const auto findRoot = [&parent](std::size_t node) {
+        while (parent[node] != node) {
+            parent[node] = parent[parent[node]];
+            node = parent[node];
+        }
+        return node;
+    };
+
+    for (const Edge& edge : edges) {
+        const std::size_t root_a = findRoot(edge.a);
+        const std::size_t root_b = findRoot(edge.b);
+        if (root_a == root_b) {
             continue;
         }
-        const int cluster_index = static_cast<int>(clusters.size());
-        clusters.push_back(TargetCluster{});
-        label[seed] = cluster_index;
-        std::vector<std::size_t> pending{seed};
-        while (!pending.empty()) {
-            const std::size_t current = pending.back();
-            pending.pop_back();
-            clusters[static_cast<std::size_t>(cluster_index)].indices.push_back(
-                static_cast<int>(current));
-            for (std::size_t other = 0; other < count; ++other) {
-                if (label[other] >= 0) {
-                    continue;
-                }
-                if (cv::norm(observations[other].position_gimbal_m -
-                             observations[current].position_gimbal_m) <= config.cluster_link_m) {
-                    label[other] = cluster_index;
-                    pending.push_back(other);
+        // 合并前把两簇的成员两两比一遍：一块桥接板能把两辆车沿链子串成一簇，
+        // 每一步都合规，串完直径却远超一辆车。卡的是簇的直径，不是步长。
+        bool too_wide = false;
+        for (std::size_t left : members[root_a]) {
+            for (std::size_t right : members[root_b]) {
+                if (cv::norm(observations[left].position_gimbal_m -
+                             observations[right].position_gimbal_m) >
+                    config.cluster_max_extent_m) {
+                    too_wide = true;
+                    break;
                 }
             }
+            if (too_wide) {
+                break;
+            }
         }
+        if (too_wide) {
+            continue;
+        }
+        parent[root_b] = root_a;
+        members[root_a].insert(members[root_a].end(), members[root_b].begin(),
+                               members[root_b].end());
+        members[root_b].clear();
+    }
+
+    // 输出顺序按簇内最小下标排，与原来的按种子顺序一致。
+    std::vector<int> label(count, -1);
+    for (std::size_t i = 0; i < count; ++i) {
+        const std::size_t root = findRoot(i);
+        if (label[root] < 0) {
+            label[root] = static_cast<int>(clusters.size());
+            clusters.push_back(TargetCluster{});
+        }
+        label[i] = label[root];
+        clusters[static_cast<std::size_t>(label[root])].indices.push_back(
+            static_cast<int>(i));
     }
 
     const Eigen::Matrix3d to_world = ArmorEkf::gimbalToWorld(gimbal_yaw);
