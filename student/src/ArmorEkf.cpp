@@ -343,6 +343,7 @@ void ArmorEkf::predict(double dt) {
     used_indices_.fill(false);
     updated_this_frame_ = false;
     init_used_this_frame_ = false;
+    frame_best_nis_ = -1.0;
     if (status_ == TrackingState::NoTarget) {
         return;
     }
@@ -534,6 +535,13 @@ bool ArmorEkf::associateAndUpdate(const ArmorPose& observation, double gimbal_ya
             best_h = h;
             best_H = H;
         }
+    }
+
+    // 记到本帧出口上，闸门之前就记，被拒的观测才留得下数。一帧有几条观测时
+    // 取较大的那个：一条坏观测不该被另一条好观测盖住。所有槽位都在跳变闸外时
+    // 没有比值可谈，保持哨兵 -1，与"本帧没有观测"同义。
+    if (best_index >= 0) {
+        frame_best_nis_ = std::max(frame_best_nis_, best_nis);
     }
 
     if (best_index < 0) {
@@ -887,6 +895,11 @@ PredictionResult ArmorEkf::buildPrediction(const GimbalState& gimbal, double lat
     const double nis_mean = recentNisMean();
     result.nis_mean =
         std::isfinite(nis_mean) ? static_cast<float>(nis_mean) : -1.0F;
+    // 本帧那条观测判定的 NIS，闸门之前取值。内部哨兵已经是 -1，这里只防一个
+    // 非有限的残差算出来的 NaN 混进出口结构体。
+    result.best_nis = std::isfinite(frame_best_nis_)
+                          ? static_cast<float>(frame_best_nis_)
+                          : -1.0F;
     // 车体状态报在跟踪系（W：x 前、y 左、z 上）里，与 PredictionResult 的注释一致。
     result.center_x_m = static_cast<float>(x_[Px]);
     result.center_y_m = static_cast<float>(x_[Py]);

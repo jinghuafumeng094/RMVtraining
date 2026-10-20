@@ -464,6 +464,52 @@ void testAdjacentPlatesOfOneVehicleStayTogether() {
     assert(clusters[0].indices.size() == 2);
 }
 
+void testSplitClusterTieKeepsHigherScoringCluster() {
+    // 2026-10-21 实车尾段 f=4672 到 f=4673 的复现。两板同簇时簇心是两板均值；
+    // 下一帧两板之间拉开越过 cluster_link_m 就拆成两簇，两个子簇心对上一帧的
+    // 簇心精确等距。并列时如果留任的是分数更低的那簇，挑战者连续三帧领先就会
+    // 换簇，调用方据此重置滤波器。并列必须按分数挑，让 best 与 matched 重合。
+    const std::vector<ArmorPose> merged{
+        singlePlate(Eigen::Vector3d(2.0, -0.25, 0.0), 3, 300.0),
+        singlePlate(Eigen::Vector3d(2.0, 0.25, 0.0), 3, 40.0),
+    };
+    // 关于 (2.0, 0.0, 0.0) 对称，间距 0.60 m 越过 cluster_link_m 0.55。
+    const std::vector<ArmorPose> split{
+        singlePlate(Eigen::Vector3d(2.0, -0.30, 0.0), 3, 300.0),
+        singlePlate(Eigen::Vector3d(2.0, 0.30, 0.0), 3, 40.0),
+    };
+
+    const TargetSelectorConfig config;
+    const std::vector<TargetCluster> merged_clusters =
+        TargetSelector::buildClusters(merged, 0.0, config);
+    assert(merged_clusters.size() == 1);
+    const std::vector<TargetCluster> split_clusters =
+        TargetSelector::buildClusters(split, 0.0, config);
+    assert(split_clusters.size() == 2);
+
+    // 前提一：两个子簇心到上一帧簇心的距离真的相等，不是近似相等。
+    const Eigen::Vector3d previous = merged_clusters[0].center_world_m;
+    const double left_gap = (split_clusters[0].center_world_m - previous).norm();
+    const double right_gap = (split_clusters[1].center_world_m - previous).norm();
+    assert(left_gap == right_gap);
+
+    // 前提二：下标 0 那簇分数更低，差得够 switch_margin。
+    assert(TargetSelector::scoreOf(split_clusters[1], config) >
+           TargetSelector::scoreOf(split_clusters[0], config) + config.switch_margin);
+
+    TargetSelector selector(config);
+    const TargetSelection first = selector.select(merged, 0.0, 0.0);
+    assert(first.switched);
+    assert(first.target_id == 3);
+
+    // 拆分后的两帧里不许换簇，票数永远不该走起来。
+    for (int frame = 1; frame <= 2 * config.switch_confirm_frames; ++frame) {
+        const TargetSelection selection = selector.select(split, 0.0, 0.01 * frame);
+        assert(!selection.switched);
+        assert(selection.track_id == first.track_id);
+    }
+}
+
 void testEmptyInputFromStart() {
     TargetSelector selector;
     const std::vector<ArmorPose> empty;
@@ -511,6 +557,8 @@ int main() {
     std::printf("cluster_diameter_cap ok\n");
     testAdjacentPlatesOfOneVehicleStayTogether();
     std::printf("adjacent_plates ok\n");
+    testSplitClusterTieKeepsHigherScoringCluster();
+    std::printf("split_cluster_tie ok\n");
     testEmptyInputFromStart();
     std::printf("empty_input ok\n");
     return 0;

@@ -398,6 +398,10 @@ inline TargetSelection TargetSelector::select(const std::vector<ArmorPose>& obse
     // 找和上次选中簇在世界系里对得上的那一簇。
     // 距离不直接比：贴纸对不上时加惩罚。同一辆车换板造成的簇心跳变只有编号能兜住，
     // 没有编号作证就只认 cluster_link_m 那么远。
+    // 合并成一簇的两块板下一帧分开时，两个子簇心对上一帧的簇心精确等距（簇心是
+    // 成员均值）。并列按分数挑：否则留任的低分簇会被挑战者连续三帧压过，攒够票
+    // 换簇，调用方据此重置滤波器。差 1e-6 m 以内当作并列，给坐标变换的浮点噪声留位。
+    constexpr double kTieToleranceM = 1e-6;
     int matched = -1;
     double matched_key = std::numeric_limits<double>::infinity();
     for (int i = 0; i < static_cast<int>(clusters.size()); ++i) {
@@ -407,9 +411,18 @@ inline TargetSelection TargetSelector::select(const std::vector<ArmorPose>& obse
             cluster.target_id != 0 && target_id_ != 0 && cluster.target_id == target_id_;
         const double key =
             sticker_agrees ? distance : distance + config_.identity_sticker_penalty_m;
-        if (key <= config_.identity_match_m && key < matched_key) {
+        if (key > config_.identity_match_m) {
+            continue;
+        }
+        if (matched < 0 || key < matched_key - kTieToleranceM) {
             matched = i;
             matched_key = key;
+            continue;
+        }
+        if (key <= matched_key + kTieToleranceM &&
+            cluster.score > clusters[static_cast<std::size_t>(matched)].score) {
+            matched = i;
+            matched_key = std::min(matched_key, key);
         }
     }
 

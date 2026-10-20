@@ -212,9 +212,12 @@ PredictionResult ekf_predict(const std::vector<ArmorPose>& observations,
     const armor::TargetSelection selection =
         selector.select(observations, static_cast<double>(gimbal.yaw), timestamp_seconds);
 
-    // 换车等于换了一个物理对象，旧状态会把新车挡在跳变闸外，
-    // 等状态机超时重置又要 1.5 s，所以这里直接重置。
-    if (selection.switched) {
+    // 换簇不等于换车：同一辆靶车的两块板拆成两簇也会置 switched，而这时滤波器
+    // 可能正处在 Stable。无条件重置会把收敛好的半径与速度一起扔掉，重建时还会
+    // 按单板视线假设把车心放偏，第二块板从此落在 max_radius 之外，再也进不来。
+    // 解释不了的观测由跳变闸与 NIS 闸挡下，连续 miss 到 reinit_after_misses
+    // 就会用这几帧观测就地重建；真换了车也走同一条路。
+    if (selection.switched && filter.status() == TrackingState::NoTarget) {
         filter.reset();
     }
 

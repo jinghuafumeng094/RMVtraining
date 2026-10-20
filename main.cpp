@@ -186,6 +186,12 @@ void logPrediction(const PredictionResult& result) {
     if (result.nis_mean >= 0.0F) {
         WEB_LOG("ekf_nis_mean", result.nis_mean);
     }
+    // 本帧被评估的那条观测的 NIS，取值在闸门之前。上面那条只统计被接受的更新，
+    // 观测被拒的帧在那条线上什么都不留；这一条让被拒的帧也留下数：大于 nis_gate
+    // 说明是统计闸挡的，-1 说明这一帧没有观测走到槽位比较。
+    if (result.best_nis >= 0.0F) {
+        WEB_LOG("ekf_best_nis", result.best_nis);
+    }
     // 以下三个是派生角，不参与任何控制，也不回流进滤波器。它们的作用是把「估出来的状态
     // 到底符不符合物理」变成肉眼可判的形状：车体匀速自转时，这三个角各自有一条已知的
     // 波形，形状、周期、幅值都能事先算出来，对不上就说明相应的状态没收敛或者模型写错了。

@@ -298,6 +298,71 @@ void testNisSentinelBeforeFirstUpdate() {
                 static_cast<double>(prediction.nis_mean));
 }
 
+// best_nis 是本帧每条观测在槽位比较里取到的最小 NIS，取值在 NIS 闸之前。
+// 与 nis_mean 的分工：nis_mean 只吃被接受的更新，被拒的帧在那条曲线上什么都不留，
+// 于是"观测被拒了"和"这一帧没有观测"在打点里长得一样，Q/R 闭不上。
+//
+// 三条契约一起钉：干净帧给小数、被统计闸挡下的帧给出超过闸门的数、没有观测
+// 走到槽位比较的帧给 -1。第二条是本字段存在的理由，第三条保证它不会与第一条混淆。
+void testBestNisReachesPrediction() {
+    const ArmorEkf::Config config = testConfig();
+    const GimbalState gimbal = makeGimbal(0.0, 0.0);
+    const double dt = 1.0 / 165.0;
+
+    ArmorEkf filter(config);
+    Truth truth;
+    truth.center = Eigen::Vector3d(4.0, 0.3, 0.6);
+    truth.yaw = 0.4;
+
+    double timestamp = 0.0;
+    for (int frame = 0; frame < 60; ++frame) {
+        timestamp += dt;
+        filter.predict(dt);
+        feedFrame(filter, config, truth, 0.0, 0.0, frame);
+        filter.advanceStateMachine(timestamp);
+        trueStep(truth, dt);
+    }
+    assert(filter.status() != TrackingState::NoTarget);
+
+    // 干净帧：残差只剩线性化误差。这里也顺带钉住这个字段不是常量占位。
+    const PredictionResult clean = filter.buildPrediction(gimbal, 0.001);
+    assert(clean.best_nis >= 0.0F);
+    assert(clean.best_nis < 1.0F);
+
+    // 把 0 号板的观测横向推开 0.12 m。4 m 处横向标准差约 13 mm，NIS 约 85，
+    // 越过 nis_gate 11.34；同时远小于 jump_gate 0.6 m，走的确实是统计闸而不是
+    // 物理闸。相邻槽位在 2r 之外，残差更大，最近槽位不会换。
+    const Eigen::Vector3d plate =
+        ArmorEkf::worldToGimbal(0.0) * truePlateWorld(truth, 0, config);
+    Eigen::Vector3d shifted = plate;
+    shifted.y() += 0.12;
+    const int rejected_before = filter.rejectedCount();
+    timestamp += dt;
+    filter.predict(dt);
+    const bool accepted =
+        filter.update(makeObservation(shifted, 1, trueArmorYaw(truth, 0, config, 0.0)), 0.0);
+    filter.advanceStateMachine(timestamp);
+    assert(!accepted);
+    assert(filter.rejectedCount() == rejected_before + 1);
+
+    const PredictionResult gated = filter.buildPrediction(gimbal, 0.001);
+    assert(std::isfinite(gated.best_nis));
+    assert(gated.best_nis > static_cast<float>(config.nis_gate));
+    // 被拒的更新不进 NIS 窗口：均值原封不动，只有本帧这个字段记得下来。
+    assert(std::fabs(gated.nis_mean - clean.nis_mean) < 1e-6F);
+
+    // 没有观测走到槽位比较的帧必须是 -1，不能把上一帧的数留在出口上。
+    timestamp += dt;
+    filter.predict(dt);
+    filter.advanceStateMachine(timestamp);
+    const PredictionResult idle = filter.buildPrediction(gimbal, 0.001);
+    assert(idle.best_nis < 0.0F);
+
+    std::printf("[ekf] best_nis 干净 %.6f 被拒 %.1f 空帧 %.1f 通过\n",
+                static_cast<double>(clean.best_nis), static_cast<double>(gated.best_nis),
+                static_cast<double>(idle.best_nis));
+}
+
 // ---------------------------------------------------------------------------
 
 void testCoordinateTransforms() {
@@ -1408,6 +1473,7 @@ int main() {
     testTrackingEvidenceFieldsReachPrediction();
     testNisMeanReachesPrediction();
     testNisSentinelBeforeFirstUpdate();
+    testBestNisReachesPrediction();
     testBallisticDropCompensation();
     testMuzzleOffsetIsSubtractedInGimbalFrame();
     testSafetyInvariants();

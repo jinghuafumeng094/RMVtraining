@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 
 // 旋转装甲板目标的扩展卡尔曼滤波。
 //
@@ -319,6 +320,12 @@ private:
     std::array<double, 8> nis_history_{};
     int nis_count_{0};
     int nis_head_{0};
+
+    // 本帧观测在槽位比较里取到的最小 NIS 的最大值，每帧在 predict 里清成 -1。
+    // 与 nis_history_ 的区别：这个在闸门之前取值，被拒的观测也记。NIS 非负，
+    // 所以 -1 可以当"本帧没有一条观测走到槽位比较"的哨兵，直接进出口结构体。
+    // 不用正无穷：清零后取 max 会一直停在无穷上，那是个只会静默失效的写法。
+    double frame_best_nis_{-1.0};
 
     std::array<double, 32> latency_history_{};
     int latency_count_{0};
