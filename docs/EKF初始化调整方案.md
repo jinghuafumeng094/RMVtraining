@@ -1,7 +1,7 @@
 # EKF 初始化调整方案
 
 日期：2026-10-13
-适用：`student/src/ArmorEkf.cpp:385-392` 的初始化段
+适用：`student/src/ArmorEkf.cpp:436-447` 的初始化段
 前一版结论：`docs/上车前问题清单.md` §2.7、`rm_autoaim_evidence/06-EKF跟踪与预测/20261013-ekf-fix-trials-候选修法全试过.md`
 
 **一句话**：初始化的方位角方向取反了 180°。代码假设观测到的板**背对**相机，
@@ -16,7 +16,7 @@
 
 ## 一、根因
 
-初始化段（`ArmorEkf.cpp:385-392`）把**板心相对世界原点**的方位角，
+初始化段（`ArmorEkf.cpp:436-447`，下面引的是修复前的式子）把**板心相对世界原点**的方位角，
 当成了**板心相对旋转中心**的方位角：
 
 ```cpp
@@ -185,13 +185,13 @@ Stable，与现在的实现哪一帧报 Stable 对比。27 行 × 两个变体�
 （这里数的是可见而不是被接受，拒绝多时真实的门只会更晚开，所以"免费"这条对真实实现是乐观侧，
 "堵不住"这条不受影响。）
 
-做法（若要做）：在 `advanceStateMachine`（`ArmorEkf.cpp:493`）的 Unstable 转 Stable 条件里加一条
+做法（若要做）：在 `advanceStateMachine`（`ArmorEkf.cpp:623`）的 Unstable 转 Stable 条件里加一条
 
 ```
 去过偶数槽位的观测 && 去过奇数槽位的观测
 ```
 
-- 用**槽位奇偶**而不是"见过几块板"，因为 `radiusIndex`（`:112`）按奇偶分 `r1`/`r2`：
+- 用**槽位奇偶**而不是"见过几块板"，因为 `radiusIndex`（`:166`）按奇偶分 `r1`/`r2`：
   两块相差 180° 的板落在**同奇偶**槽位，打破不了半径简并，只数块数是错的。
 - 判据只在"观测被接受"时置位（过了三道闸的才算）。
 - 代价：车若恰好不自转（`omega = 0`），可见的永远是同一个槽位，门会一直挡住。
@@ -229,7 +229,7 @@ Stable，与现在的实现哪一帧报 Stable 对比。27 行 × 两个变体�
 
 ## 七、顺序
 
-1. ~~改 `ArmorEkf.cpp:387` 一行（取反）。~~ **已完成**，`student/src/ArmorEkf.cpp`。
+1. ~~改 `ArmorEkf.cpp:438` 一行（取反）。~~ **已完成**，`student/src/ArmorEkf.cpp`。
 2. ~~改夹具：`feedFrame` 加可见性筛选（与 `ekf_trace` 同一条锥角判据）。~~ **已完成**。
 3. ~~重定 `testNoiselessConvergence` 的帧数预算；重写 `testTwoPlateVehicleObservesRadiusTwo`。~~
    **已完成**，2400 帧与 24000 帧，界与实测见第四节。
@@ -269,5 +269,5 @@ bash build.sh ArmorEkf_G.cpp    ekf_G    ekf_trace.cpp
 ./ekf_G    --direct > var_G_direct.txt
 ```
 
-`--direct` 才打内部 `x_`，负半径只在内部看得见（`:677-678` 上报前已经 `std::max(0.0, ...)`）。
+`--direct` 才打内部 `x_`，负半径只在内部看得见（`:912-913` 上报前已经 `std::max(0.0, ...)`）。
 没有 `--fast`：必须真睡够帧间隔，否则 `ekf_predict` 内部量到的 latency 会被截到 0.2 s。
