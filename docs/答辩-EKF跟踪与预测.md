@@ -318,7 +318,7 @@ Q(Radius1, Radius1) = radius_variance;
 Q(Radius2, Radius2) = radius_variance;
 ```
 
-给半径一点自由度是为了防止滤波器把它「冻死」在初值上；`radius_variance_floor_m2 = 9e-8`（即 0.3 mm 的平方）是下限，`dt` 很小时靠它兜底。
+**2026-10-21 起半径不再是待估量**：`min_radius_m = max_radius_m = initial_radius_m = 0.273`，`clampRadii` 每帧把它夹回这个常量，`initial_radius_std_m` 降到 0.003，免得协方差与钳位互相矛盾。这一段 `Q` 仍逐帧计算、仍写进协方差，但半径方向被钳位压住，不再漂。原因是单板帧里半径与车心径向严格不可辨识（`δr = ε`、`δc = -ε·r` 给出同一个板心），放开它只会让 r 滑到边界，再靠 `clampRadii` 平移车心维持自洽，车心因此每帧多出几厘米的位移。`radius_variance_floor_m2 = 9e-8`（即 0.3 mm 的平方）在 166 fps 下是主导项：`radius_drift_m² · dt²` 只有 1.4e-8，比它小一个数量级。
 
 ### 这些数从哪来
 
@@ -998,8 +998,8 @@ if (!predictionIsFinite(result)) {
 | `plate_spacing_rad` | 90° | 相邻板夹角，前哨站 120° |
 | `accel_noise_m_s2` | 6.0 | `Q` 的中心三轴加速度强度 |
 | `angular_accel_noise_rad_s2` | 12.0 | `Q` 的车体角加速度强度 |
-| `radius_drift_m` | 0.02 | 半径随机游走强度 |
-| `radius_variance_floor_m2` | 9e-8 | 半径过程噪声下限，(0.3 mm)² |
+| `radius_drift_m` | 0.02 | 半径随机游走强度，2026-10-21 起被钳位压住，实际不起作用 |
+| `radius_variance_floor_m2` | 9e-8 | 半径过程噪声下限，(0.3 mm)²，166 fps 下的主导项 |
 | `lateral_noise_scale` / `base_m` | 0.002 / 0.005 | 观测横向噪声 `sigma = 0.002 d + 0.005` |
 | `depth_noise_scale` / `base_m` | 0.010 / 0.010 | 观测深度噪声 `sigma = 0.010 d + 0.010` |
 | `jump_gate_m` | 0.6 | 物理跳变闸 |
@@ -1017,6 +1017,8 @@ if (!predictionIsFinite(result)) {
 | `stable_radius_std_m` | 0.05 | 半径标准差上限 |
 | `stable_yaw_std_rad` | 0.10 | yaw 标准差上限 |
 | `initial_radius_m` | 0.273 | 初始化半径，2026-10-20 靶车实测 |
+| `initial_radius_std_m` | 0.003 | 初始半径标准差，半径已钳成常量，这个数只保证协方差与钳位不矛盾 |
+| `min_radius_m` / `max_radius_m` | 0.273 / 0.273 | 上下界相等，半径是常量而不是待估量（2026-10-21） |
 | `muzzle_offset_m` | 0.0741 | 枪口相对云台 P 轴原点的前移量，弹道输入从枪口量起。来源外参 handout，**不是调参旋钮** |
 | `max_step_s` | 0.5 | `predict` 的 `dt` 上限 |
 | `max_latency_s` | 0.2 | 单帧延迟上限 |
@@ -1198,6 +1200,8 @@ R = diag(depth², lateral², lateral²)
 这句话的适用边界用纯几何量过（`testrig/plate_visibility_geometry.cpp`，扫 20000 个朝向、距离 1 到 8 m）：锥角 92 度以内，任何距离都只有一块；锥角到 94 度时，8 m 处有 1.5% 的朝向能同时看到两块。所以「最多一块」是**锥角不超过约 93 度**时的性质，不是无条件成立。
 
 ### 12.6.2 两个半径只要目标在转，都会收敛
+
+**这一小节是 2026-10-14 放开半径时测的，2026-10-21 起半径已钳成常量（`min_radius_m = max_radius_m = 0.273`），下面这张表描述的现象不再发生，保留它只为说明「半径可辨识」需要什么条件。**
 
 `H.col(radiusIndex(i))`（`ArmorEkf.cpp:211`）是雅可比里唯一非零的半径列，一条观测只修得动一个奇偶的半径。但可见槽位随车体旋转轮换，两个半径都会陆续拿到观测：
 

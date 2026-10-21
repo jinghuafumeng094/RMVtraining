@@ -223,6 +223,10 @@ void testNisMeanReachesPrediction() {
         truth.center = Eigen::Vector3d(4.0, 0.3, 0.6);
         truth.yaw = 0.4;
         truth.yaw_rate = 2.0;
+        // 半径钉成常量之后，夹具也必须用同一个半径，否则干净观测下残差里
+        // 混进 3 cm 的模型偏差，NIS 就不再是"只剩线性化误差"。
+        truth.radius1 = config.initial_radius_m;
+        truth.radius2 = config.initial_radius_m;
         double timestamp = 0.0;
         for (int frame = 0; frame < 800; ++frame) {
             timestamp += dt;
@@ -504,6 +508,11 @@ void testNoiselessConvergence() {
     truth.velocity = Eigen::Vector3d(0.5, -0.2, 0.0);
     truth.yaw = 0.4;
     truth.yaw_rate = 2.0;
+    // 2026-10-21 起半径钉成常量（min = max = initial_radius_m），不再是待估量。
+    // 夹具必须用同一个半径，否则模型复现不了自己生成的观测，这条用例会变成在
+    // 测钳位，而不是测收敛。
+    truth.radius1 = config.initial_radius_m;
+    truth.radius2 = config.initial_radius_m;
 
     const double dt = 1.0 / 165.0;
     for (int frame = 0; frame < 2400; ++frame) {
