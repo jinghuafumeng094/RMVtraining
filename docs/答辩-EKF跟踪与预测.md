@@ -1285,7 +1285,7 @@ yaw 为什么不可观测：相机只看得到板，看不到车心。车心由�
 
 # 十三、复现与自测工具
 
-`ArmorEkf` 不依赖相机和串口，可以被仓库外的工具直接构造驱动。现有工具在 `~/workplace/rm_autoaim_testrig/`（不进提交）：
+`ArmorEkf` 不依赖相机和串口，可以被仓库外的工具直接构造驱动。现有工具在 `~/workplace/rm_autoaim_testrig-hxr/`（不进提交）：
 
 | 工具 | 用途 |
 |---|---|
@@ -1298,7 +1298,7 @@ yaw 为什么不可观测：相机只看得到板，看不到车心。车心由�
 **`ekf_trace` 必须真睡够帧间隔**，没有 `--fast`：`ekf_predict` 内部用 `steady_clock` 现取「现在」减帧时间戳当处理延迟，伪造时间戳会让它量出 0.2 秒（clamp 上限），预测时长整条时间线都是错的。
 
 ```bash
-bash ~/workplace/rm_autoaim_testrig/build_ekf_trace.sh
+bash ~/workplace/rm_autoaim_testrig-hxr/build_ekf_trace.sh
 ./ekf_trace --direct
 ```
 
