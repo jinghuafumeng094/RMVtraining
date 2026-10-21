@@ -25,7 +25,7 @@ struct Truth {
     Eigen::Vector3d velocity{0.0, 0.0, 0.0};
     double yaw{0.0};
     double yaw_rate{0.0};
-    // 2026-10-20 靶车实测旋转中心到板心 27.3 cm，四块板近似等大。夹具留一点
+    // 靶车旋转中心到板心 30.3 cm（PnP 口径，卷尺 27.3 偏小 10.9%），四块板近似等大。夹具留一点
     // 不等，是为了让两个半径各自的观测性在这些用例里也能被测到；两个数都必须
     // 落在 Config 的物理范围内，否则 clamp 会先把真值吃掉。
     double radius1{0.30};
@@ -566,7 +566,7 @@ void testTwoPlateVehicleObservesRadiusTwo() {
     config.plate_count = 2;
     config.plate_spacing_rad = kPi;
     // 本用例验两个半径各自的观测性。半径差是弱可观测方向，信噪比靠差值本身
-    // 撑起来：产线真车 27.3 cm 的半径差只有几毫米，比 5 cm 量级的深度噪声
+    // 撑起来：产线真车 30.3 cm 的半径差只有几毫米，比 5 cm 量级的深度噪声
     // 还小，24000 帧内学不出来。这里用一辆 0.30/0.19 的大车，先验和过程
     // 噪声也放回旧值，保持原有帧数与 1e-4 的收敛预算。
     config.initial_radius_m = 0.25;
@@ -1030,7 +1030,7 @@ void testGimbalRotationIsNotTargetMotion() {
 
     const double dt = 1.0 / 165.0;
     // 半径与偏航是弱可观测方向，收敛速度随半径变大而变慢。半径 9.75 cm 时
-    // 500 帧的 yaw_rate 残差已经远低于 1e-6；半径按实测改成 27.3 cm 后，
+    // 500 帧的 yaw_rate 残差已经远低于 1e-6；半径改成 30.3 cm 后，
     // 500 帧只到 4.2e-6，1500 帧降到 6.6e-9，留出三个数量级余量。
     for (int frame = 0; frame < 1500; ++frame) {
         const double t = static_cast<double>(frame) * dt;
@@ -1174,7 +1174,7 @@ void testNegativePredictionBiasIsHonored() {
     const double d_later = later.target_yaw - none.target_yaw;
     const double d_earlier = earlier.target_yaw - none.target_yaw;
     // 同样 30 ms 的 bias 推出的角度正比于瞄准点的切向速度。半径按实测
-    // 27.3 cm 取值后，板随车转的那一份速度约为旧几何 9.75 cm 时的三倍，
+    // 30.3 cm 取值后，板随车转的那一份速度约为旧几何 9.75 cm 时的三倍，
     // 角度差仍远大于数值噪声。阈值保持 5e-4。
     assert(std::fabs(d_later) > 5e-4);
     assert(std::fabs(d_earlier) > 5e-4);
