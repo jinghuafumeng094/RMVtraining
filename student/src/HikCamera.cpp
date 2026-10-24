@@ -13,7 +13,7 @@ namespace {
 // 曝光和增益都手动。自动曝光的目标亮度由相机自己定，灯一变整幅图的灰度跟着变，
 // 下游那些固定颜色阈值会被拖垮。
 constexpr float    kExposureUs     = 5000.0F;   // 曝光时间，微秒
-constexpr float    kGainDb         = 0.0F;      // 增益，dB
+constexpr float    kGainDb         = 6.0F;      // 增益，dB
 constexpr unsigned kGrabTimeoutMs  = 1000;      // 单帧等待上限
 constexpr int      kFailStreakLimit = 5;        // 连败几次就重开相机
 
@@ -231,10 +231,16 @@ bool HikCamera::grab(cv::Mat& pic) {
         return false;
     }
 
-    // clone 是必须的：bgr 是栈上临时缓冲，出了这个函数就没了。
-    pic = cv::Mat(static_cast<int>(h), static_cast<int>(w), CV_8UC3,
-                  bgr.data())
-              .clone();
+    // 相机在车上倒装，画面转 180 度正过来。
+    // 转整幅图不是镜像，手性不变，相机系仍是 x 右、y 下：
+    // config/camera.yaml 的 rotation_camera_to_gimbal 不用动，
+    // 绕光轴转也不挪光心，translation_camera_to_gimbal 同样不用动。
+    // 主点随画面一起转，cx' = w-1-cx、cy' = h-1-cy，yaml 已按翻转后的值写入；
+    // 径向畸变在 (x, y) -> (-x, -y) 下不变，切向项 p1 = p2 = 0，畸变向量不用改。
+    // cv::rotate 自己分配并写入 pic，原来那次 clone 省掉了，不多一次拷贝。
+    const cv::Mat wrapped(static_cast<int>(h), static_cast<int>(w), CV_8UC3,
+                          bgr.data());
+    cv::rotate(wrapped, pic, cv::ROTATE_180);
     failStreak_ = 0;
     return true;
 }

@@ -32,11 +32,9 @@ struct Truth {
     double radius2{0.285};
 };
 
-// 板高一律取 0，走共面这一支，与 config 的出厂默认一致。
-// 实车不是共面：标准步兵相对的两块等高、相邻两块有高差，也就是 0/2 共用一个
-// 高度、1/3 共用另一个，与 r1/r2 的奇偶配对同一套（armor/src/Planner.cpp:223-226
-// 的 z0=z2、z1=z3）。这里取 0 只是让断言避开"板环整体挪两格"的等价关系，
-// 不是在声明实车共面；上车的真实高差要另外量。
+// 板高一律取 0，走共面这一支，让断言避开"板环整体挪两格"的等价关系。
+// 这不是在声明实车共面：四块板可以各不相等，真实高差要另外量。取 0 也不用
+// 担心和 config 的出厂默认一致，夹具里用的是 testHeights() 自己的表。
 // 以前这里给 2 号板 0.15 m 的抬高，目的是打破同一层的等价关系，好让 theta_c
 // 的断言有唯一解。实测这个抬高在真实可见性下会把收敛拖慢到几千帧、还随起始
 // 朝向时好时坏，而它想解决的"板环等价"本来就该在断言里避开，不该靠改物理
@@ -240,7 +238,7 @@ void testNisMeanReachesPrediction() {
     };
 
     const float clean = run(0.0);
-    const float perturbed = run(0.02);
+    const float perturbed = run(0.004);
 
     // 干净观测下残差只剩线性化误差，远小于滤波器自己声明的 R；
     // 实测这个量在 1e-6 量级，界留得很宽。
@@ -317,6 +315,10 @@ void testBestNisReachesPrediction() {
     Truth truth;
     truth.center = Eigen::Vector3d(4.0, 0.3, 0.6);
     truth.yaw = 0.4;
+    // 半径钉成常量之后，夹具必须与模型取同一个值。差两厘米的模型偏差会
+    // 直接进残差，干净帧的 best_nis 就不再是"只剩线性化误差"。
+    truth.radius1 = config.initial_radius_m;
+    truth.radius2 = config.initial_radius_m;
 
     double timestamp = 0.0;
     for (int frame = 0; frame < 60; ++frame) {
@@ -333,8 +335,8 @@ void testBestNisReachesPrediction() {
     assert(clean.best_nis >= 0.0F);
     assert(clean.best_nis < 1.0F);
 
-    // 把 0 号板的观测横向推开 0.12 m。4 m 处横向标准差约 13 mm，NIS 约 85，
-    // 越过 nis_gate 11.34；同时远小于 jump_gate 0.6 m，走的确实是统计闸而不是
+    // 把 0 号板的观测横向推开 0.12 m。4 m 处横向标准差约 3 mm，NIS 远在
+    // nis_gate 11.34 之上；同时远小于 jump_gate 0.6 m，走的确实是统计闸而不是
     // 物理闸。相邻槽位在 2r 之外，残差更大，最近槽位不会换。
     const Eigen::Vector3d plate =
         ArmorEkf::worldToGimbal(0.0) * truePlateWorld(truth, 0, config);
@@ -1147,7 +1149,13 @@ void testInitializationTakesOneObservationPerFrame() {
 // clamp 截断。若只给 1 ms 的 latency，负 bias 会被总时长夹到 0，
 // 这时测到的是"被夹住"而不是"被吃掉"，分不清是哪种毛病。
 void testNegativePredictionBiasIsHonored() {
-    const ArmorEkf::Config config = testConfig();
+    ArmorEkf::Config config = testConfig();
+    // 相邻两块板在云台系里的方位角只差 r/d，比出厂 aim_switch_margin_rad
+    // 还小；正负 30 ms 的 bias 在 2 rad/s 下把预测位姿转了 0.12 rad，足以
+    // 让瞄准板在两者之间翻。翻了以后三次预测瞄的不是同一块板，target_yaw
+    // 的差就混进了换板跳变，符号断言失效。把迟滞余量放到 1 rad，瞄准板
+    // 只在当前这块转出可见锥时才换，本用例只验 bias 的符号。
+    config.aim_switch_margin_rad = 1.0;
 
     auto convergeAndPredict = [&config](double bias) {
         ArmorEkf filter(config);
@@ -1156,6 +1164,10 @@ void testNegativePredictionBiasIsHonored() {
         truth.velocity = Eigen::Vector3d(0.6, 0.0, 0.0);
         truth.yaw = 0.3;
         truth.yaw_rate = 2.0;
+        // 半径已钉成常量，真值必须与模型取同一个数。差几毫米时平衡点会
+        // 随 R 的权重移动，平衡点在瞄准格里的位置一变，断言就跟着变。
+        truth.radius1 = config.initial_radius_m;
+        truth.radius2 = config.initial_radius_m;
         const double dt = 1.0 / 165.0;
         // 自转 2 rad/s 时实测第 134 帧进 Stable，800 帧留了余量。
         for (int frame = 0; frame < 800; ++frame) {
