@@ -562,6 +562,10 @@ bool ArmorEkf::associateAndUpdate(const ArmorPose& observation, double gimbal_ya
     }
     if (best_nis > config_.nis_gate) {
         ++rejected_count_;  // 统计闸：卡方 (3, 99%) 分位点
+        // 位置被拒只说明模型位置与这块板对不上，推不出偏航也是错的。
+        // 偏航是本帧唯一一条独立观测，丢掉它 YawRate 就只剩过程噪声外推，
+        // 车心再通过 Vx/Vy 被一路拖走。所以位置状态不动，偏航照常更新。
+        updateYaw(observation, best_index, gimbal_yaw);
         return false;
     }
 
@@ -576,31 +580,7 @@ bool ArmorEkf::associateAndUpdate(const ArmorPose& observation, double gimbal_ya
          K * R * K.transpose();
     x_[Yaw] = wrapToPi(x_[Yaw]);
 
-    // 第四条观测：板面法向的偏航角。板面朝外，法向是板心径向的反向，云台系里
-    // 它的方位角是 pi - (Yaw + i * spacing + gimbal_yaw)，对 Yaw 的偏导恒为 -1。
-    // 只更新 Yaw 一个分量，按标量卡尔曼做，Joseph 形式保住正定性。
-    // 不进 NIS 窗口：那是三维卡方的统计量，掺一条一维观测均值就不再是 3。
-    if (std::isfinite(observation.armor_yaw)) {
-        const double psi = x_[Yaw] + static_cast<double>(best_index) *
-                                           config_.plate_spacing_rad;
-        const double predicted_yaw = wrapToPi(kPi - (psi + gimbal_yaw));
-        const double yaw_residual = wrapToPi(observation.armor_yaw - predicted_yaw);
-        const double yaw_noise_variance =
-            config_.armor_yaw_noise_rad * config_.armor_yaw_noise_rad;
-        const double yaw_variance = P_(Yaw, Yaw) + yaw_noise_variance;
-        if (std::fabs(yaw_residual) <= config_.armor_yaw_gate_rad &&
-            yaw_variance > 0.0) {
-            const Eigen::Matrix<double, 10, 1> yaw_gain = -P_.col(Yaw) / yaw_variance;
-            Eigen::Matrix<double, 1, 10> yaw_row = Eigen::Matrix<double, 1, 10>::Zero();
-            yaw_row[Yaw] = -1.0;
-            const Covariance yaw_identity_minus_kh =
-                Covariance::Identity() - yaw_gain * yaw_row;
-            P_ = yaw_identity_minus_kh * P_ * yaw_identity_minus_kh.transpose() +
-                 yaw_gain * yaw_noise_variance * yaw_gain.transpose();
-            x_ += yaw_gain * yaw_residual;
-            x_[Yaw] = wrapToPi(x_[Yaw]);
-        }
-    }
+    updateYaw(observation, best_index, gimbal_yaw);
 
     // 半径是估计量，但必须落在车体几何可能的范围里。夹的同时把车心对齐，
     // 保证这块板的模型位置仍然等于刚吃下的观测。
@@ -614,6 +594,37 @@ bool ArmorEkf::associateAndUpdate(const ArmorPose& observation, double gimbal_ya
     updated_this_frame_ = true;
     recordNis(best_nis);
     return true;
+}
+
+// 第四条观测：板面法向的偏航角。板面朝外，法向是板心径向的反向，云台系里
+// 它的方位角是 pi - (Yaw + i * spacing + gimbal_yaw)，对 Yaw 的偏导恒为 -1。
+// 只更新 Yaw 一个分量，按标量卡尔曼做，Joseph 形式保住正定性。
+// 不进 NIS 窗口：那是三维卡方的统计量，掺一条一维观测均值就不再是 3。
+// 闸是 armor_yaw_gate_rad，与位置那条 NIS 闸各管各的。
+void ArmorEkf::updateYaw(const ArmorPose& observation, int armor_index,
+                         double gimbal_yaw) {
+    if (!std::isfinite(observation.armor_yaw)) {
+        return;
+    }
+    const double psi =
+        x_[Yaw] + static_cast<double>(armor_index) * config_.plate_spacing_rad;
+    const double predicted_yaw = wrapToPi(kPi - (psi + gimbal_yaw));
+    const double yaw_residual = wrapToPi(observation.armor_yaw - predicted_yaw);
+    const double yaw_noise_variance =
+        config_.armor_yaw_noise_rad * config_.armor_yaw_noise_rad;
+    const double yaw_variance = P_(Yaw, Yaw) + yaw_noise_variance;
+    if (std::fabs(yaw_residual) > config_.armor_yaw_gate_rad || yaw_variance <= 0.0) {
+        return;
+    }
+    const Eigen::Matrix<double, 10, 1> yaw_gain = -P_.col(Yaw) / yaw_variance;
+    Eigen::Matrix<double, 1, 10> yaw_row = Eigen::Matrix<double, 1, 10>::Zero();
+    yaw_row[Yaw] = -1.0;
+    const Covariance yaw_identity_minus_kh =
+        Covariance::Identity() - yaw_gain * yaw_row;
+    P_ = yaw_identity_minus_kh * P_ * yaw_identity_minus_kh.transpose() +
+         yaw_gain * yaw_noise_variance * yaw_gain.transpose();
+    x_ += yaw_gain * yaw_residual;
+    x_[Yaw] = wrapToPi(x_[Yaw]);
 }
 
 // ---------------------------------------------------------------------------
@@ -885,6 +896,8 @@ PredictionResult ArmorEkf::buildPrediction(const GimbalState& gimbal, double lat
         index_target_id_[static_cast<std::size_t>(aim_index)];
     result.target_id = aim_target_id != 0 ? aim_target_id : target_id_;
     result.aim_index = aim_index;
+    result.aim_plate_height_m = static_cast<float>(
+        config_.plate_height_m[static_cast<std::size_t>(aim_index)]);
     result.hit_streak = hit_streak_;
     result.miss_count = miss_count_;
     result.rejected_count = rejected_count_;

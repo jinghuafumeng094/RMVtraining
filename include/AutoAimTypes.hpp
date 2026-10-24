@@ -95,6 +95,9 @@ struct PredictionResult {
     // hit_streak 与 miss_count 分别是连续命中、连续无有效观测的帧数，二者互斥；
     // rejected_count 是累计被离群闸挡下的观测条数。
     int aim_index{-1};
+    // 当前瞄准那块板的板心高度，相对车心，单位米。Web Debug 的派生角要用它，
+    // 这样板高表只在 ArmorEkfConfig 里存一份。aim_index 为 -1 时无意义。
+    float aim_plate_height_m{0.0F};
     int hit_streak{0};
     int miss_count{0};
     int rejected_count{0};

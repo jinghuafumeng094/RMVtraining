@@ -4,6 +4,7 @@
 #include "StudentTasks.hpp"
 #include "WebLogger.hpp"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -225,6 +226,24 @@ void logPrediction(const PredictionResult& result) {
     const double to_slot0_azimuth = std::atan2(-slot0_y, slot0_x);
     WEB_LOG("ekf_plate0_parallax_rad",
             std::remainder(to_slot0_azimuth - to_center_azimuth, 2.0 * kPi));
+
+    // 四、第一条在竖直面里的同一个角。顶点仍在敌车旋转中心，一条边指向当前瞄准的
+    // 那块板，另一条指向我方云台原点，两条各取仰角再相减。
+    // 板心相对车心的仰角 atan2(板高, 半径) 只取决于这是第几块板，瞄点一换整段跳，
+    // 所以这条是四级矩形波，台阶高度约为相邻两块板的高度差除以半径。
+    // 这一条必须用 aim_index，跟第一条正好相反：不跟着瞄点走，它就退化成一条常数线。
+    // 段内是斜坡而不是平台，说明车心高度在漂，斜率对应 ekf_vz_m_s 的误差。
+    // 取带符号的差，板心低于云台原点时值为负，四级台阶的先后顺序因此也看得出来。
+    // 板高从 result 里取，出处仍是 ArmorEkfConfig::plate_height_m，不在本文件另抄一份。
+    if (result.aim_index >= 0) {
+        const double plate_radius =
+            result.aim_index % 2 == 0 ? result.radius_1_m : result.radius_2_m;
+        const double plate_elevation =
+            std::atan2(result.aim_plate_height_m, plate_radius);
+        const double me_elevation = std::atan2(
+            -result.center_z_m, std::hypot(result.center_x_m, result.center_y_m));
+        WEB_LOG("ekf_plate_me_pitch_rad", plate_elevation - me_elevation);
+    }
 }
 
 // 相机侧的两个量，与上面那一组的关键区别是不经过滤波器。
@@ -277,6 +296,29 @@ void logMeasYawRate(const std::vector<ArmorPose>& observations,
 
     WEB_LOG("armor_orientation_yaw", chosen->armor_yaw);
     WEB_LOG("ekf_meas_yaw_rate_rad_s", rate);
+}
+
+// 网页俯视图的蓝色框：本帧每一块解出位姿的板，位置和板背方位角。
+//
+// 位置保持云台系，不在这里换世界坐标。俯视图的 --camera 模式已经有一条
+// 从云台系到世界系的换算路径，两处各算一遍迟早会不一致；这里只负责把
+// 原始观测送出去，由 target_topdown_ui 统一换算。
+//
+// 每帧都写 obs_count，没有观测时写 0，把上一帧的蓝框清掉，否则屏幕上会
+// 留着已经丢掉的板。上限取 4，是哨兵车能同时看到的板数上限，同时也是
+// 序号只用一位数字的前提，超出部分不画。
+constexpr int kMaxLoggedObservations = 4;
+
+void logObservations(const std::vector<ArmorPose>& observations) {
+    const int count = std::min(static_cast<int>(observations.size()),
+                               kMaxLoggedObservations);
+    WEB_LOG("obs_count", static_cast<double>(count));
+    for (int i = 0; i < count; ++i) {
+        const ArmorPose& observation = observations[static_cast<std::size_t>(i)];
+        WEB_LOG("obs" + std::to_string(i) + "_x", observation.position_gimbal_m[0]);
+        WEB_LOG("obs" + std::to_string(i) + "_y", observation.position_gimbal_m[1]);
+        WEB_LOG("obs" + std::to_string(i) + "_yaw", observation.armor_yaw);
+    }
 }
 
 // main 中启动线程前先同步读一帧，保持参考工程的初始化顺序。
@@ -579,6 +621,9 @@ void *OperationFunction(void *arg) {
         logPrediction(prediction_valid ? prediction : PredictionResult{});
         // 传采集时刻，不是帧间隔：缺观测的帧要把时间摊到下一帧的分母里。
         logMeasYawRate(observations, gimbal, time_stamp);
+        // 放在后面：obs 的序号来自本帧的 observations，而换算世界坐标要用的
+        // gimbal_yaw 由 logMeasYawRate 打点，同一条 SSE 消息里先到云台角。
+        logObservations(observations);
 
         // 4. 将结果写回原 64 字节结构体。
         writeFrame(*serialPort, translator);

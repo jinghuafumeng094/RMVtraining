@@ -85,7 +85,22 @@ public:
         double plate_spacing_rad{1.5707963267948966};  // 90 度
 
         // 过程噪声，按随机加速度模型离散化。
-        double accel_noise_m_s2{6.0};               // 旋转中心三轴加速度标准差
+        //
+        // 6.0 是 2026-10-22 初调时定的，当时 R 的横向 sigma 只有 3 mm，滤波器
+        // 在噪声里找速度，这个数只能调大到压不住。R 按实测重标之后（见下面
+        // observationNoise 那一组），v1.avi 上一档一档量下来。
+        // 指标取"被接受的帧"上的车心帧间跳变，被拒帧保留预测、本来就不跳；
+        // 统计口径见 trace_stats2。
+        //   sigma_a  拒收  Stable  跳变p50  p90    p99   速度跳变p50  |v|p50
+        //   6.0      37%    209    22.4 mm  68.3  225.5    71.1 mm/s   2.27
+        //   3.0      38%    179    18.6 mm  68.3  285.4    51.6 mm/s   1.33
+        //   1.5      39%    207    18.4 mm  63.1  218.8    37.7 mm/s   1.35
+        //   0.8      41%    210    17.1 mm  61.7  218.8    33.2 mm/s   1.02
+        // 靶车静止，2 m/s 以上的速度全是噪声。1.5 比 6.0 在位置、速度两处都
+        // 平滑，Stable 帧数持平；3.0 那一档实测偏噪（|omega| 中位 2.07 而相邻
+        // 两档是 1.05 与 0.82），单次抽到的不是趋势。0.8 再往下只剩 6% 的
+        // 收益、拒收涨到 41%，取 1.5。
+        double accel_noise_m_s2{1.5};               // 旋转中心三轴加速度标准差
         double angular_accel_noise_rad_s2{12.0};    // 车体 yaw 角加速度标准差
         // 半径已在车上量过，只剩几毫米的装配与量法误差，随机游走给到
         // 0.12 mm/帧即可；166 fps 下真正生效的是下面的下限。
@@ -94,16 +109,19 @@ public:
 
         // 观测噪声 sigma = scale * 距离 + base，横向与深度分开。
         //
-        // 横向取 0.0005 / 0.001，2026-10-22 在车上两轮收紧后定下：1.28 m 处
-        // sigma 1.64 mm，1.85 m 处 1.93 mm。实测角点抖动 1.41 px 在 1.85 m
-        // 折合 1.46 mm，余量不到 1.4 倍，已经贴着量测精度。
-        // 再往下收就会撞上进 Stable 的第三条闸：收紧后 ekf_nis_mean 锯齿顶到
-        // 8.14 / 8.16，而 nis_mean_gate 是 8.0。要继续收 R 就得同时动那个闸。
-        // 深度未动，仍是 0.010 / 0.010。横向收窄后 NIS 几乎只由横向两轴决定，
-        // 深度轴对 NIS 基本失明，深度要另找判据。
-        double lateral_noise_scale{0.0005};
-        double lateral_noise_base_m{0.001};
-        double depth_noise_scale{0.010};
+        // 标定口径是 PnP 板心到板心的实测离散，不是角点像素抖动的折算值。
+        // 2026-10-24 在 v1.avi 上逐轴量相邻帧同板板的板心差、再除以 sqrt(2)：
+        // 3.96 m 处深度 62 mm、横向 22 mm、竖直 12 mm，靶车静止（整段板心斜率
+        // 0.01 m/s）。旧值 0.0005 / 0.001 是在车上按角点 1.41 px 折算来的，
+        // 只覆盖了亚像素定位噪声，漏掉了双解翻转、角点归属错、板模型误差这些
+        // 端到端成分，横向因此小了 7 倍。后果是滤波器逐帧照抄测量，同一个真实
+        // 新息算出的 NIS 被放大，v1 上 58% 的帧被闸拒掉。
+        //
+        // 竖直与横向同取一个值：观测噪声里两轴的物理来源不同，但 R 在云台系里
+        // 本来就是对角阵，真要分开就是再加一组键，眼下没有分开的依据。
+        double lateral_noise_scale{0.004};
+        double lateral_noise_base_m{0.002};
+        double depth_noise_scale{0.013};
         double depth_noise_base_m{0.010};
 
         // 离群观测量闸门。
@@ -280,6 +298,9 @@ private:
 
     bool tryInitialize(const ArmorPose& observation, double gimbal_yaw);
     bool associateAndUpdate(const ArmorPose& observation, double gimbal_yaw);
+    // 板面法向的偏航是一条与板心位置独立的观测，按标量卡尔曼只更新 Yaw。
+    // 位置更新被 NIS 闸拒掉时也照样调用，见 associateAndUpdate 里的说明。
+    void updateYaw(const ArmorPose& observation, int armor_index, double gimbal_yaw);
     // 把一帧板心喂进初始化窗口，返回窗口是否已经攒够。
     bool accumulateInitWindow(const Eigen::Vector3d& plate_world);
     // 按一块世界系板心反推旋转中心，建起滤波器。初始化与跳闸外重建共用。

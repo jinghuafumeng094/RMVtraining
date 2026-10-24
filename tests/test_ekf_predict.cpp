@@ -181,6 +181,17 @@ void feedFrame(ArmorEkf& filter, const ArmorEkf::Config& config, const Truth& tr
     }
 }
 
+// 六个均匀分布之和减 3，方差 0.5，再乘 sqrt(2) 就是单位方差。
+// 用 LCG 而不是 <random>：同一个种子永远得到同一串数，断言不会偶发。
+double pseudoNormal(unsigned& state) {
+    double sum = 0.0;
+    for (int i = 0; i < 6; ++i) {
+        state = state * 1664525u + 1013904223u;
+        sum += static_cast<double>(state >> 8) / 16777216.0;
+    }
+    return (sum - 3.0) * std::sqrt(2.0);
+}
+
 GimbalState makeGimbal(double yaw, double pitch, double bias = 0.0) {
     GimbalState gimbal;
     gimbal.yaw = static_cast<float>(yaw);
@@ -741,6 +752,109 @@ void testArmorYawObservationPinsBodyYaw() {
     std::printf("[ekf] armor_yaw 钉偏航 误差 %.4f rad\n", error);
     assert(error < 0.03);
     std::printf("[ekf] armor_yaw 钉住车体偏航 通过\n");
+}
+
+// 位置新息撞 NIS 闸被拒掉的帧，板面偏航照样是一条独立观测，必须更新。
+//
+// 板上量到的 armor_yaw 与板心位置是两条独立信息：位置对不上只说明模型位置
+// 与这块板不符，推不出偏航也是错的。偏航角速度没有别的观测量，被拒帧把这一条
+// 一起丢掉之后，YawRate 只能靠过程噪声外推，而车心又通过 Vx/Vy 跟着漂。
+//
+// 判据：这条观测的 3D 新息必须真的超过 nis_gate，也就是 update 返回 false 且
+// 板心残差仍在 jump_gate_m 以内（0.15 m 对 0.6 m），排除跳变闸与重投影两条
+// 提前返回；此后 Yaw 仍要朝观测方向动。
+void testYawUpdatesOnNisRejectedFrame() {
+    const ArmorEkf::Config config = testConfig();
+    ArmorEkf filter(config);
+
+    Truth truth;
+    truth.center = Eigen::Vector3d(4.0, 0.0, 0.5);
+    truth.yaw = kPi;
+    truth.yaw_rate = 0.0;
+    truth.radius1 = config.initial_radius_m;
+    truth.radius2 = config.initial_radius_m;
+
+    const Eigen::Vector3d plate = truePlateWorld(truth, 0, config);
+    const double dt = 1.0 / 165.0;
+    double timestamp = 0.0;
+    for (int frame = 0; frame < 20; ++frame) {
+        timestamp += dt;
+        filter.predict(dt);
+        filter.update(makeObservation(plate, 1, trueArmorYaw(truth, 0, config, 0.0)), 0.0);
+        filter.advanceStateMachine(timestamp);
+    }
+    assert(filter.status() != TrackingState::NoTarget);
+
+    const double yaw_before = filter.state()[ArmorEkf::Yaw];
+    const double predicted_yaw = ArmorEkf::wrapToPi(kPi - yaw_before);
+    // 离预测 0.45 rad，仍在 armor_yaw_gate_rad 0.5 之内，位置关联也不受影响。
+    const double bad_yaw = ArmorEkf::wrapToPi(predicted_yaw + 0.45);
+    // 沿视线挪近 0.45 m。4 m 处深度噪声 sigma = 0.05 m，单轴新息就是 9 个 sigma，
+    // 这条观测必然撞 NIS 闸。横向不能挪：横向 sigma 只有 0.003 m，挪 0.1 m 就
+    // 离旁边的板更近，关联会改槽位；沿视线挪 0.45 m 时另外三块都在跳变闸外。
+    const Eigen::Vector3d bad_position = plate + Eigen::Vector3d(-0.45, 0.0, 0.0);
+
+    timestamp += dt;
+    filter.predict(dt);
+    const bool accepted = filter.update(makeObservation(bad_position, 1, bad_yaw), 0.0);
+    const double yaw_after = filter.state()[ArmorEkf::Yaw];
+    const double moved = ArmorEkf::wrapToPi(yaw_after - yaw_before);
+
+    std::printf("[ekf] 被拒帧的偏航位移 %.5f rad，accepted=%d\n", moved, accepted ? 1 : 0);
+    assert(!accepted);
+    // 预测的板面偏航是 pi - Yaw - gimbal_yaw，随 Yaw 递减；观测偏大 0.45，
+    // 所以 Yaw 必须朝小的方向动，而且不是只差一个浮点零。
+    assert(moved < -1e-3);
+}
+
+// 观测噪声 R 必须与实测噪声同量级。R 填小了，滤波器会几乎逐帧照抄测量，
+// 输出跟着测量抖；同一个真实新息算出的 NIS 被放大，一多半的帧还会被闸掉，
+// 拒收段结束那一下再硬拉回来。v1.avi 上单观测帧逐轴量到的板心噪声
+// （相邻帧差的标准差除以 sqrt(2)，3.96 m 处）：深度 62 mm、横向 22 mm、竖直 12 mm。
+// 相机的竖直方向对准的是板的竖直棱，所以比横向准。
+//
+// 这里用同量级的噪声喂一条静止靶车的观测序列，要求稳态下的接受率不低于 90%。
+// 接受率是 R 标定的直接后果：R 偏小，NIS 中位数就越过闸门，接受率掉下来。
+void testMeasurementNoiseMatchesObservation() {
+    const ArmorEkf::Config config = testConfig();
+    ArmorEkf filter(config);
+    Truth truth;
+    truth.center = Eigen::Vector3d(4.0, 0.0, 0.5);
+    truth.velocity = Eigen::Vector3d::Zero();
+    truth.yaw = kPi;
+    truth.radius1 = config.initial_radius_m;
+    truth.radius2 = config.initial_radius_m;
+    const double dt = 1.0 / 166.0;
+    const double sigma[3] = {0.062, 0.022, 0.012};
+    unsigned rng = 20261024u;
+    double timestamp = 0.0;
+    int counted = 0;
+    int accepted = 0;
+    for (int frame = 0; frame < 400; ++frame) {
+        timestamp += dt;
+        filter.predict(dt);
+        Eigen::Vector3d z = truePlateWorld(truth, 0, config);
+        for (int axis = 0; axis < 3; ++axis) {
+            z[axis] += sigma[axis] * pseudoNormal(rng);
+        }
+        const bool ok = filter.update(
+            makeObservation(z, 1, trueArmorYaw(truth, 0, config, 0.0)), 0.0);
+        if (frame >= 100) {  // 前 100 帧留给初始化与收敛
+            ++counted;
+            accepted += ok ? 1 : 0;
+        }
+        filter.advanceStateMachine(timestamp);
+    }
+    const double rate = static_cast<double>(accepted) / static_cast<double>(counted);
+    const double speed = std::hypot(filter.state()[ArmorEkf::Vx],
+                                    filter.state()[ArmorEkf::Vy]);
+    std::printf("[ekf] 实测噪声下接受率 %.1f%%，|v|=%.3f m/s，车心误差 %.1f mm\n",
+                100.0 * rate, speed,
+                1000.0 * (Eigen::Vector2d(filter.state()[ArmorEkf::Px],
+                                          filter.state()[ArmorEkf::Py]) -
+                          truth.center.head<2>()).norm());
+    assert(rate >= 0.9);
+    assert(speed < 0.5);
 }
 
 // 半径是估计量，不是连续量里的普通状态：它必须落在车体几何可能的范围里。
@@ -1432,6 +1546,14 @@ void testMuzzleOffsetIsSubtractedInGimbalFrame() {
         ArmorEkf::Config run_config = testConfig();
         run_config.fire_spin_tolerance_rad_s = 100.0;
         run_config.muzzle_offset_m = muzzle_offset;
+        // 把瞄准板钉死，让这个用例只考枪口偏移这一条路径。选板有 5 度迟滞，
+        // 两块相邻板的方位差在 5 m 处只有 r/d = 61 mrad，跟迟滞余量同量级；
+        // 偏移让预测时长差 3.2 ms，在 ω = 2 rad/s 下就是 6.4 mrad 的状态差，
+        // 一旦末帧状态正好落在迟滞边界上，两遍就会各瞄一块板，distance_m 与
+        // target_pitch 同时跳掉一个板间距（实测 93.8 mm），与偏移无关。
+        // 四块板都算朝向云台，迟滞余量给到 10 rad，初始化后不再换板。
+        run_config.side_plate_angle_rad = 0.5 * kPi;
+        run_config.aim_switch_margin_rad = 10.0;
         ArmorEkf filter(run_config);
         const double dt = 1.0 / 165.0;
         double timestamp = 0.0;
@@ -1453,8 +1575,16 @@ void testMuzzleOffsetIsSubtractedInGimbalFrame() {
     const PredictionResult without_offset = run(0.0);
 
     // 偏移只进弹道解，不进状态、不进观测：两遍的低层状态逐位相同。
+    // 逐位相同同时也保证了下面那条比较不是两块板之间的比较。
+    assert(with_offset.aim_index == without_offset.aim_index);
+    assert(with_offset.center_x_m == without_offset.center_x_m);
+    assert(with_offset.center_y_m == without_offset.center_y_m);
+    assert(with_offset.center_z_m == without_offset.center_z_m);
+    assert(with_offset.body_yaw == without_offset.body_yaw);
+    assert(with_offset.radius_1_m == without_offset.radius_1_m);
+
     // distance_m 却不完全一样，因为它量的是预测后的瞄点，而预测时长里含着
-    // 飞行时间，偏移让飞行时间少了约 3.2 ms，瞄点在这段时间里挪了 0.38 mm。
+    // 飞行时间，偏移让飞行时间少了几毫秒，瞄点在这段时间里挪一点。
     // 这一条同时钉住"distance_m 没有跟着挪到枪口"：若挪了，这里会差出
     // 一个整偏移 74 mm。
     const double distance_shift =
@@ -1483,6 +1613,8 @@ int main() {
     testTwoPlateVehicleObservesRadiusTwo();
     testSinglePlateInitializationIsOnTheFarSide();
     testArmorYawObservationPinsBodyYaw();
+    testYawUpdatesOnNisRejectedFrame();
+    testMeasurementNoiseMatchesObservation();
     testRadiusStaysWithinPhysicalBounds();
     testRejectedObservationsInflateCovarianceAndRecover();
     testSameFrameDuplicatePlateIsRejectedByYaw();
