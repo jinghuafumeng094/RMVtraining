@@ -29,6 +29,7 @@ bool CameraParameters::valid() const {
         !isDistortionVector(distortion_coefficients) ||
         !isMatrix(rotation_camera_to_gimbal, 3, 3) ||
         !isMatrix(translation_camera_to_gimbal, 3, 1) ||
+        !std::isfinite(mount_pitch_deg) || std::abs(mount_pitch_deg) >= 90.0 ||
         !std::isfinite(mean_reprojection_error_px) || mean_reprojection_error_px < 0.0 ||
         !cv::checkRange(camera_matrix) || !cv::checkRange(distortion_coefficients) ||
         !cv::checkRange(rotation_camera_to_gimbal) ||
@@ -64,6 +65,8 @@ bool loadCameraParameters(const std::string& path, CameraParameters& parameters,
     storage["distortion_coefficients"] >> parameters.distortion_coefficients;
     storage["rotation_camera_to_gimbal"] >> parameters.rotation_camera_to_gimbal;
     storage["translation_camera_to_gimbal"] >> parameters.translation_camera_to_gimbal;
+    // 可选字段：老标定文件里没有这一项，读成 0，等价于光轴与云台 x 轴平行。
+    storage["mount_pitch_deg"] >> parameters.mount_pitch_deg;
     storage["mean_reprojection_error_px"] >> parameters.mean_reprojection_error_px;
 
     // 在校验以及后续 OpenCV 计算前，先统一 YAML 数值矩阵的类型。

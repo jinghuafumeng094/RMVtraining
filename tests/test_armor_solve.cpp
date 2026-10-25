@@ -82,6 +82,15 @@ cv::Mat yawRotation(double phi) {
             0.0, -std::sin(phi), 0.0, std::cos(phi));
 }
 
+// 绕相机 x（右）轴的旋转，正角把光轴往上抬（+z 转向 -y）。
+// 相机光轴向下偏 tilt 时，同一块板在相机系里的坐标满足
+//   p_测到 = pitchRotation(tilt) * p_光轴水平
+// 因为光轴往下压了 tilt，板相对光轴就抬高了 tilt。
+cv::Mat pitchRotation(double radians) {
+    const double c = std::cos(radians), s = std::sin(radians);
+    return (cv::Mat_<double>(3, 3) << 1.0, 0.0, 0.0, 0.0, c, -s, 0.0, s, c);
+}
+
 // 相机系 -> 云台系的旋转外参，与 config/camera.yaml 里填的是同一个值。
 // 这里手写一遍是有意的：相机系是 右 / 下 / 前，云台系是 前 / 左 / 上，
 // 两系之间必须差一个 90 度置换。若实现里把它当单位阵，位置照样解得出来、
@@ -361,6 +370,55 @@ int main() {
         ArmorDetection reversed = good;
         std::reverse(reversed.corners.begin(), reversed.corners.end());
         assert(armor_solve({reversed}, cam, GimbalState{}).empty());
+    }
+
+    // =======================================================================
+    // 8. 相机安装俯仰偏角：光轴下偏 7.5 度，板在云台 x 轴上就得解回 z = 0
+    // =======================================================================
+    // 不补偿时，画面中央的板被当成"沿云台 x 轴"，而它其实在轴下方 7.5 度，
+    // 解出来的 z 会比真实值高 距离 × tan(7.5)。2 m 处是 0.263 m，
+    // 弹道在这个距离上根本补不回来。所以这条只能靠外参里的俯仰项吃进。
+    {
+        const double tilt_deg = 7.5;
+        const double tilt = tilt_deg * CV_PI / 180.0;
+        const std::vector<cv::Point3f> object = platePoints(0.135);
+
+        // 板心放在云台 x 轴正前方 2 m，云台系里就是 (前 2, 左 0, 上 0)。
+        const cv::Mat p_gimbal = tvecOf(2.0, 0.0, 0.0);
+
+        CameraParameters cam = makeCameraOnGimbal();
+        // 按几何把这块板投到一个"光轴下偏 7.5 度"的相机里：
+        //   名义相机系坐标 p_nom = R^T (p_gimbal - t)
+        //   测到的坐标     p_meas = 俯仰 7.5 度之后再进相机
+        const cv::Mat p_nominal =
+            cam.rotation_camera_to_gimbal.t() *
+            (p_gimbal - cam.translation_camera_to_gimbal);
+        const cv::Mat p_measured = pitchRotation(tilt) * p_nominal;
+        cv::Mat rvec;
+        cv::Rodrigues(pitchRotation(tilt), rvec);
+
+        const ArmorDetection d = detectionWith(look(object, rvec, p_measured));
+
+        // 真值校验：这块板在"光轴水平"的相机里应该偏在画面中心上方
+        // 2 × tan(7.5 度) = 0.263 m，不然下面两条断言在自欺欺人。
+        assert(p_measured.at<double>(1, 0) < -0.2);
+
+        cam.mount_pitch_deg = tilt_deg;
+        const std::vector<ArmorPose> compensated =
+            armor_solve({d}, cam, GimbalState{});
+        assert(compensated.size() == 1);
+        assert(std::fabs(compensated[0].position_gimbal_m[0] - 2.0) < 1e-3);
+        assert(std::fabs(compensated[0].position_gimbal_m[1]) < 1e-3);
+        assert(std::fabs(compensated[0].position_gimbal_m[2]) < 1e-3);
+        // 板正对云台 x 轴，偏航角是 0。俯仰项只该改位置，不该把偏航带偏。
+        assert(std::fabs(compensated[0].armor_yaw) < 1e-3);
+
+        // 同一帧、俯仰项填 0：z 偏到 +0.26 附近，方向是上。
+        // 这一条同时钉住符号 —— 补偿写成反向会跑到 -0.52，两边都过不了。
+        cam.mount_pitch_deg = 0.0;
+        const std::vector<ArmorPose> raw = armor_solve({d}, cam, GimbalState{});
+        assert(raw.size() == 1);
+        assert(raw[0].position_gimbal_m[2] > 0.2);
     }
 
     return 0;

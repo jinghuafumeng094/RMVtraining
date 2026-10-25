@@ -42,6 +42,10 @@ struct CameraParameters {
     cv::Mat distortion_coefficients;
     cv::Mat rotation_camera_to_gimbal;
     cv::Mat translation_camera_to_gimbal;  // 3x1，单位为米，表示在云台坐标系中的平移。
+    // 相机安装俯仰偏角，单位度，正值表示光轴相对云台 x 轴向下偏，0 表示平行。
+    // 它与上面的旋转外参是两回事：那个矩阵只覆盖两系轴向命名（右/下/前 -> 前/左/上），
+    // 这一项是支架装歪了的物理角度，实测得来。解算时先按它把方向转回光轴水平。
+    double mount_pitch_deg{0.0};
     double mean_reprojection_error_px{-1.0};
 
     bool valid() const;

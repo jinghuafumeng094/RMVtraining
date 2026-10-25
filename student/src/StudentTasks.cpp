@@ -59,6 +59,14 @@ cv::Vec3d toVec3d(const cv::Mat& column) {
                      column.at<double>(2));
 }
 
+// 绕相机 x（右）轴的旋转，正角把光轴往上抬，即 +z 转向 -y。
+// 只服务安装俯仰偏角这一处，方向约定见 armor_solve 里对 mount_pitch_deg 的说明。
+cv::Mat pitchRotationRadians(double radians) {
+    const double c = std::cos(radians);
+    const double s = std::sin(radians);
+    return (cv::Mat_<double>(3, 3) << 1.0, 0.0, 0.0, 0.0, c, -s, 0.0, s, c);
+}
+
 }  // namespace
 
 // 任务 1：相机取流。
@@ -100,6 +108,17 @@ std::vector<ArmorPose> armor_solve(const std::vector<ArmorDetection>& detections
     const cv::Mat& distortion = camera.distortion_coefficients;
     const cv::Mat& R_camera_to_gimbal = camera.rotation_camera_to_gimbal;
     const cv::Mat& t_camera_to_gimbal = camera.translation_camera_to_gimbal;
+
+    // 安装俯仰偏角，夹在 PnP 和外参之间用。
+    // 光轴向下偏 delta 时，板在相机系里的 y 会比光轴水平时小 距离 × tan(delta)，
+    // 于是整块板被读得偏高；按下面的顺序解出来，2 m 处能偏 26 cm。
+    // 补偿就是把测到的方向先转回"光轴水平"的名义相机系，再交给命名用的外参。
+    // 角度取负号：pitchRotationRadians 正角是抬，而这里要抵消的是向下偏。
+    // 只转方向不挪平移：相机是绕光心转的，光心在云台系里的位置不变。
+    // 若实际是绕支架螺钉转、光心跟着平移，这段还差一个二三毫米量级的修正。
+    const cv::Mat R_measured_to_nominal =
+        pitchRotationRadians(-camera.mount_pitch_deg * CV_PI / 180.0);
+    const cv::Mat R_effective = R_camera_to_gimbal * R_measured_to_nominal;
 
     poses.reserve(detections.size());
     for (const ArmorDetection& detection : detections) {
@@ -177,7 +196,7 @@ std::vector<ArmorPose> armor_solve(const std::vector<ArmorDetection>& detections
         // 位置会照常解出来、也不报错，只是每个分量都换了含义。
         const cv::Mat p_camera =
             (cv::Mat_<double>(3, 1) << tvec[0], tvec[1], tvec[2]);
-        pose.position_gimbal_m = toVec3d(R_camera_to_gimbal * p_camera +
+        pose.position_gimbal_m = toVec3d(R_effective * p_camera +
                                          t_camera_to_gimbal);
 
         // armor_yaw：装甲板法向在云台系中的偏航角，右为正。
@@ -186,8 +205,7 @@ std::vector<ArmorPose> armor_solve(const std::vector<ArmorDetection>& detections
         // 与 main.cpp 的 pnp_yaw_rad、ArmorEkf 的 rel_yaw 同一套口径。
         cv::Mat R_object_to_camera;
         cv::Rodrigues(rvec, R_object_to_camera);
-        const cv::Mat normal_gimbal =
-            R_camera_to_gimbal * R_object_to_camera.col(2);
+        const cv::Mat normal_gimbal = R_effective * R_object_to_camera.col(2);
         pose.armor_yaw = std::atan2(-normal_gimbal.at<double>(1),
                                     normal_gimbal.at<double>(0));
 
