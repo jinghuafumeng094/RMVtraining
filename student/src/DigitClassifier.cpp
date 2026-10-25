@@ -1,8 +1,11 @@
 #include "DigitClassifier.hpp"
 
 #include <cmath>
+#include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <mutex>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -197,18 +200,32 @@ bool DigitClassifier::ready() {
     }
     state.attempted = true;
 
-    // 先试编进二进制的绝对路径（不依赖工作目录）。
-    if (tryLoadLocked(defaultModelPath())) {
-        state.loaded = true;
-        std::cerr << "[digit] 模型已加载：" << defaultModelPath() << std::endl;
-        return true;
+    // 按候选表找模型，第一个能加载的就用。
+    // 编进二进制的绝对路径只在编它的那台机器上成立：二进制拷到另一台机器，
+    // 仓库目录可能叫 rm_autoaim-hxr，那条路径就不存在。车上就是这种情况。
+    std::vector<std::string> candidates;
+    candidates.emplace_back(defaultModelPath());
+    if (const char* home = std::getenv("HOME")) {
+        candidates.emplace_back(std::string(home) +
+                                "/workplace/rm_autoaim-hxr/models/armor_digit_svm.xml");
+        candidates.emplace_back(std::string(home) +
+                                "/workplace/rm_autoaim/models/armor_digit_svm.xml");
     }
-    // 再试相对路径兜底（从仓库根目录运行时能命中）。
-    if (tryLoadLocked("models/armor_digit_svm.xml")) {
-        state.loaded = true;
-        std::cerr << "[digit] 模型已加载：models/armor_digit_svm.xml（相对路径）"
-                  << std::endl;
-        return true;
+    // 最后两条是相对路径，从仓库根目录或其下一层运行时能命中。
+    candidates.emplace_back("models/armor_digit_svm.xml");
+    candidates.emplace_back("../models/armor_digit_svm.xml");
+    for (const std::string& path : candidates) {
+        // 先看文件在不在。SVM::load 对不存在的路径抛异常，逐条试会把每一条
+        // 的「加载失败」都刷到屏幕上，真正的原因反而被埋掉。
+        const bool present = std::ifstream(path).good();
+        if (!present) {
+            continue;
+        }
+        if (tryLoadLocked(path)) {
+            state.loaded = true;
+            std::cerr << "[digit] 模型已加载：" << path << std::endl;
+            return true;
+        }
     }
     std::cerr << "[digit] 没有可用模型，数字分类全部返回 target_id = 0。\n"
                  "[digit] 请先把 models/armor_digit_svm.xml 放进仓库。"
