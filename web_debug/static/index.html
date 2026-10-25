@@ -147,6 +147,30 @@
 
         main { padding: 18px 20px 30px; }
 
+        #camera { margin-bottom: 12px; }
+
+        .camera-card {
+            overflow: hidden;
+            border: 1px solid var(--line);
+            border-radius: 6px;
+            background: var(--surface);
+        }
+
+        .camera-wrap {
+            display: grid;
+            min-height: 220px;
+            place-items: center;
+            background: #000;
+        }
+
+        #cameraStream {
+            display: block;
+            width: 100%;
+            height: auto;
+            max-height: 58vh;
+            object-fit: contain;
+        }
+
         #charts {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(min(100%, 340px), 1fr));
@@ -262,7 +286,7 @@
             <div class="brand-mark" aria-hidden="true">RMV</div>
             <div>
                 <h1>视觉调试面板</h1>
-                <div class="subtitle">Real-time numeric telemetry</div>
+                <div class="subtitle">相机画面与数值曲线</div>
             </div>
         </div>
 
@@ -289,6 +313,23 @@
     </header>
 
     <main>
+        <section id="camera" aria-label="相机实时画面">
+            <article class="camera-card">
+                <header class="chart-header">
+                    <div class="metric-info">
+                        <span class="metric-name">相机实时画面</span>
+                        <span id="frameStatus" class="metric-value">连接中</span>
+                    </div>
+                    <div class="card-actions">
+                        <button id="frameReload" class="icon-btn" type="button"
+                                title="重新连接画面" aria-label="重新连接画面">R</button>
+                    </div>
+                </header>
+                <div class="camera-wrap">
+                    <img id="cameraStream" alt="相机实时画面">
+                </div>
+            </article>
+        </section>
         <section id="charts" aria-live="polite"></section>
     </main>
 
@@ -304,6 +345,9 @@
             const clearButton = document.getElementById("clearButton");
             const exportButton = document.getElementById("exportButton");
             const timeWindow = document.getElementById("timeWindow");
+            const cameraStream = document.getElementById("cameraStream");
+            const frameStatus = document.getElementById("frameStatus");
+            const frameReload = document.getElementById("frameReload");
 
             // 每个指标名称对应一张图表，并在浏览器内维护自己的历史记录。
             const charts = new Map();
@@ -606,6 +650,36 @@
                 renderAll(true);
             });
 
+            // 画面是浏览器原生的 multipart 流，不用 JS 解帧。断开时 img 会触发
+            // error，这里隔一秒带时间戳重连一次，界面上的按钮也能手动重连。
+            let frameRetry = null;
+
+            function openFrame() {
+                if (frameRetry !== null) {
+                    window.clearTimeout(frameRetry);
+                    frameRetry = null;
+                }
+                frameStatus.textContent = "连接中";
+                cameraStream.src = `/frame?t=${Date.now()}`;
+            }
+
+            cameraStream.addEventListener("load", () => {
+                frameStatus.textContent =
+                    `${cameraStream.naturalWidth}x${cameraStream.naturalHeight}`;
+            });
+
+            cameraStream.addEventListener("error", () => {
+                frameStatus.textContent = "画面断开";
+                if (frameRetry !== null) window.clearTimeout(frameRetry);
+                frameRetry = window.setTimeout(openFrame, 1000);
+            });
+
+            frameReload.addEventListener("click", openFrame);
+
+            window.addEventListener("beforeunload", () => {
+                if (frameRetry !== null) window.clearTimeout(frameRetry);
+            });
+
             function connect() {
                 setConnectionState("connecting", "正在连接");
                 // EventSource 重连时会把 Last-Event-ID 发送给服务器。
@@ -632,6 +706,9 @@
 
             updateEmptyState();
             connect();
+            // 画面地址在脚本里给，不写在 img 标签上：连续流的响应永远不结束，
+            // 写死在标签里会让页面的 load 事件一直等下去，标签页一直转圈。
+            openFrame();
             window.setInterval(() => renderAll(false), 100);
         })();
     </script>

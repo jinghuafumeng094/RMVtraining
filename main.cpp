@@ -544,6 +544,10 @@ void *OperationFunction(void *arg) {
         if (!using_fallback_frame) {
             WEB_LOG("empty_frame", 0.0);
         }
+        // 网页上的相机画面就是这一帧：检测、PnP、EKF 后面用的都是同一份像素，
+        // 不另开取流。这里只递交 Mat 头，JPEG 编码在 WebLogger 自己的线程里做，
+        // 不占本循环的帧预算。
+        WEB_FRAME(pic);
 
         const auto frame_time = std::chrono::steady_clock::now();
         if (last_frame_time.time_since_epoch().count() != 0) {

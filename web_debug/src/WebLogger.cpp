@@ -4,6 +4,8 @@
 
 #include "httplib.h"
 
+#include <opencv2/imgcodecs.hpp>
+
 #include <chrono>
 #include <cmath>
 #include <iostream>
@@ -57,6 +59,9 @@ void WebLogger::start(int port, const std::string& host) {
     if (server_thread_.joinable()) {
         server_thread_.join();
     }
+    if (encoder_thread_.joinable()) {
+        encoder_thread_.join();
+    }
     server_.reset();
 
     {
@@ -64,6 +69,17 @@ void WebLogger::start(int port, const std::string& host) {
         buffer_.clear();
         next_sequence_ = 1;
     }
+    {
+        std::lock_guard<std::mutex> image_lock(image_mutex_);
+        latest_image_.release();
+        image_sequence_ = 0;
+    }
+    {
+        std::lock_guard<std::mutex> encoded_lock(encoded_mutex_);
+        encoded_jpeg_.clear();
+    }
+    encoded_sequence_.store(0, std::memory_order_release);
+    image_clients_.store(0, std::memory_order_relaxed);
 
     // 先注册路由并绑定端口；绑定失败时不会创建后台线程。
     auto server = std::make_unique<httplib::Server>();
@@ -86,6 +102,8 @@ void WebLogger::start(int port, const std::string& host) {
         std::cerr << "[WebLogger] HTTP server could not enter the listen loop\n";
         return;
     }
+    // 监听确认成功之后才开编码线程，失败路径上就不用回收它。
+    encoder_thread_ = std::thread(&WebLogger::encoderLoop, this);
     std::cout << "[WebLogger] Dashboard: http://" << host << ':' << port << '\n';
 }
 
@@ -94,6 +112,8 @@ void WebLogger::stop() {
 
     running_.store(false, std::memory_order_release);
     data_cv_.notify_all();
+    image_cv_.notify_all();
+    encoded_cv_.notify_all();
 
     if (server_) {
         // stop() 会关闭已激活的监听器；decommission() 也能处理尚未完全进入
@@ -104,6 +124,9 @@ void WebLogger::stop() {
 
     if (server_thread_.joinable()) {
         server_thread_.join();
+    }
+    if (encoder_thread_.joinable()) {
+        encoder_thread_.join();
     }
     server_.reset();
 }
@@ -130,6 +153,72 @@ void WebLogger::log(const std::string& key, double value) {
         buffer_.push_back({key, value, timestamp, next_sequence_++});
     }
     data_cv_.notify_all();
+}
+
+void WebLogger::publishImage(const cv::Mat& frame) {
+    if (!running_.load(std::memory_order_acquire) || frame.empty()) {
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(image_mutex_);
+        if (!running_.load(std::memory_order_relaxed)) {
+            return;
+        }
+        // 只换头，不拷像素。cv::Mat 是引用计数：主循环随后 release 掉的只是
+        // 它自己那个头，这块内存要等编码线程也放手才回收。前提是主循环拿到
+        // 下一帧时重新分配，而不是往这块缓冲里原地覆写。
+        latest_image_ = frame;
+        ++image_sequence_;
+    }
+    image_cv_.notify_one();
+}
+
+void WebLogger::encoderLoop() {
+    constexpr auto kPeriod = std::chrono::milliseconds(1000 / kImageFps);
+    auto next_allowed = std::chrono::steady_clock::now();
+
+    while (true) {
+        cv::Mat image;
+        std::uint64_t sequence = 0;
+        {
+            std::unique_lock<std::mutex> lock(image_mutex_);
+            image_cv_.wait(lock, [this] {
+                return !running_.load(std::memory_order_acquire) ||
+                       (image_clients_.load(std::memory_order_relaxed) > 0 &&
+                        image_sequence_ != encoded_sequence_.load(std::memory_order_acquire));
+            });
+            if (!running_.load(std::memory_order_acquire)) {
+                return;
+            }
+
+            const auto now = std::chrono::steady_clock::now();
+            if (now < next_allowed) {
+                image_cv_.wait_until(lock, next_allowed, [this] {
+                    return !running_.load(std::memory_order_acquire);
+                });
+                // 醒来重新取最新一帧，别去编睡前那张旧图。
+                continue;
+            }
+            image = latest_image_;
+            sequence = image_sequence_;
+        }
+
+        std::vector<unsigned char> jpeg;
+        const bool encoded =
+            cv::imencode(".jpg", image, jpeg, {cv::IMWRITE_JPEG_QUALITY, kImageQuality});
+        next_allowed = std::chrono::steady_clock::now() + kPeriod;
+        if (!encoded) {
+            continue;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(encoded_mutex_);
+            encoded_jpeg_.swap(jpeg);
+        }
+        encoded_sequence_.store(sequence, std::memory_order_release);
+        encoded_cv_.notify_all();
+    }
 }
 
 bool WebLogger::isRunning() const noexcept {
@@ -208,6 +297,59 @@ void WebLogger::configureServer(httplib::Server& server) {
                     return false;
                 }
                 return sink.write(payload.data(), payload.size());
+            });
+    });
+
+    // 相机画面。multipart/x-mixed-replace 是浏览器原生认的连续图像流，
+    // <img src="/frame"> 就会自己一帧帧换，页面上不需要任何解码代码。
+    server.Get("/frame", [this](const httplib::Request&, httplib::Response& response) {
+        image_clients_.fetch_add(1, std::memory_order_relaxed);
+        image_cv_.notify_all();
+        // 借用 shared_ptr 的析构时机统计连接数：content provider 被销毁时
+        // 说明这条连接结束了，计数随之回落。指针本身是空的。
+        std::shared_ptr<void> client_guard(nullptr, [this](void*) {
+            image_clients_.fetch_sub(1, std::memory_order_relaxed);
+            image_cv_.notify_all();
+        });
+
+        response.set_header("Cache-Control", "no-store");
+        response.set_header("X-Accel-Buffering", "no");
+        response.set_chunked_content_provider(
+            "multipart/x-mixed-replace; boundary=frame",
+            [this, client_guard, last_sent = std::uint64_t{0}](
+                std::size_t, httplib::DataSink& sink) mutable {
+                std::vector<unsigned char> jpeg;
+                {
+                    std::unique_lock<std::mutex> lock(encoded_mutex_);
+                    encoded_cv_.wait_for(lock, std::chrono::seconds(2),
+                                         [this, last_sent] {
+                                             return !running_.load(std::memory_order_acquire) ||
+                                                    encoded_sequence_.load(
+                                                        std::memory_order_acquire) > last_sent;
+                                         });
+                    if (!running_.load(std::memory_order_acquire)) {
+                        sink.done();
+                        return true;
+                    }
+                    if (encoded_sequence_.load(std::memory_order_acquire) <= last_sent) {
+                        // 没拿到新图，本轮不写，下一轮接着等。
+                        return true;
+                    }
+                    jpeg = encoded_jpeg_;
+                    last_sent = encoded_sequence_.load(std::memory_order_acquire);
+                }
+
+                std::string part;
+                part.reserve(jpeg.size() + 96);
+                part += "--frame\r\n";
+                part += "Content-Type: image/jpeg\r\n";
+                part += "Content-Length: " + std::to_string(jpeg.size()) + "\r\n\r\n";
+                part.append(reinterpret_cast<const char*>(jpeg.data()), jpeg.size());
+                part += "\r\n";
+                if (!sink.is_writable()) {
+                    return false;
+                }
+                return sink.write(part.data(), part.size());
             });
     });
 
