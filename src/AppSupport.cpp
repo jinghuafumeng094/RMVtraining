@@ -1,6 +1,10 @@
 #include "AppSupport.hpp"
 
+#include <opencv2/imgproc.hpp>
+
+#include <algorithm>
 #include <cmath>
+#include <string>
 
 namespace {
 
@@ -98,4 +102,46 @@ bool applyPrediction(Translator& translator, const PredictionResult& prediction)
                                  : 0U;
     message.tail = kFrameTail;
     return true;
+}
+
+void annotateDetections(cv::Mat& image,
+                        const std::vector<ArmorDetection>& detections) {
+    // 尺寸按 1440x1080 的画面定：框 3 px、字 1.0 倍。网页那条流是缩过的 JPEG，
+    // 线再细就看不清了。
+    constexpr int kBoxThickness = 3;
+    constexpr int kFontThickness = 2;
+    constexpr double kFontScale = 1.0;
+    constexpr int kLabelLiftPx = 8;
+
+    if (image.empty() || image.type() != CV_8UC3) {
+        return;
+    }
+
+    for (const ArmorDetection& detection : detections) {
+        // 编号 0 表示板子检出了、但没能读出 1~8 的数字。框照样画，颜色换成黄色，
+        // 这样「检出几块」和「其中几块能当目标」在画面上一眼分得开。
+        const cv::Scalar color =
+            detection.target_id != 0 ? cv::Scalar(0, 255, 0) : cv::Scalar(0, 255, 255);
+        for (int i = 0; i < 4; ++i) {
+            cv::line(image, detection.corners[i], detection.corners[(i + 1) % 4],
+                     color, kBoxThickness, cv::LINE_AA);
+        }
+
+        const std::string label =
+            std::to_string(detection.target_id) +
+            (detection.size == ArmorSize::Large ? " L " : " S ") +
+            cv::format("%.2f", static_cast<double>(detection.confidence));
+
+        // 标签挂在左上角点上方。贴边的板会把它顶出画面，所以两个方向都要夹回图内：
+        // x 夹到「右边还剩得下这行字」，y 夹到「字顶不越出上边界」。
+        int baseline = 0;
+        const cv::Size text_size = cv::getTextSize(
+            label, cv::FONT_HERSHEY_SIMPLEX, kFontScale, kFontThickness, &baseline);
+        const int x = static_cast<int>(detection.corners[0].x);
+        const int y = static_cast<int>(detection.corners[0].y) - kLabelLiftPx;
+        const cv::Point anchor(std::max(0, std::min(x, image.cols - text_size.width)),
+                               std::max(text_size.height, y));
+        cv::putText(image, label, anchor, cv::FONT_HERSHEY_SIMPLEX, kFontScale,
+                    color, kFontThickness, cv::LINE_AA);
+    }
 }

@@ -542,11 +542,6 @@ void *OperationFunction(void *arg) {
         if (!using_fallback_frame) {
             WEB_LOG("empty_frame", 0.0);
         }
-        // 网页上的相机画面就是这一帧：检测、PnP、EKF 后面用的都是同一份像素，
-        // 不另开取流。这里只递交 Mat 头，JPEG 编码在 WebLogger 自己的线程里做，
-        // 不占本循环的帧预算。
-        WEB_FRAME(pic);
-
         const auto frame_time = std::chrono::steady_clock::now();
         if (last_frame_time.time_since_epoch().count() != 0) {
             const double frame_seconds =
@@ -572,6 +567,13 @@ void *OperationFunction(void *arg) {
             WEB_LOG("target_x_px", center.x);
             WEB_LOG("target_y_px", center.y);
         }
+
+        // 网页上的相机画面就是这一帧：检测、PnP、EKF 后面用的都是同一份像素，
+        // 不另开取流。画框放在 armor_detect 之后，检测器看到的始终是原始像素，
+        // 不会把自己的框线当成灯条。递交之后这个循环不再写 pic —— 编码线程拿的
+        // 就是这里这个 Mat 头，不是副本。
+        annotateDetections(pic, detections);
+        WEB_FRAME(pic);
 
         // 2. PnP 位姿解算。PnP 失败时同样保留空 observations，交给 EKF 做纯预测。
         const std::vector<ArmorPose> observations =
