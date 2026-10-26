@@ -171,8 +171,6 @@ void logPrediction(const PredictionResult& result) {
     WEB_LOG("ekf_vz_m_s", result.center_velocity_z_m_s);
     WEB_LOG("ekf_yaw_rad", result.body_yaw);
     WEB_LOG("ekf_yaw_rate_rad_s", result.body_yaw_velocity);
-    WEB_LOG("ekf_radius_1_m", result.radius_1_m);
-    WEB_LOG("ekf_radius_2_m", result.radius_2_m);
     // 切换与遮挡的直接证据：当前瞄准的槽位、连续命中与连续丢失、累计被离群闸挡下的观测条数。
     // hit_streak 与 miss_count 互斥，任何时刻只有一个非零，所以合成一条带符号的曲线：
     // 正值为连续命中帧数，负值为连续丢失帧数，0 表示刚重置。
