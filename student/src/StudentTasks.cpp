@@ -174,8 +174,10 @@ std::vector<ArmorPose> armor_solve(const std::vector<ArmorDetection>& detections
 
         ArmorPose pose;
         pose.detection = detection;
-        // solvePnP 的 tvec 就是板心在相机系中的位置(m)
+        // solvePnP 的 tvec 就是板心在相机系中的位置(m)，rvec 留作画面上的
+        // 物体系坐标轴，滤波链不用它。
         pose.position_camera_m = tvec;
+        pose.rvec = rvec;
         pose.reprojection_error = error_px;
 
         // 板心到画面中心的像素距离，多目标筛选按它排序。

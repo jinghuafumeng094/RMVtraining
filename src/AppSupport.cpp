@@ -1,10 +1,12 @@
 #include "AppSupport.hpp"
 
+#include <opencv2/calib3d.hpp>
 #include <opencv2/imgproc.hpp>
 
 #include <algorithm>
 #include <cmath>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -104,8 +106,63 @@ bool applyPrediction(Translator& translator, const PredictionResult& prediction)
     return true;
 }
 
+namespace {
+
+// 物体系三条轴的画法，数值与仓库外的 armor_live 逐项一致，两块屏对着看能重合：
+// 轴长 7 cm，比板高 5.7 cm、小板半宽 6.75 cm 都长一点，箭头落在板外不被板面挡住。
+constexpr double kAxisLengthM = 0.07;
+constexpr double kAxisFontScale = 0.7;
+constexpr double kPnpTextFontScale = 0.7;
+
+// 在板心画物体系的 x / y / z。颜色跟报告里《三个坐标系的方向与原点关系》一致，
+// x 红、y 绿、z 蓝。z 是板背法向，板正对相机时几乎沿光轴，投影出来很短，属正常。
+// 不用 cv::drawFrameAxes：它配色是 x 蓝 / y 绿 / z 红，跟本项目反着，也不标轴名。
+void drawObjectAxes(cv::Mat& image, const CameraParameters& camera,
+                    const cv::Vec3d& rvec, const cv::Vec3d& tvec) {
+    const float length = static_cast<float>(kAxisLengthM);
+    const std::vector<cv::Point3f> axes = {{0.0F, 0.0F, 0.0F},
+                                           {length, 0.0F, 0.0F},
+                                           {0.0F, length, 0.0F},
+                                           {0.0F, 0.0F, length}};
+    std::vector<cv::Point2f> projected;
+    cv::projectPoints(axes, rvec, tvec, camera.camera_matrix,
+                      camera.distortion_coefficients, projected);
+
+    const cv::Point2f origin = projected[0];
+    const cv::Scalar colors[3] = {cv::Scalar(0, 0, 255),   // x 红
+                                  cv::Scalar(0, 255, 0),   // y 绿
+                                  cv::Scalar(255, 0, 0)};  // z 蓝
+    const char* names[3] = {"x", "y", "z"};
+
+    // 原点就是板心，点一个白点标出来。
+    cv::circle(image, origin, 3, cv::Scalar(255, 255, 255), -1, cv::LINE_AA);
+    for (int i = 0; i < 3; ++i) {
+        const cv::Point2f tip = projected[i + 1];
+        cv::arrowedLine(image, origin, tip, colors[i], 2, cv::LINE_AA, 0, 0.25);
+        cv::putText(image, names[i], tip + cv::Point2f(6.0F, -6.0F),
+                    cv::FONT_HERSHEY_SIMPLEX, kAxisFontScale, colors[i], 2,
+                    cv::LINE_AA);
+    }
+}
+
+// 按左上角点在同一条检测上认位姿。armor_solve 复制进 ArmorPose 的就是同一组
+// float 角点，除此之外没有共同的编号可用。
+const ArmorPose* findPose(const std::vector<ArmorPose>& observations,
+                          const cv::Point2f& anchor) {
+    for (const ArmorPose& pose : observations) {
+        if (pose.detection.corners[0] == anchor) {
+            return &pose;
+        }
+    }
+    return nullptr;
+}
+
+}  // namespace
+
 void annotateDetections(cv::Mat& image,
-                        const std::vector<ArmorDetection>& detections) {
+                        const std::vector<ArmorDetection>& detections,
+                        const std::vector<ArmorPose>& observations,
+                        const CameraParameters& camera) {
     // 尺寸按 1440x1080 的画面定：框 3 px、字 1.0 倍。网页那条流是缩过的 JPEG，
     // 线再细就看不清了。
     constexpr int kBoxThickness = 3;
@@ -116,6 +173,10 @@ void annotateDetections(cv::Mat& image,
     if (image.empty() || image.type() != CV_8UC3) {
         return;
     }
+
+    // 没标定就没有位姿，整幅不画 PnP 标记：否则每块板都会被标成被闸挡下，
+    // 把"没标定"伪装成"观测被拒"。
+    const bool pnp_enabled = camera.valid();
 
     for (const ArmorDetection& detection : detections) {
         // 编号 0 表示板子检出了、但没能读出 1~8 的数字。框照样画，颜色换成黄色，
@@ -143,5 +204,43 @@ void annotateDetections(cv::Mat& image,
                                std::max(text_size.height, y));
         cv::putText(image, label, anchor, cv::FONT_HERSHEY_SIMPLEX, kFontScale,
                     color, kFontThickness, cv::LINE_AA);
+
+        if (!pnp_enabled) {
+            continue;
+        }
+
+        // 在这批观测里找这条检测对应的位姿。armor_solve 的闸会丢掉一部分观测，
+        // 被丢掉的按角点找不到位姿，标成 PnP x，"观测被拒"就成了画面上看得见的
+        // 事，不是只写在文档里。
+        const cv::Point2f& plate_anchor = detection.corners[0];
+        const cv::Point text_anchor(static_cast<int>(plate_anchor.x),
+                                    static_cast<int>(plate_anchor.y));
+        const ArmorPose* pose = findPose(observations, plate_anchor);
+        if (pose == nullptr) {
+            cv::putText(image, "PnP x", cv::Point(text_anchor.x, text_anchor.y - 34),
+                        cv::FONT_HERSHEY_SIMPLEX, kPnpTextFontScale,
+                        cv::Scalar(0, 0, 255), 2, cv::LINE_AA);
+            continue;
+        }
+
+        // 过了三道闸的位姿才有意义，坐标轴也只画在这一条上。
+        drawObjectAxes(image, camera, pose->rvec, pose->position_camera_m);
+
+        // PnP 的原始两个输出，一行一个。y 轴朝下，想让它显示在上面，y 偏移要更小，
+        // 所以 -62 在上、-34 在下。
+        cv::putText(image,
+                    cv::format("rvec=(%+.3f, %+.3f, %+.3f)", pose->rvec[0],
+                               pose->rvec[1], pose->rvec[2]),
+                    cv::Point(text_anchor.x, text_anchor.y - 62),
+                    cv::FONT_HERSHEY_SIMPLEX, kPnpTextFontScale,
+                    cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
+        cv::putText(image,
+                    cv::format("tvec=(%+.3f, %+.3f, %+.3f)",
+                               pose->position_camera_m[0],
+                               pose->position_camera_m[1],
+                               pose->position_camera_m[2]),
+                    cv::Point(text_anchor.x, text_anchor.y - 34),
+                    cv::FONT_HERSHEY_SIMPLEX, kPnpTextFontScale,
+                    cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
     }
 }

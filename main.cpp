@@ -568,13 +568,6 @@ void *OperationFunction(void *arg) {
             WEB_LOG("target_y_px", center.y);
         }
 
-        // 网页上的相机画面就是这一帧：检测、PnP、EKF 后面用的都是同一份像素，
-        // 不另开取流。画框放在 armor_detect 之后，检测器看到的始终是原始像素，
-        // 不会把自己的框线当成灯条。递交之后这个循环不再写 pic —— 编码线程拿的
-        // 就是这里这个 Mat 头，不是副本。
-        annotateDetections(pic, detections);
-        WEB_FRAME(pic);
-
         // 2. PnP 位姿解算。PnP 失败时同样保留空 observations，交给 EKF 做纯预测。
         const std::vector<ArmorPose> observations =
             armor_solve(detections, camera, gimbal);
@@ -601,6 +594,14 @@ void *OperationFunction(void *arg) {
             WEB_LOG("pnp_yaw_rad", -1.0);
             WEB_LOG("pnp_pitch_rad", -1.0);
         }
+
+        // 网页上的相机画面就是这一帧：检测、PnP、EKF 后面用的都是同一份像素，
+        // 不另开取流。画框放在 armor_detect 之后，检测器看到的始终是原始像素，
+        // 不会把自己的框线当成灯条。坐标轴与 rvec/tvec 要等 armor_solve 的三道闸
+        // 走完才知道哪条观测留下了，所以整个标注放在解算之后。递交之后这个循环
+        // 不再写 pic，编码线程拿的就是这里这个 Mat 头，不是副本。
+        annotateDetections(pic, detections, observations, camera);
+        WEB_FRAME(pic);
 
         // 3. 记下时间戳和通信延迟，再调用 EKF。即使 observations 为空也必须调用。
         // 不单独记帧间隔：相机帧率就是同一对 frame_time 差值的倒数，两条曲线互为倒影。

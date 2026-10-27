@@ -66,6 +66,9 @@ struct ArmorPose {
     ArmorDetection detection;
     cv::Vec3d position_camera_m{0.0, 0.0, 0.0};
     cv::Vec3d position_gimbal_m{0.0, 0.0, 0.0};
+    // solvePnP 的旋转向量，物体系（x 右、y 下、z 指向板背）到相机系。
+    // 滤波不用它，只在画面标注里画物体系的三条轴，所以不再重解一次 PnP。
+    cv::Vec3d rvec{0.0, 0.0, 0.0};
     double armor_yaw{0.0};
     double reprojection_error{0.0};
     double center_offset_px{0.0};
