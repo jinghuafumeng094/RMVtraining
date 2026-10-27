@@ -251,9 +251,9 @@ void logPrediction(const PredictionResult& result) {
 // 滤波器的车体角速度参照曲线：和 ekf_yaw_rate_rad_s 贴在一起说明滤波器跟得上相机，
 // 分叉说明它更信自己的模型。这正好把"跟不上"和"模型有偏"这两种病因分开。
 //
-// armor_orientation_yaw 是装甲板背向在云台系里的方位角，右正，板正对镜头时为 0。
-// 它单独画没有意义，云台一转它就动；要和 gimbal_yaw 一起看，两者相加才是板在
-// 世界系里的方位角，而世界系方位角的下降速率就是车体自转速率。
+// 板背方位角不往外写：它在云台系里，云台一动它就动，单独画没有意义。换算留在
+// MeasYawRate 内部：armor_yaw 加 gimbal_yaw 与水平面上的绝对方位只差一个常数
+// （板背朝里，差 180 度），求导时这个常数消掉，符号也在那边一并处理。
 //
 // 多块板同时可见时按"跟着上一帧那块板走"选取，取与上一帧方位角最接近的一块。
 // 这样物理换板才是一次 90 度跳变，而不是每帧在几块板之间乱跳；单块板可见时
@@ -292,7 +292,6 @@ void logMeasYawRate(const std::vector<ArmorPose>& observations,
     has_previous = true;
     previous_yaw = chosen->armor_yaw;
 
-    WEB_LOG("armor_orientation_yaw", chosen->armor_yaw);
     WEB_LOG("ekf_meas_yaw_rate_rad_s", rate);
 }
 
@@ -577,12 +576,14 @@ void *OperationFunction(void *arg) {
             WEB_LOG("pnp_distance_m", cv::norm(observation.position_gimbal_m));
 
             // 目标 yaw/pitch：板心在云台系里的方位角，也就是"云台该往哪转"。
-            // 云台系 x 向前、y 向左、z 向上，与 EKF 的世界系同向，
+            // 云台系 x 向前、y 向左、z 向上，跟着云台 yaw 和 pitch 一起转，
             // 见 student/include/ArmorEkf.hpp 顶部。所以：
             //   yaw   = atan2(-y, x)           右正（y 朝左，取负才得到右正）
             //   pitch =  atan2(z, hypot(x, y)) 上正
-            // 注意这两个是观测值，不要和 EKF 输出的 target_yaw/target_pitch 混看：
-            // 那两条是滤波后的云台指令，这里是单帧 PnP 的原始方位。
+            // 这个系比 EKF 的水平世界系多叠了一个 pitch：pitch 不为零时，yaw 与
+            // EKF 输出的 target_yaw 不在同一个水平面上，两块板不等于直接相减。
+            // 也不要和 target_yaw/target_pitch 混看：那两条是滤波后的云台指令，
+            // 这里是单帧 PnP 的原始方位。同样的数打在网页画面上，见 annotateDetections。
             const cv::Vec3d& p_gimbal = observation.position_gimbal_m;
             WEB_LOG("pnp_yaw_rad", std::atan2(-p_gimbal[1], p_gimbal[0]));
             WEB_LOG("pnp_pitch_rad",

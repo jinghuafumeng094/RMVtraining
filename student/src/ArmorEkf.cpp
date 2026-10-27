@@ -879,7 +879,9 @@ PredictionResult ArmorEkf::buildPrediction(const GimbalState& gimbal, double lat
     const Eigen::Vector3d p_level_aim = to_level * p_world_aim;
     const Eigen::Vector3d p_gimbal_aim = to_gimbal * p_world_aim;
 
-    // 与 main.cpp 里 pnp_yaw_rad / pnp_pitch_rad 同式：yaw 右为正，pitch 抬头为正。
+    // 与 main.cpp 里 pnp_yaw_rad / pnp_pitch_rad 同号：yaw 右为正，pitch 抬头为正。
+    // 但取的系不同：rel_yaw 在水平系里取，pnp_yaw_rad 在叠了云台 pitch 的系里取，
+    // 板不在光轴上时两者差一个随 pitch 变的偏置；rel_pitch 与 pnp_pitch_rad 同系。
     const double rel_yaw = gimbalAzimuth(p_level_aim);
     const double rel_pitch = gimbalElevation(p_gimbal_aim);
 

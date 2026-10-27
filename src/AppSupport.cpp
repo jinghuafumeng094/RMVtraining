@@ -226,20 +226,48 @@ void annotateDetections(cv::Mat& image,
         // 过了三道闸的位姿才有意义，坐标轴也只画在这一条上。
         drawObjectAxes(image, camera, pose->rvec, pose->position_camera_m);
 
-        // PnP 的原始两个输出，一行一个。y 轴朝下，想让它显示在上面，y 偏移要更小，
-        // 所以 -62 在上、-34 在下。
-        cv::putText(image,
-                    cv::format("rvec=(%+.3f, %+.3f, %+.3f)", pose->rvec[0],
-                               pose->rvec[1], pose->rvec[2]),
-                    cv::Point(text_anchor.x, text_anchor.y - 62),
+        // 三行 PnP 文字挂在框左上角上方，自下而上：tvec、rvec、汇总。
+        // y 轴朝下，想让它显示在上面，y 偏移要更小，所以 -34 在下、-62 居中、-90 在上。
+        //
+        // 汇总行是云台系里的方位角、俯仰角、到云台原点的斜距，以及这一次解算的
+        // 重投影误差，与 main.cpp 的 pnp_yaw_rad / pnp_pitch_rad / pnp_distance_m /
+        // pnp_reprojection_error 同式同值。这几项属于相机侧，单帧有效，不受滤波器
+        // 影响，所以和 rvec/tvec 一起贴在板上看。
+        // yaw 取 atan2(-y, x) 得右正，pitch 取 atan2(z, hypot(x, y)) 得上正。
+        const cv::Vec3d& p_gimbal = pose->position_gimbal_m;
+        const std::string rvec_line =
+            cv::format("rvec=(%+.3f, %+.3f, %+.3f)", pose->rvec[0], pose->rvec[1],
+                       pose->rvec[2]);
+        const std::string tvec_line = cv::format(
+            "tvec=(%+.3f, %+.3f, %+.3f)", pose->position_camera_m[0],
+            pose->position_camera_m[1], pose->position_camera_m[2]);
+        const std::string pnp_line =
+            cv::format("PnP yaw=%+.3f pitch=%+.3f d=%.2fm err=%.2fpx",
+                       std::atan2(-p_gimbal[1], p_gimbal[0]),
+                       std::atan2(p_gimbal[2], std::hypot(p_gimbal[0], p_gimbal[1])),
+                       cv::norm(p_gimbal), pose->reprojection_error);
+
+        // 三行都比框宽，贴右边的板会把尾巴挤出画面。按最宽的一行把 x 夹回图内，
+        // 三行才保持左对齐；夹的时候只往左推，不越过框的左上角点太多也没关系，
+        // 字盖住框也比看不见强。
+        int widest = 0;
+        for (const std::string& line : {rvec_line, tvec_line, pnp_line}) {
+            int line_baseline = 0;
+            widest = std::max(
+                widest, cv::getTextSize(line, cv::FONT_HERSHEY_SIMPLEX,
+                                        kPnpTextFontScale, 2, &line_baseline)
+                            .width);
+        }
+        const int text_x =
+            std::max(0, std::min(text_anchor.x, image.cols - widest));
+
+        cv::putText(image, tvec_line, cv::Point(text_x, text_anchor.y - 34),
                     cv::FONT_HERSHEY_SIMPLEX, kPnpTextFontScale,
                     cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
-        cv::putText(image,
-                    cv::format("tvec=(%+.3f, %+.3f, %+.3f)",
-                               pose->position_camera_m[0],
-                               pose->position_camera_m[1],
-                               pose->position_camera_m[2]),
-                    cv::Point(text_anchor.x, text_anchor.y - 34),
+        cv::putText(image, rvec_line, cv::Point(text_x, text_anchor.y - 62),
+                    cv::FONT_HERSHEY_SIMPLEX, kPnpTextFontScale,
+                    cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
+        cv::putText(image, pnp_line, cv::Point(text_x, text_anchor.y - 90),
                     cv::FONT_HERSHEY_SIMPLEX, kPnpTextFontScale,
                     cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
     }

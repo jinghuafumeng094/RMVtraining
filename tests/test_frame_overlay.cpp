@@ -4,7 +4,8 @@
 // 3. 编号 0 的板换黄色，和有效目标分得开；
 // 4. 解算通过的板在板心画出物体系三轴：x 红朝右、y 绿朝下、原点白点；
 // 5. 解算通过才有 rvec/tvec 两行字，颜色 (255,255,0)，位置在框上方两行；
-// 6. 被 armor_solve 的闸挡下的板标红字 PnP x；没标定时一个 PnP 标记都不画。
+// 6. 解算通过还有一行 PnP 汇总：云台系的 yaw/pitch、距离、重投影误差；
+// 7. 被 armor_solve 的闸挡下的板标红字 PnP x；没标定时一个 PnP 标记都不画。
 
 #include "AppSupport.hpp"
 
@@ -12,7 +13,9 @@
 #include <opencv2/imgproc.hpp>
 
 #include <cassert>
+#include <cmath>
 #include <cstdio>
+#include <string>
 #include <vector>
 
 namespace {
@@ -89,11 +92,15 @@ CameraParameters makeCamera() {
     return camera;
 }
 
-ArmorPose makePose(const ArmorDetection& detection, const cv::Vec3d& tvec) {
+ArmorPose makePose(const ArmorDetection& detection, const cv::Vec3d& tvec,
+                   const cv::Vec3d& gimbal_tvec = cv::Vec3d(0.0, 0.0, 0.0),
+                   double reprojection_error = 0.0) {
     ArmorPose pose;
     pose.detection = detection;
     pose.position_camera_m = tvec;
+    pose.position_gimbal_m = gimbal_tvec;
     pose.rvec = cv::Vec3d(0.0, 0.0, 0.0);
+    pose.reprojection_error = reprojection_error;
     return pose;
 }
 
@@ -134,14 +141,19 @@ int main() {
 
     // 5. 解算通过的板：板心处画出物体系三轴，并在框上方写 rvec / tvec 两行。
     //    板心在相机系 (0,0,1)，投到 (200,200)；轴长 7 cm、fx=800 ⇒ 图上 56 px。
-    cv::Mat solved(400, 400, CV_8UC3, kBlack);
+    //    画布放宽到 800：三行字加起来比 400 宽，窄画布里会被右边界截掉，
+    //    那样逐像素比对只能证到被截的一段。截断的情形由第 8 条单独管。
+    cv::Mat solved(600, 800, CV_8UC3, kBlack);
     ArmorDetection solved_plate = makeDetection(3, ArmorSize::Small, 0.82F);
     solved_plate.corners = {cv::Point2f(60.0F, 120.0F),
                             cv::Point2f(160.0F, 120.0F),
                             cv::Point2f(160.0F, 180.0F),
                             cv::Point2f(60.0F, 180.0F)};
+    const cv::Vec3d gimbal_position(0.3, -0.2, 0.1);
+    constexpr double kReprojectionError = 0.42;
     annotateDetections(solved, {solved_plate},
-                       {makePose(solved_plate, cv::Vec3d(0.0, 0.0, 1.0))},
+                       {makePose(solved_plate, cv::Vec3d(0.0, 0.0, 1.0),
+                                 gimbal_position, kReprojectionError)},
                        makeCamera());
     // 原点白点画在板心上。三条轴从原点出发，正中心的像素会被轴线盖住，
     // 所以找的是白点的余下部分，不是 (200,200) 那一个像素。
@@ -154,7 +166,25 @@ int main() {
     assert(countColored(solved, cv::Rect(60, 36, 300, 24), isPnpText) > 10);
     assert(countColored(solved, cv::Rect(60, 64, 300, 24), isPnpText) > 10);
 
-    // 6. 没有对应位姿的板：标红字 PnP x，且不画轴。
+    // 6. 汇总行在框上方 90 px ⇒ 基线 30。数值全部取自云台系，按车上
+    //    pnp_yaw_rad / pnp_pitch_rad / pnp_distance_m 的定义写死：
+    //    yaw = atan2(-y, x) 右正，pitch = atan2(z, hypot(x, y)) 上正，
+    //    d 是到云台原点的斜距，err 就是这一次解算的重投影误差。
+    //    逐像素比对，验的是数值和坐标系，不只是"这里有字"。
+    const cv::Vec3d& gp = gimbal_position;
+    const std::string pnp_line = cv::format(
+        "PnP yaw=%+.3f pitch=%+.3f d=%.2fm err=%.2fpx", std::atan2(-gp[1], gp[0]),
+        std::atan2(gp[2], std::hypot(gp[0], gp[1])), cv::norm(gp), kReprojectionError);
+    cv::Mat expected_pnp(600, 800, CV_8UC3, kBlack);
+    cv::putText(expected_pnp, pnp_line, cv::Point(60, 30), cv::FONT_HERSHEY_SIMPLEX,
+                0.7, cv::Scalar(255, 255, 0), 2, cv::LINE_AA);
+    const cv::Rect pnp_band(60, 2, 340, 34);
+    assert(countColored(solved, pnp_band, isPnpText) > 10);
+    cv::Mat pnp_diff;
+    cv::compare(solved(pnp_band), expected_pnp(pnp_band), pnp_diff, cv::CMP_NE);
+    assert(cv::countNonZero(pnp_diff.reshape(1)) == 0);
+
+    // 7. 没有对应位姿的板：标红字 PnP x，且不画轴。
     cv::Mat rejected(400, 400, CV_8UC3, kBlack);
     ArmorDetection rejected_plate = makeDetection(6, ArmorSize::Small, 0.40F);
     rejected_plate.corners = {cv::Point2f(60.0F, 300.0F),
@@ -168,6 +198,23 @@ int main() {
     assert(countColored(rejected, cv::Rect(60, 248, 100, 20), isRed) > 5);
     // 这条没有位姿，板心位置不该出现白点或轴。
     assert(isBlack(rejected.at<cv::Vec3b>(200, 200)));
+    // 角点 (60,300)，汇总行本该在基线 210 一带；这条连位姿都没有，那一带是空的。
+    assert(countColored(rejected, cv::Rect(60, 182, 340, 34), isPnpText) == 0);
+
+    // 8. 贴右边的板：三行字按最宽的一行整体往左推，整行留在画面内。
+    cv::Mat right_edge(600, 800, CV_8UC3, kBlack);
+    ArmorDetection edge_plate = makeDetection(4, ArmorSize::Small, 0.66F);
+    edge_plate.corners = {cv::Point2f(700.0F, 300.0F),
+                          cv::Point2f(800.0F, 300.0F),
+                          cv::Point2f(800.0F, 360.0F),
+                          cv::Point2f(700.0F, 360.0F)};
+    annotateDetections(right_edge, {edge_plate},
+                       {makePose(edge_plate, cv::Vec3d(0.0, 0.0, 1.0),
+                                 gimbal_position, kReprojectionError)},
+                       makeCamera());
+    // 汇总行基线 300-90=210。框从 x=700 起，字整行比图窄不了多少，左推之后
+    // 左半截落在 x<600 一带；不推的话这一带一个青色像素都没有。
+    assert(countColored(right_edge, cv::Rect(0, 182, 600, 34), isPnpText) > 10);
 
     std::puts("frame_overlay ok");
     return 0;
