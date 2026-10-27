@@ -92,7 +92,7 @@
   <text x="1048" y="250" font-size="16" fill="#2b5fd0">z 指向板背</text>
 
   <text x="60" y="486" font-size="16" fill="#333">
-    云台系取 <tspan font-weight="bold">x 前 / y 左 / z 上</tspan>，与弹道系（世界系）轴向相同，两系只差一个绕竖直轴的偏航角。
+    云台系取 <tspan font-weight="bold">x 前 / y 左 / z 上</tspan>，与弹道系（世界系）轴向相同，两系只差云台的偏航与俯仰两个角。
   </text>
   <text x="60" y="512" font-size="16" fill="#333">
     相机系是 右 / 下 / 前，与云台系不同向，所以旋转外参 R 不是单位阵，而是一个 90° 置换矩阵，见 (b)。

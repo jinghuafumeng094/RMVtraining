@@ -287,7 +287,7 @@ public:
     // yaw = 90 度时正好等于一整个 muzzle_offset_m。
     //
     // p_gimbal 必须已经去掉 pitch，即 worldToGimbal(yaw) 的结果。弹道要的是
-    // 重力方向下的分解，叠进 pitch 后 z 不再竖直，算出来的落点补偿是错的。
+    // 重力方向下的分解，叠进 pitch 后 z 不再竖直。枪口高 δsinφ 按 0 处理，是已知近似。
     struct BallisticInputs {
         double horizontal_m{0.0};
         double vertical_m{0.0};

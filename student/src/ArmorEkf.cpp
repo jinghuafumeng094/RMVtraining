@@ -843,8 +843,8 @@ PredictionResult ArmorEkf::buildPrediction(const GimbalState& gimbal, double lat
     //
     //   to_level  只去 yaw，系仍然水平。方位角、水平距离、竖直高差都在这个系里：
     //             方位角绕的是竖直轴，yaw 电机的指令就是它；弹道模型要的是重力
-    //             方向下的分解，也要水平系。枪口偏移 (offset, 0, 0) 在这个系里
-    //             同样是对的，它与改动前 worldToGimbal(yaw) 的行为逐位相同。
+    //             方向下的分解，也要水平系。枪口偏移也在这个系里减，枪口比 P 轴
+    //             高 δ sin(pitch) 这一点按 0 处理，是已知近似，见 docs 8.2.1。
     //   to_gimbal 再叠一层 pitch，才是相机与炮管真正所在的系。只有"相对炮管轴
     //             的仰角"需要它：叠上 gimbal_pitch 才是绝对仰角。
     const Eigen::Matrix3d to_level = worldToGimbal(gimbal_yaw);

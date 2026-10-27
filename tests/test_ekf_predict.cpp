@@ -429,6 +429,29 @@ void testCoordinateTransforms() {
         ArmorEkf::worldToGimbal(yaw) * ArmorEkf::gimbalToWorld(yaw);
     assert((round_trip - Eigen::Matrix3d::Identity()).norm() < 1e-12);
 
+    // 俯仰这一层：抬头为正，云台正前方在世界系里抬到 +z 上。
+    // 少了这一层时下面第一条就让正前方留在 z = 0，立刻红。
+    const double pitch = 0.2;
+    const Eigen::Vector3d lifted =
+        ArmorEkf::gimbalToWorld(0.0, pitch) * Eigen::Vector3d(1.0, 0.0, 0.0);
+    assert(std::fabs(lifted.z() - std::sin(pitch)) < 1e-12);
+    assert(std::fabs(lifted.x() - std::cos(pitch)) < 1e-12);
+    // 横向轴不参与俯仰。
+    const Eigen::Vector3d left =
+        ArmorEkf::gimbalToWorld(0.0, pitch) * Eigen::Vector3d(0.0, 1.0, 0.0);
+    assert((left - Eigen::Vector3d(0.0, 1.0, 0.0)).norm() < 1e-12);
+    // 两个角一起给时，往返仍是恒等。
+    const Eigen::Matrix3d round_trip_both = ArmorEkf::worldToGimbal(yaw, pitch) *
+                                            ArmorEkf::gimbalToWorld(yaw, pitch);
+    assert((round_trip_both - Eigen::Matrix3d::Identity()).norm() < 1e-12);
+    // 顺序：先 yaw 后 pitch。两个角都非零时，两种顺序给出不同的矩阵，
+    // 这里钉住选用的是哪一种。
+    const Eigen::Matrix3d yaw_only = ArmorEkf::gimbalToWorld(yaw, 0.0);
+    const Eigen::Matrix3d pitch_only = ArmorEkf::gimbalToWorld(0.0, pitch);
+    const Eigen::Matrix3d both = ArmorEkf::gimbalToWorld(yaw, pitch);
+    assert((both - yaw_only * pitch_only).norm() < 1e-12);
+    assert((both - pitch_only * yaw_only).norm() > 1e-6);
+
     assert(std::fabs(ArmorEkf::wrapToPi(0.0)) < 1e-15);
     assert(std::fabs(ArmorEkf::wrapToPi(3.0 + 2.0 * kPi) - 3.0) < 1e-12);
     assert(std::fabs(ArmorEkf::wrapToPi(6.0 * kPi)) < 1e-12);
