@@ -228,7 +228,8 @@ PredictionResult ekf_predict(const std::vector<ArmorPose>& observations,
     static double last_timestamp = 0.0;
 
     const armor::TargetSelection selection =
-        selector.select(observations, static_cast<double>(gimbal.yaw), timestamp_seconds);
+        selector.select(observations, static_cast<double>(gimbal.yaw), timestamp_seconds,
+                        static_cast<double>(gimbal.pitch));
 
     // 换簇不等于换车：同一辆靶车的两块板拆成两簇也会置 switched，而这时滤波器
     // 可能正处在 Stable。无条件重置会把收敛好的半径与速度一起扔掉，重建时还会
@@ -257,7 +258,8 @@ PredictionResult ekf_predict(const std::vector<ArmorPose>& observations,
     filter.predict(dt);
     for (int index : selection.observation_indices) {
         filter.update(observations[static_cast<std::size_t>(index)],
-                      static_cast<double>(gimbal.yaw));
+                      static_cast<double>(gimbal.yaw),
+                      static_cast<double>(gimbal.pitch));
     }
     filter.advanceStateMachine(timestamp_seconds);
     return filter.buildPrediction(gimbal, latency_s);

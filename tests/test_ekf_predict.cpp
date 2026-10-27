@@ -162,14 +162,29 @@ ArmorPose makeObservation(const Eigen::Vector3d& z, int target_id, double armor_
     return observation;
 }
 
+// p_G = Ry(pitch) * Rz(yaw) * p_W，是 M = Rz(-yaw) * Ry(-pitch) 的转置。
+// 测试自己写一遍这个乘积，不调被测的 worldToGimbal：变换少一层时两边一起错，
+// 用例还是绿的。
+Eigen::Vector3d toGimbalHand(const Eigen::Vector3d& p, double yaw, double pitch) {
+    const double cy = std::cos(yaw);
+    const double sy = std::sin(yaw);
+    const double a = cy * p.x() - sy * p.y();
+    const double b = sy * p.x() + cy * p.y();
+    const double c = p.z();
+    const double cp = std::cos(pitch);
+    const double sp = std::sin(pitch);
+    return Eigen::Vector3d(cp * a + sp * c, b, -sp * a + cp * c);
+}
+
 void feedFrame(ArmorEkf& filter, const ArmorEkf::Config& config, const Truth& truth,
-               double gimbal_yaw, double noise_sigma_m = 0.0, int frame = 0) {
-    const Eigen::Matrix3d to_gimbal = ArmorEkf::worldToGimbal(gimbal_yaw);
+               double gimbal_yaw, double noise_sigma_m = 0.0, int frame = 0,
+               double gimbal_pitch = 0.0) {
     for (int index = 0; index < config.plate_count; ++index) {
         if (!plateFacesCamera(truth, index, config)) {
             continue;
         }
-        Eigen::Vector3d z = to_gimbal * truePlateWorld(truth, index, config);
+        Eigen::Vector3d z =
+            toGimbalHand(truePlateWorld(truth, index, config), gimbal_yaw, gimbal_pitch);
         if (noise_sigma_m > 0.0) {
             const double n = static_cast<double>(frame) + 0.37 * static_cast<double>(index);
             z.x() += noise_sigma_m * std::sin(1.7 * n + 0.3);
@@ -177,7 +192,7 @@ void feedFrame(ArmorEkf& filter, const ArmorEkf::Config& config, const Truth& tr
             z.z() += noise_sigma_m * std::sin(3.1 * n + 2.7);
         }
         filter.update(makeObservation(z, index + 1, trueArmorYaw(truth, index, config, gimbal_yaw)),
-                      gimbal_yaw);
+                      gimbal_yaw, gimbal_pitch);
     }
 }
 
@@ -1170,6 +1185,48 @@ void testGimbalRotationIsNotTargetMotion() {
     std::printf("[ekf] 云台转动不产生目标运动 通过\n");
 }
 
+// 车心高度是世界量，靶车沿地面平移时不该跟着变。云台的 pitch 不进变换时，
+// 「世界系」其实是炮管系：同一块板在 G 里的 z 是 h*cos(p) - d*sin(p)，
+// 距离项被原样记进了车心高度。12 度俯仰、视线前后挪 3 m，ekf_z_m 就差
+// 3*sin(12 度) = 0.62 m，这就是页面上那几十厘米漂移。
+//
+// 同一块板、同一个真值高度，只把车摆到两个距离上。收敛后的 center_z_m
+// 必须与距离无关，而且要落在真值附近，不能两个一起偏。
+// 两块可见的距离上都是单板，半径由先验钉住，真值半径与先验取同一个数，
+// 免得把建模误差算进这条断言。
+void testGimbalPitchKeepsWorldHeight() {
+    const ArmorEkf::Config config = testConfig();
+    const double pitch = 12.0 * kPi / 180.0;
+    const double true_height = -0.25;
+    const GimbalState gimbal = makeGimbal(0.0, pitch);
+
+    const auto settled_z = [&](double distance) {
+        ArmorEkf filter(config);
+        Truth truth;
+        truth.center = Eigen::Vector3d(distance, 0.0, true_height);
+        truth.yaw = 0.0;
+        truth.yaw_rate = 0.0;
+        truth.radius1 = config.initial_radius_m;
+        truth.radius2 = config.initial_radius_m;
+        const double dt = 1.0 / 165.0;
+        for (int frame = 0; frame < 800; ++frame) {
+            filter.predict(dt);
+            feedFrame(filter, config, truth, 0.0, 0.0, 0, pitch);
+            filter.advanceStateMachine(static_cast<double>(frame + 1) * dt);
+        }
+        return static_cast<double>(filter.buildPrediction(gimbal, 0.001).center_z_m);
+    };
+
+    const double near_z = settled_z(1.5);
+    const double far_z = settled_z(4.5);
+    std::printf("[ekf] 俯仰 %.0f 度 车心 z 近 %.4f 远 %.4f 真值 %.4f\n",
+                pitch * 180.0 / kPi, near_z, far_z, true_height);
+    assert(std::fabs(near_z - far_z) < 0.02);
+    assert(std::fabs(near_z - true_height) < 0.05);
+    assert(std::fabs(far_z - true_height) < 0.05);
+    std::printf("[ekf] 云台俯仰下车心高度不随距离变 通过\n");
+}
+
 void testStateMachineTiming() {
     const ArmorEkf::Config config = testConfig();
     ArmorEkf filter(config);
@@ -1620,6 +1677,7 @@ int main() {
     testSameFrameDuplicatePlateIsRejectedByYaw();
     testDivergedFilterReinitializesFromConsistentObservations();
     testGimbalRotationIsNotTargetMotion();
+    testGimbalPitchKeepsWorldHeight();
     testStateMachineTiming();
     testInitializationTakesOneObservationPerFrame();
     testNegativePredictionBiasIsHonored();

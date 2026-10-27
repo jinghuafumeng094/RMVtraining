@@ -19,13 +19,23 @@
 //     r1/r2     偶数/奇数编号装甲板到旋转中心的半径 (m)
 //
 // 两套坐标系，互相变换只允许走 gimbalToWorld / worldToGimbal 两个函数：
-//   G 云台系  x 前、y 左、z 上
+//   G 云台系  x 前、y 左、z 上，跟着云台的 yaw 与 pitch 一起转
 //             armor_solve 输出的 position_gimbal_m 就在这个系里。
-//   W 世界系  x 前、y 左、z 上
+//   W 世界系  x 前、y 左、z 上，水平，不随云台动
 //             与 armor/include/BulletModel.hpp 的弹道模型约定一致。
 //
-// 两系轴向相同，只差一个绕竖直轴（两系的 z）的偏航角，没有基础变换。
-// 依据：学长 2026-10-15「云台系和世界系一样」，见 docs/上车前问题清单.md 第 1.1 节。
+// 两系轴向相同，没有基础变换，只差云台的两个角：先绕 y 轴去 pitch，
+// 再绕 z 轴去 yaw，即 M = Rz(-yaw) * Ry(-pitch)。
+//
+// 2026-10-27 之前这里只去 yaw。云台是有俯仰的，那时的「世界系」其实是炮管系：
+// 同一块板在 G 里的 z 是 h*cos(p) - d*sin(p)，距离项被原样算进了车心高度，
+// 靶车前后走几米，ekf_z_m 就跟着走几十厘米。5 m、10 度时是 0.87 m。
+//
+// roll 仍不进变换。GimbalState.roll 目前没有任何一路输入给它，恒为 0；
+// 真车上要加，按 Rz(-yaw) * Ry(-pitch) * Rx(-roll) 接在右边。
+//
+// 学长 2026-10-15 的「云台系和世界系一样」指的是轴向与没有基础变换，见
+// docs/上车前问题清单.md 第 1.1 节；两个云台角仍然要转，pitch 这一层 10-27 补上。
 // 代价是相机系（右 / 下 / 前）与云台系不再同向，config/camera.yaml 的旋转外参
 // 因此不是单位阵而是 90 度置换矩阵；那是外参的事，本类只按上面的轴向写。
 //
@@ -231,7 +241,10 @@ public:
     // 主循环三步，按顺序每帧调用一次。
     void predict(double dt);
     // 关联、门控并更新。返回是否吃下了这条观测。
-    bool update(const ArmorPose& observation, double gimbal_yaw);
+    // gimbal_pitch 抬头为正，与 GimbalState.pitch 同口径。默认 0 只给不带
+    // 俯仰的回放工具与测试用，主链路必须传真实值，否则世界系又变回炮管系。
+    bool update(const ArmorPose& observation, double gimbal_yaw,
+                double gimbal_pitch = 0.0);
     // 状态迁移与超时重置。必须每帧调用一次，包括没有观测的帧。
     void advanceStateMachine(double timestamp_seconds);
 
@@ -256,20 +269,25 @@ public:
     // 见 PredictionResult::nis_mean 与 main.cpp 的 logPrediction。
     double recentNisMean() const;
 
-    // 坐标系变换：p_world = gimbalToWorld(yaw) * p_gimbal。
-    // M(yaw) = [  cos  sin  0 ]
-    //          [ -sin  cos  0 ]
-    //          [   0    0   1 ]
-    // 两系轴向相同，就只剩这个绕 z 轴的偏航，行列式为 +1。
-    // gimbal_yaw 取正值时云台向右转，世界系里的视线朝 -y 走。
-    static Eigen::Matrix3d gimbalToWorld(double gimbal_yaw);
-    static Eigen::Matrix3d worldToGimbal(double gimbal_yaw);
+    // 坐标系变换：p_world = gimbalToWorld(yaw, pitch) * p_gimbal。
+    // M = Rz(-yaw) * Ry(-pitch)
+    //   Rz(-yaw) = [  cos  sin  0 ]      Ry(-pitch) = [ cos  0 -sin ]
+    //              [ -sin  cos  0 ]                   [  0   1   0  ]
+    //              [   0    0   1 ]                   [ sin  0  cos ]
+    // 两系轴向相同，只有这两个云台角，行列式为 +1。
+    // gimbal_yaw 取正值时云台向右转，世界系里的视线朝 -y 走；
+    // gimbal_pitch 取正值时炮管抬头，云台 +x 在世界系里朝 +z 抬。
+    static Eigen::Matrix3d gimbalToWorld(double gimbal_yaw, double gimbal_pitch = 0.0);
+    static Eigen::Matrix3d worldToGimbal(double gimbal_yaw, double gimbal_pitch = 0.0);
 
-    // 弹道模型的两个输入：目标相对枪口的水平距离与高度差，都在云台系里量。
-    // 枪口 = 云台原点 + (muzzle_offset_m, 0, 0)。云台系跟世界系只差一个绕 z 的
-    // yaw，hypot(x, y) 与 z 都不过 yaw，所以在云台系里算，与在 W 里减掉旋转后的
-    // 那个向量逐位相同。反过来，若在 W 里直接减常向量 (muzzle_offset_m, 0, 0)，
-    // 误差随 yaw 走，yaw = 90 度时正好等于一整个 muzzle_offset_m。
+    // 弹道模型的两个输入：目标相对枪口的水平距离与高度差，都在水平的云台系里量。
+    // 枪口 = 云台原点 + (muzzle_offset_m, 0, 0)。hypot(x, y) 与 z 都不过 yaw，
+    // 所以在只去 yaw 的系里算，与在 W 里减掉旋转后的那个向量逐位相同。
+    // 反过来，若在 W 里直接减常向量 (muzzle_offset_m, 0, 0)，误差随 yaw 走，
+    // yaw = 90 度时正好等于一整个 muzzle_offset_m。
+    //
+    // p_gimbal 必须已经去掉 pitch，即 worldToGimbal(yaw) 的结果。弹道要的是
+    // 重力方向下的分解，叠进 pitch 后 z 不再竖直，算出来的落点补偿是错的。
     struct BallisticInputs {
         double horizontal_m{0.0};
         double vertical_m{0.0};
@@ -282,11 +300,13 @@ public:
     static Eigen::Vector3d observationModel(const StateVector& x, int armor_index,
                                             double gimbal_yaw,
                                             const std::array<double, 4>& plate_height_m,
-                                            double plate_spacing_rad);
+                                            double plate_spacing_rad,
+                                            double gimbal_pitch = 0.0);
     static ObservationJacobian observationJacobian(const StateVector& x, int armor_index,
                                                    double gimbal_yaw,
                                                    const std::array<double, 4>& plate_height_m,
-                                                   double plate_spacing_rad);
+                                                   double plate_spacing_rad,
+                                                   double gimbal_pitch = 0.0);
 
     // 把角度折算到 (-pi, pi]。
     static double wrapToPi(double angle);
@@ -296,16 +316,22 @@ private:
     static int normalizeIndex(int armor_index, int plate_count);
     static int radiusIndex(int armor_index);
 
-    bool tryInitialize(const ArmorPose& observation, double gimbal_yaw);
-    bool associateAndUpdate(const ArmorPose& observation, double gimbal_yaw);
+    bool tryInitialize(const ArmorPose& observation, double gimbal_yaw,
+                       double gimbal_pitch);
+    bool associateAndUpdate(const ArmorPose& observation, double gimbal_yaw,
+                            double gimbal_pitch);
     // 板面法向的偏航是一条与板心位置独立的观测，按标量卡尔曼只更新 Yaw。
     // 位置更新被 NIS 闸拒掉时也照样调用，见 associateAndUpdate 里的说明。
+    // 只收 gimbal_yaw：板面法向是水平的，绕 y 轴转 pitch 只会让它在这个系里
+    // 的方位角变化一个二阶量，30 度俯仰下最大约 4 度，远在 0.5 rad 的闸之内，
+    // 也当不成观测。位置那条链路才是 pitch 必须进去的地方。
     void updateYaw(const ArmorPose& observation, int armor_index, double gimbal_yaw);
     // 把一帧板心喂进初始化窗口，返回窗口是否已经攒够。
     bool accumulateInitWindow(const Eigen::Vector3d& plate_world);
     // 按一块世界系板心反推旋转中心，建起滤波器。初始化与跳闸外重建共用。
     void startTracking(const Eigen::Vector3d& plate_world, std::uint8_t target_id);
     // commit=false 只查询不写 aim_index_，供弹道迭代这类"试算"使用。
+    // 比较的是方位角，方位角绕的是竖直轴，与俯仰无关，所以只收 gimbal_yaw。
     int selectArmorIndex(const StateVector& x, double gimbal_yaw, bool commit);
     Eigen::Vector3d platePositionWorld(const StateVector& x, int armor_index) const;
     // 把两个半径夹进 [min_radius_m, max_radius_m]，并平移车心，保持

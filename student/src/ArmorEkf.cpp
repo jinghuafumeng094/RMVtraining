@@ -26,8 +26,10 @@
 // 所以 theta_c 左为正。gimbal.yaw 定义成右为正。
 // 两者各自只在一个地方用一次，滤波器因此仍然自洽，不需要强行统一。
 //
-// G 云台系与 W 世界系轴向相同（前 / 左 / 上），只差绕竖直轴的偏航角。依据是
-// 学长 2026-10-15「云台系和世界系一样」，见 docs/上车前问题清单.md 第 1.1 节。
+// G 云台系与 W 世界系轴向相同（前 / 左 / 上），没有基础变换，差的是云台的
+// 两个角：p_W = Rz(-yaw) * Ry(-pitch) * p_G。学长 2026-10-15 的「云台系和
+// 世界系一样」说的是轴向这一层，见 docs/上车前问题清单.md 第 1.1 节；
+// pitch 这一层是 2026-10-27 补的，此前 W 实际是炮管系，见 gimbalToWorld。
 // tests/test_ekf_predict.cpp 把两处都钉住了：坐标变换用例钉 gimbalToWorld 的
 // 方向，无噪收敛用例逐分量比对真值（真值的 psi 就用左为正），把 theta_c 钉住。
 // 但"是否符合电控下发的符号"仓库里没有任何一处写明，只能上车确认。若发现
@@ -119,18 +121,34 @@ ArmorEkf::ArmorEkf(const Config& config) : config_(config) {}
 // 坐标系变换
 // ---------------------------------------------------------------------------
 
-Eigen::Matrix3d ArmorEkf::gimbalToWorld(double gimbal_yaw) {
-    const double s = std::sin(gimbal_yaw);
-    const double c = std::cos(gimbal_yaw);
-    Eigen::Matrix3d m;
-    m << c, s, 0.0,
-         -s, c, 0.0,
-         0.0, 0.0, 1.0;
-    return m;
+// M = Rz(-yaw) * Ry(-pitch)，gimbal_yaw 右为正、gimbal_pitch 抬头为正。
+//
+// pitch 这一层是 2026-10-27 补的。云台装在俯仰轴上，相机跟着一起转，
+// armor_solve 解出来的 position_gimbal_m 就在跟着俯仰转的那个系里。
+// 只去 yaw 时，同一块板在 W 里的 z 是 h*cos(p) - d*sin(p)：后一项是云台的
+// 转动乘上距离，不是目标的竖直运动，却被 startTracking 原样算进了 Pz。
+// 靶车在原地前后走，ekf_z_m 就跟着距离走，5 m、10 度时是 0.87 m。
+//
+// 顺序不能反：先绕 G 的 y 轴去 pitch，再绕 z 轴去 yaw。两步的轴都在前一步
+// 的系里，换成 Ry(-pitch) * Rz(-yaw) 就是另一个矩阵。
+Eigen::Matrix3d ArmorEkf::gimbalToWorld(double gimbal_yaw, double gimbal_pitch) {
+    const double sy = std::sin(gimbal_yaw);
+    const double cy = std::cos(gimbal_yaw);
+    const double sp = std::sin(gimbal_pitch);
+    const double cp = std::cos(gimbal_pitch);
+    Eigen::Matrix3d yaw_matrix;
+    yaw_matrix << cy, sy, 0.0,
+                  -sy, cy, 0.0,
+                  0.0, 0.0, 1.0;
+    Eigen::Matrix3d pitch_matrix;
+    pitch_matrix << cp, 0.0, -sp,
+                    0.0, 1.0, 0.0,
+                    sp, 0.0, cp;
+    return yaw_matrix * pitch_matrix;
 }
 
-Eigen::Matrix3d ArmorEkf::worldToGimbal(double gimbal_yaw) {
-    return gimbalToWorld(gimbal_yaw).transpose();
+Eigen::Matrix3d ArmorEkf::worldToGimbal(double gimbal_yaw, double gimbal_pitch) {
+    return gimbalToWorld(gimbal_yaw, gimbal_pitch).transpose();
 }
 
 ArmorEkf::BallisticInputs ArmorEkf::ballisticInputsFromMuzzle(
@@ -172,7 +190,8 @@ int ArmorEkf::radiusIndex(int armor_index) {
 Eigen::Vector3d ArmorEkf::observationModel(const StateVector& x, int armor_index,
                                            double gimbal_yaw,
                                            const std::array<double, 4>& plate_height_m,
-                                           double plate_spacing_rad) {
+                                           double plate_spacing_rad,
+                                           double gimbal_pitch) {
     const int i = armor_index;
     const double psi = x[Yaw] + static_cast<double>(i) * plate_spacing_rad;
     const double radius = x[radiusIndex(i)];
@@ -180,17 +199,18 @@ Eigen::Vector3d ArmorEkf::observationModel(const StateVector& x, int armor_index
     u << x[Px] + radius * std::cos(psi),
          x[Py] + radius * std::sin(psi),
          x[Pz] + plate_height_m[static_cast<std::size_t>(i)];
-    return worldToGimbal(gimbal_yaw) * u;
+    return worldToGimbal(gimbal_yaw, gimbal_pitch) * u;
 }
 
 ArmorEkf::ObservationJacobian ArmorEkf::observationJacobian(
     const StateVector& x, int armor_index, double gimbal_yaw,
-    const std::array<double, 4>& plate_height_m, double plate_spacing_rad) {
+    const std::array<double, 4>& plate_height_m, double plate_spacing_rad,
+    double gimbal_pitch) {
     (void)plate_height_m;  // 高度是常量，不进状态，因此不产生列
     const int i = armor_index;
     const double psi = x[Yaw] + static_cast<double>(i) * plate_spacing_rad;
     const double radius = x[radiusIndex(i)];
-    const Eigen::Matrix3d to_gimbal = worldToGimbal(gimbal_yaw);
+    const Eigen::Matrix3d to_gimbal = worldToGimbal(gimbal_yaw, gimbal_pitch);
 
     // h(x) = M^T * u(x)，所以每列就是 M^T 乘上 u 对那个状态分量在 W 系里的偏导。
     // 一律走 worldToGimbal，不在这里手抄 M^T 的元素。手抄等于把同一个约定写两遍，
@@ -367,17 +387,22 @@ void ArmorEkf::predict(double dt) {
 // 初始化与更新
 // ---------------------------------------------------------------------------
 
-bool ArmorEkf::update(const ArmorPose& observation, double gimbal_yaw) {
+bool ArmorEkf::update(const ArmorPose& observation, double gimbal_yaw,
+                      double gimbal_pitch) {
     if (!std::isfinite(gimbal_yaw)) {
         gimbal_yaw = 0.0;
     }
-    if (status_ == TrackingState::NoTarget) {
-        return tryInitialize(observation, gimbal_yaw);
+    if (!std::isfinite(gimbal_pitch)) {
+        gimbal_pitch = 0.0;
     }
-    return associateAndUpdate(observation, gimbal_yaw);
+    if (status_ == TrackingState::NoTarget) {
+        return tryInitialize(observation, gimbal_yaw, gimbal_pitch);
+    }
+    return associateAndUpdate(observation, gimbal_yaw, gimbal_pitch);
 }
 
-bool ArmorEkf::tryInitialize(const ArmorPose& observation, double gimbal_yaw) {
+bool ArmorEkf::tryInitialize(const ArmorPose& observation, double gimbal_yaw,
+                             double gimbal_pitch) {
     if (init_used_this_frame_) {
         // 本帧已经有一条观测参与了初始化计数，同帧的其余观测直接跳过。
         return false;
@@ -394,7 +419,7 @@ bool ArmorEkf::tryInitialize(const ArmorPose& observation, double gimbal_yaw) {
         return false;
     }
 
-    if (!accumulateInitWindow(gimbalToWorld(gimbal_yaw) * z)) {
+    if (!accumulateInitWindow(gimbalToWorld(gimbal_yaw, gimbal_pitch) * z)) {
         return false;
     }
     startTracking(init_mean_, observation.detection.target_id);
@@ -462,7 +487,8 @@ void ArmorEkf::startTracking(const Eigen::Vector3d& plate_world, std::uint8_t ta
     init_mean_.setZero();
 }
 
-bool ArmorEkf::associateAndUpdate(const ArmorPose& observation, double gimbal_yaw) {
+bool ArmorEkf::associateAndUpdate(const ArmorPose& observation, double gimbal_yaw,
+                                  double gimbal_pitch) {
     const Eigen::Vector3d z(observation.position_gimbal_m[0],
                             observation.position_gimbal_m[1],
                             observation.position_gimbal_m[2]);
@@ -517,13 +543,15 @@ bool ArmorEkf::associateAndUpdate(const ArmorPose& observation, double gimbal_ya
             continue;  // 一帧内一块板只配一条观测
         }
         const Eigen::Vector3d h = observationModel(
-            x_, i, gimbal_yaw, config_.plate_height_m, config_.plate_spacing_rad);
+            x_, i, gimbal_yaw, config_.plate_height_m, config_.plate_spacing_rad,
+            gimbal_pitch);
         const Eigen::Vector3d residual = z - h;
         if (residual.norm() > config_.jump_gate_m) {
             continue;  // 物理跳变闸：6 ms 内 0.6 m 相当于 100 m/s，不可能是真目标
         }
         const ObservationJacobian H = observationJacobian(
-            x_, i, gimbal_yaw, config_.plate_height_m, config_.plate_spacing_rad);
+            x_, i, gimbal_yaw, config_.plate_height_m, config_.plate_spacing_rad,
+            gimbal_pitch);
         const Eigen::Matrix3d S = H * P_ * H.transpose() + R;
         const double nis = residual.transpose() * S.inverse() * residual;
         if (!std::isfinite(nis)) {
@@ -553,7 +581,7 @@ bool ArmorEkf::associateAndUpdate(const ArmorPose& observation, double gimbal_ya
         if (status_ != TrackingState::NoTarget && !updated_this_frame_ &&
             !init_used_this_frame_ && miss_count_ >= config_.reinit_after_misses) {
             init_used_this_frame_ = true;
-            if (accumulateInitWindow(gimbalToWorld(gimbal_yaw) * z)) {
+            if (accumulateInitWindow(gimbalToWorld(gimbal_yaw, gimbal_pitch) * z)) {
                 startTracking(init_mean_, observation.detection.target_id);
                 return true;
             }
@@ -811,8 +839,16 @@ PredictionResult ArmorEkf::buildPrediction(const GimbalState& gimbal, double lat
     const double latency = smoothedLatency(latency_s);
     const double t0 = std::clamp(latency + bias, 0.0, config_.max_prediction_s);
 
-    // 云台系的点后面多处要用，先算一次，飞行时间迭代、瞄准、中心差分共用。
-    const Eigen::Matrix3d to_gimbal = worldToGimbal(gimbal_yaw);
+    // 这里的量分属两套系，两个矩阵各管一半，混用会静默错。
+    //
+    //   to_level  只去 yaw，系仍然水平。方位角、水平距离、竖直高差都在这个系里：
+    //             方位角绕的是竖直轴，yaw 电机的指令就是它；弹道模型要的是重力
+    //             方向下的分解，也要水平系。枪口偏移 (offset, 0, 0) 在这个系里
+    //             同样是对的，它与改动前 worldToGimbal(yaw) 的行为逐位相同。
+    //   to_gimbal 再叠一层 pitch，才是相机与炮管真正所在的系。只有"相对炮管轴
+    //             的仰角"需要它：叠上 gimbal_pitch 才是绝对仰角。
+    const Eigen::Matrix3d to_level = worldToGimbal(gimbal_yaw);
+    const Eigen::Matrix3d to_gimbal = worldToGimbal(gimbal_yaw, gimbal_pitch);
 
     // 飞行时间依赖距离，距离又依赖预测时长。两次迭代解开这个循环。
     // 迭代里只试算，不提交 aim_index_，否则迟滞状态会被试算值写脏。
@@ -827,7 +863,7 @@ PredictionResult ArmorEkf::buildPrediction(const GimbalState& gimbal, double lat
         const Eigen::Vector3d p_world = platePositionWorld(x_step, index);
         // 这一轮只取飞行时间，第三个参数是回退仰角，用不到。
         const BallisticInputs inputs =
-            ballisticInputsFromMuzzle(to_gimbal * p_world, config_.muzzle_offset_m);
+            ballisticInputsFromMuzzle(to_level * p_world, config_.muzzle_offset_m);
         flight_s = solveBallistics(inputs.horizontal_m, inputs.vertical_m, 0.0)
                        .flight_time_s;
     }
@@ -840,16 +876,17 @@ PredictionResult ArmorEkf::buildPrediction(const GimbalState& gimbal, double lat
         return PredictionResult{};
     }
     const Eigen::Vector3d p_world_aim = platePositionWorld(x_pred, aim_index);
+    const Eigen::Vector3d p_level_aim = to_level * p_world_aim;
     const Eigen::Vector3d p_gimbal_aim = to_gimbal * p_world_aim;
 
     // 与 main.cpp 里 pnp_yaw_rad / pnp_pitch_rad 同式：yaw 右为正，pitch 抬头为正。
-    const double rel_yaw = gimbalAzimuth(p_gimbal_aim);
+    const double rel_yaw = gimbalAzimuth(p_level_aim);
     const double rel_pitch = gimbalElevation(p_gimbal_aim);
 
     // 指令仰角取弹道发射仰角。下坠补偿在算法侧做，发的不是瞄准点的几何仰角；
     // 第三个参数是弹道解不收敛时的回退值，即不作补偿的几何绝对仰角。
     const BallisticInputs aim_inputs =
-        ballisticInputsFromMuzzle(p_gimbal_aim, config_.muzzle_offset_m);
+        ballisticInputsFromMuzzle(p_level_aim, config_.muzzle_offset_m);
     const double command_pitch =
         solveBallistics(aim_inputs.horizontal_m, aim_inputs.vertical_m,
                         gimbal_pitch + rel_pitch)
@@ -867,14 +904,16 @@ PredictionResult ArmorEkf::buildPrediction(const GimbalState& gimbal, double lat
     const Eigen::Vector3d p_world_late = platePositionWorld(x_late, aim_index);
     const Eigen::Vector3d p_early = to_gimbal * p_world_early;
     const Eigen::Vector3d p_late = to_gimbal * p_world_late;
-    const double yaw_early = gimbalAzimuth(p_early);
-    const double yaw_late = gimbalAzimuth(p_late);
+    const Eigen::Vector3d p_level_early = to_level * p_world_early;
+    const Eigen::Vector3d p_level_late = to_level * p_world_late;
+    const double yaw_early = gimbalAzimuth(p_level_early);
+    const double yaw_late = gimbalAzimuth(p_level_late);
     // target_pitch 是补偿后的角，它的速率也必须来自补偿后的角，
     // 否则同一个上报结构里两个量对不上。
     const BallisticInputs early_inputs =
-        ballisticInputsFromMuzzle(p_early, config_.muzzle_offset_m);
+        ballisticInputsFromMuzzle(p_level_early, config_.muzzle_offset_m);
     const BallisticInputs late_inputs =
-        ballisticInputsFromMuzzle(p_late, config_.muzzle_offset_m);
+        ballisticInputsFromMuzzle(p_level_late, config_.muzzle_offset_m);
     const double pitch_early =
         solveBallistics(early_inputs.horizontal_m, early_inputs.vertical_m,
                         gimbal_pitch + gimbalElevation(p_early))

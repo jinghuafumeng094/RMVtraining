@@ -117,13 +117,16 @@ public:
     void reset();
 
     // timestamp_seconds 用于遮挡计时，必须单调不减；非有限值时按 0 处理。
+    // gimbal_pitch 只参与 gimbal -> world 的变换，与 ArmorEkf 同一个约定，
+    // 不给就按 0 处理，等价于云台水平。
     TargetSelection select(const std::vector<ArmorPose>& observations, double gimbal_yaw,
-                           double timestamp_seconds);
+                           double timestamp_seconds, double gimbal_pitch = 0.0);
 
     // 纯函数，不依赖跨帧状态，供测试与调试。
     static std::vector<TargetCluster> buildClusters(const std::vector<ArmorPose>& observations,
                                                     double gimbal_yaw,
-                                                    const TargetSelectorConfig& config);
+                                                    const TargetSelectorConfig& config,
+                                                    double gimbal_pitch = 0.0);
     static double scoreOf(const TargetCluster& cluster, const TargetSelectorConfig& config);
 
 private:
@@ -174,7 +177,7 @@ inline int dominantTargetId(const std::vector<ArmorPose>& observations,
 
 inline std::vector<TargetCluster> TargetSelector::buildClusters(
     const std::vector<ArmorPose>& observations, double gimbal_yaw,
-    const TargetSelectorConfig& config) {
+    const TargetSelectorConfig& config, double gimbal_pitch) {
     std::vector<TargetCluster> clusters;
     const std::size_t count = observations.size();
     if (count == 0) {
@@ -282,7 +285,7 @@ inline std::vector<TargetCluster> TargetSelector::buildClusters(
             static_cast<int>(i));
     }
 
-    const Eigen::Matrix3d to_world = ArmorEkf::gimbalToWorld(gimbal_yaw);
+    const Eigen::Matrix3d to_world = ArmorEkf::gimbalToWorld(gimbal_yaw, gimbal_pitch);
     for (TargetCluster& cluster : clusters) {
         std::sort(cluster.indices.begin(), cluster.indices.end());
         Eigen::Vector3d sum = Eigen::Vector3d::Zero();
@@ -362,9 +365,11 @@ inline TargetSelection TargetSelector::makeSelection(const TargetCluster& cluste
 }
 
 inline TargetSelection TargetSelector::select(const std::vector<ArmorPose>& observations,
-                                              double gimbal_yaw, double timestamp_seconds) {
+                                              double gimbal_yaw, double timestamp_seconds,
+                                              double gimbal_pitch) {
     TargetSelection selection;
-    std::vector<TargetCluster> clusters = buildClusters(observations, gimbal_yaw, config_);
+    std::vector<TargetCluster> clusters =
+        buildClusters(observations, gimbal_yaw, config_, gimbal_pitch);
     for (TargetCluster& cluster : clusters) {
         cluster.score = scoreOf(cluster, config_);
     }
