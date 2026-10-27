@@ -231,15 +231,13 @@ bool HikCamera::grab(cv::Mat& pic) {
         return false;
     }
 
-    // 旧车这台相机倒装，画面在这里转 180 度转正。主点也随之按翻转后的值
-    // 写进 config/camera.yaml：cx 填 w-1-cx、cy 填 h-1-cy，翻转前的标定原值
-    // 是 749.4 / 574.7，本文件对应 689.6 / 504.3。两件事必须成对，
-    // 只改一处会让 PnP 偏出几十像素而全程不报错。
-    // 换成正装相机时同样成对改：这里换成不转，yaml 的 cx 与 cy 换回标定原值。
-    // 转了之后就与 bgr 不共享内存，pic 天然是独立的，bgr 返回后失效不影响它。
-    const cv::Mat wrapped(static_cast<int>(h), static_cast<int>(w), CV_8UC3,
-                          bgr.data());
-    cv::rotate(wrapped, pic, cv::ROTATE_180);
+    // 车上这台相机正装，画面不旋转。旧车那台是倒装的，当时在这里做
+    // cv::ROTATE_180，主点也随之按翻转后的值写进 config/camera.yaml。
+    // 换回倒装相机时两件事要一起改：这里加回转 180 度，yaml 里的 cx 与 cy
+    // 换成 w-1-cx、h-1-cy。只改一处会让 PnP 偏出几十像素而不报错。
+    // bgr 在本函数返回后失效，pic 必须是深拷贝。
+    pic = cv::Mat(static_cast<int>(h), static_cast<int>(w), CV_8UC3,
+                  bgr.data()).clone();
     failStreak_ = 0;
     return true;
 }
