@@ -12,21 +12,28 @@
 
 #include <opencv2/imgcodecs.hpp>
 
+#include <chrono>
 #include <iostream>
 #include <string>
+#include <thread>
 
 int main(int argc, char** argv) {
     const std::string outPath = (argc > 1) ? argv[1] : "out.png";
 
     // 相机刚上电、或 MVS 客户端刚松手时，头几帧可能拿不到，
-    // 给它几次机会。真断了也会在这里把 20 次耗完，然后明确失败。
+    // 给它几次机会。HikCamera 掉线后每秒才重开一次，所以这里也要等一秒，
+    // 否则 20 次会在一眨眼内耗完，等于没重试。真断了就把 20 次耗完，约 20 秒。
     constexpr int kAttempts = 20;
+    constexpr auto kRetryDelay = std::chrono::milliseconds(1000);
     cv::Mat pic;
     for (int i = 0; i < kAttempts; ++i) {
         if (get_pic(pic) && !pic.empty()) {
             break;
         }
         std::cerr << "第 " << (i + 1) << " 次没取到\n";
+        if (i + 1 < kAttempts) {
+            std::this_thread::sleep_for(kRetryDelay);
+        }
     }
 
     if (pic.empty()) {

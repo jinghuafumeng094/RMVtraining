@@ -514,33 +514,25 @@ void *OperationFunction(void *arg) {
         // 对应参考工程中的 camera.get_pic(&pic, ...)。具体 SDK 初始化和取流由学生完成。
         pic.release();
         const bool got_pic = get_pic(pic);
-        bool using_fallback_frame = false;
         if (!got_pic || pic.empty()) {
+            // 相机掉了。不退出：get_pic 内部按秒重开，插回来自己接上。
+            // 这一帧不跑下游，黑图对检测和 EKF 都没有意义；但 64 字节帧照常写，
+            // 电控靠帧的连续性判断视觉还活着，静默等同于掉线。
             ++empty_frame_count;
             WEB_LOG("empty_frame", static_cast<double>(empty_frame_count));
-            if (empty_frame_count > 3) {
-                // 与参考工程一致，连续多次取流失败后结束操作线程。
-                setSafeOutput(translator);
-                translator.message.latency = static_cast<float>(
-                    std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() - process_start)
-                        .count());
-                writeFrame(*serialPort, translator);
-                std::cerr << "连续取流失败，操作线程退出\n";
-                shutdown_requested.store(true, std::memory_order_relaxed);
-                break;
-            }
-            // 临时补一张黑帧，使后面的检测、PnP 和 EKF 阶段仍按原顺序执行。
-            // 该帧不是相机观测，最终输出会被强制设为无目标。
-            pic = cv::Mat(camera.image_height, camera.image_width, CV_8UC3,
-                          cv::Scalar(0, 0, 0));
-            using_fallback_frame = true;
-        } else {
-            empty_frame_count = 0;
+            WEB_LOG("camera_fps", 0.0);
+            setSafeOutput(translator);
+            translator.message.latency = static_cast<float>(
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - process_start)
+                    .count());
+            writeFrame(*serialPort, translator);
+            // 没有图像可处理，让出 CPU，也避免这条路径空转。
+            std::this_thread::sleep_for(kIdleDelay);
+            continue;
         }
-        if (!using_fallback_frame) {
-            WEB_LOG("empty_frame", 0.0);
-        }
+        empty_frame_count = 0;
+        WEB_LOG("empty_frame", 0.0);
         const auto frame_time = std::chrono::steady_clock::now();
         if (last_frame_time.time_since_epoch().count() != 0) {
             const double frame_seconds =
@@ -615,7 +607,7 @@ void *OperationFunction(void *arg) {
         bool prediction_valid = applyPrediction(translator, prediction);
 
         // 学生算法耗时过长时，丢弃本次结果，避免旧控制器数据触发动作。
-        if (using_fallback_frame || !frameIsFresh(received_at)) {
+        if (!frameIsFresh(received_at)) {
             setSafeOutput(translator);
             prediction_valid = false;
         }

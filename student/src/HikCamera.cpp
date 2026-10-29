@@ -16,6 +16,7 @@ constexpr float    kExposureUs     = 5000.0F;   // 曝光时间，微秒
 constexpr float    kGainDb         = 6.0F;      // 增益，dB
 constexpr unsigned kGrabTimeoutMs  = 1000;      // 单帧等待上限
 constexpr int      kFailStreakLimit = 5;        // 连败几次就重开相机
+constexpr int      kReopenIntervalMs = 1000;    // 掉线后多久试一次重开
 
 // MVS 的错误码是十六进制位掩码，印成十进制看不出东西来。
 void reportError(const char* what, int nRet) {
@@ -169,8 +170,28 @@ bool HikCamera::grab(cv::Mat& pic) {
     // 无论成败都先清空：调用方拿到的永远不是上一帧。
     pic.release();
 
-    if (!openOnce()) {
-        return false;
+    if (handle_ == nullptr) {
+        // 掉线之后上层的循环仍然按帧调这里。设备不在时每次枚举既慢又刷屏，
+        // 每秒试一次就够，插回来最迟一秒接上。
+        const auto now = std::chrono::steady_clock::now();
+        if (now < nextOpenAttempt_) {
+            return false;
+        }
+        nextOpenAttempt_ = now + std::chrono::milliseconds(kReopenIntervalMs);
+
+        const bool wasOffline = offlineReported_;
+        if (!openOnce()) {
+            if (!offlineReported_) {
+                std::cerr << "[camera] 相机不可用，每 " << kReopenIntervalMs
+                          << " ms 重试一次，插回后自动恢复\n";
+                offlineReported_ = true;
+            }
+            return false;
+        }
+        if (wasOffline) {
+            std::cout << "[camera] 相机已恢复，继续取流\n";
+            offlineReported_ = false;
+        }
     }
 
     // 拿一帧的缓冲。零拷贝，用完必须还。
