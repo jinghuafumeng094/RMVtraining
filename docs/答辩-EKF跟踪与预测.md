@@ -343,13 +343,13 @@ Q(Radius1, Radius1) = radius_variance;
 Q(Radius2, Radius2) = radius_variance;
 ```
 
-**2026-10-21 起半径不再是待估量**：`min_radius_m = max_radius_m = initial_radius_m = 0.303`，`clampRadii` 每帧把它夹回这个常量，`initial_radius_std_m` 降到 0.003，免得协方差与钳位互相矛盾。这一段 `Q` 仍逐帧计算、仍写进协方差，但半径方向被钳位压住，不再漂。原因是单板帧里半径与车心径向严格不可辨识（`δr = ε`、`δc = -ε·r` 给出同一个板心），放开它只会让 r 滑到边界，再靠 `clampRadii` 平移车心维持自洽，车心因此每帧多出几厘米的位移。`radius_variance_floor_m2 = 9e-8`（即 0.3 mm 的平方）在 166 fps 下是主导项：`radius_drift_m² · dt²` 只有 1.4e-8，比它小一个数量级。
+**2026-10-21 起半径不再是待估量**：`min_radius_m = max_radius_m = initial_radius_m = 0.303`，`clampRadii` 每帧把它夹回这个常量，`initial_radius_std_m` 降到 0.003，免得协方差与钳位互相矛盾。这一段 `Q` 仍逐帧计算、仍写进协方差，但半径方向被钳位压住，不再漂。原因是单板帧里半径与车心径向严格不可辨识（`δr = ε`、`δc = -ε·r` 给出同一个板心），放开它只会让 r 滑到边界，再靠 `clampRadii` 平移车心维持自洽，车心因此每帧多出几厘米的位移。`radius_variance_floor_m2 = 9e-8`（即 0.3 mm 的平方）在 166 fps 下是主导项：`radius_drift_m² · dt²` 只有 1.5e-8，比它小 6 倍。
 
 ### 这些数从哪来
 
 | 常量 | 值 | 依据 |
 |---|---|---|
-| `accel_noise_m_s2` | 6.0 | RM 步兵 0 到 20 m/s 约 1 到 2 秒，瞬时机动约 10 m/s²，取一半（`ArmorEkf.cpp:38-39`） |
+| `accel_noise_m_s2` | 1.5 | `R` 按实测重标后在 v1.avi 上逐档扫出来的，表见 `ArmorEkf.hpp:104-112`；早期按机动量估的 6.0 已废 |
 | `angular_accel_noise_rad_s2` | 12.0 | 车能快速起旋停旋，同量级取整 |
 | `radius_drift_m` | 0.02 | 半径近乎恒定，只给随机游走强度 0.02 m/√s |
 
@@ -1030,12 +1030,12 @@ if (!predictionIsFinite(result)) {
 | `plate_height_m` | `{-0.0168, 0.0033, 0.0103, 0.0033}` | 每块板相对中心的高度差，四块互相独立（2026-10-22 实测）；前哨站换 `{0,-0.102,0.102}` |
 | `plate_count` | 4 | 车体周向板数，前哨站 3 |
 | `plate_spacing_rad` | 90° | 相邻板夹角，前哨站 120° |
-| `accel_noise_m_s2` | 6.0 | `Q` 的中心三轴加速度强度 |
+| `accel_noise_m_s2` | 1.5 | `Q` 的中心三轴加速度强度，v1.avi 扫档定值（`ArmorEkf.hpp:104-112`） |
 | `angular_accel_noise_rad_s2` | 12.0 | `Q` 的车体角加速度强度 |
 | `radius_drift_m` | 0.02 | 半径随机游走强度，2026-10-21 起被钳位压住，实际不起作用 |
 | `radius_variance_floor_m2` | 9e-8 | 半径过程噪声下限，(0.3 mm)²，166 fps 下的主导项 |
-| `lateral_noise_scale` / `base_m` | 0.002 / 0.005 | 观测横向噪声 `sigma = 0.002 d + 0.005` |
-| `depth_noise_scale` / `base_m` | 0.010 / 0.010 | 观测深度噪声 `sigma = 0.010 d + 0.010` |
+| `lateral_noise_scale` / `base_m` | 0.004 / 0.002 | 观测横向噪声 `sigma = 0.004 d + 0.002`，2026-10-24 按板心实测离散重标 |
+| `depth_noise_scale` / `base_m` | 0.013 / 0.010 | 观测深度噪声 `sigma = 0.013 d + 0.010`，同上 |
 | `jump_gate_m` | 0.6 | 物理跳变闸 |
 | `nis_gate` | 11.34 | 卡方 (3, 99%) 分位点 |
 | `max_reprojection_error_px` | 5.0 | 单次观测重投影误差上限 |
@@ -1292,7 +1292,7 @@ yaw 为什么不可观测：相机只看得到板，看不到车心。车心由�
 | 1 | 0.5521 | 0.1928 |
 | 0.01 | 0.5658 | 0.2000 |
 
-⇒ `omega = 0` 时怎么降 alpha 都不收敛：alpha 差 100 倍，yaw sd 反而略大，方差单调增长。这就是真不可观测，增长由**平移过程噪声**（`accel_noise_m_s2 = 6.0`）经交叉协方差灌进 yaw 的零空间，与 alpha 无关。
+⇒ `omega = 0` 时怎么降 alpha 都不收敛：alpha 差 100 倍，yaw sd 反而略大，方差单调增长。这就是真不可观测，增长由**平移过程噪声**（那批实验当时取 `accel_noise_m_s2 = 6.0`，现默认 1.5）经交叉协方差灌进 yaw 的零空间，与 alpha 无关。
 
 结论：**慢转（omega > 0）是调参问题，完全不转是几何问题。** 0.8 rad/s 这条分界可以用 alpha 挪，代价是目标真正改变转速时滤波器跟得慢。
 
