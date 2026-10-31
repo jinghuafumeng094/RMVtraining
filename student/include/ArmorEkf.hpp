@@ -10,13 +10,23 @@
 
 // 旋转装甲板目标的扩展卡尔曼滤波。
 //
-// 状态 10 维，全部国际单位制：
-//   x = [ px, py, pz, vx, vy, vz, theta_c, omega, r1, r2 ]^T
+// 状态 13 维，全部国际单位制：
+//   x = [ px, py, pz, vx, vy, vz, theta_c, omega, r1, r2, h1, h2, h3 ]^T
 //     px/py/pz  旋转中心在 W 世界系中的位置 (m)
 //     vx/vy/vz  旋转中心在 W 世界系中的速度 (m/s)
 //     theta_c   车体偏航角，W 世界系中的方位角，左为正 (rad)
 //     omega     车体偏航角速度 (rad/s)
 //     r1/r2     偶数/奇数编号装甲板到旋转中心的半径 (m)
+//     h1/h2/h3  1/2/3 号槽位的板心相对 0 号槽位板心的高度差 (m)
+//
+// 四块板的高度是状态量，不是填死的表。观测模型里槽位 i 的板心高度写成
+// pz + h_i，只有当前看得见的那块板给出一条高度方程，换板以后另一块才被
+// 观测到，落差就从残差里学出来。
+//
+// 与 armor/src/Planner.cpp 的 z0..z3 是同一组数。planner 直接记四块板的
+// 绝对高度，这里把 0 号槽位的高度当基准记进 pz，其余三块只记相对量，
+// 两边张成同一个四维空间。差别只在规范怎么定：planner 靠删掉车心高度，
+// 这里靠把 h0 钉成 0。二者都只有一个自由度被固定，不能两个都不定。
 //
 // 两套坐标系，互相变换只允许走 gimbalToWorld / worldToGimbal 两个函数：
 //   G 云台系  x 前、y 左、z 上，跟着云台的 yaw 与 pitch 一起转
@@ -50,9 +60,9 @@
 // tests/test_ekf_predict.cpp 的无噪收敛用例逐分量比对真值，两个符号都被钉住。
 class ArmorEkf {
 public:
-    using StateVector = Eigen::Matrix<double, 10, 1>;
-    using Covariance = Eigen::Matrix<double, 10, 10>;
-    using ObservationJacobian = Eigen::Matrix<double, 3, 10>;
+    using StateVector = Eigen::Matrix<double, 13, 1>;
+    using Covariance = Eigen::Matrix<double, 13, 13>;
+    using ObservationJacobian = Eigen::Matrix<double, 3, 13>;
 
     // 状态分量的下标，避免代码里散落裸数字。
     enum Index : int {
@@ -66,26 +76,31 @@ public:
         YawRate = 7,
         Radius1 = 8,
         Radius2 = 9,
-        Dimension = 10,
+        H1 = 10,
+        H2 = 11,
+        H3 = 12,
+        Dimension = 13,
     };
 
     struct Config {
-        // 每块装甲板相对旋转中心的高度差 (m)，下标是板槽位 0..3。
+        // 四块板的初始高度差 (m)，下标是板槽位 0..3，相对量，基准是槽位 0。
         //
-        // 四块板可以各不相等，四个数互相独立，按实测逐块填，不要假设相对两块
-        // 等高。armor/src/Planner.cpp:223-226 里 z0 = z2、z1 = z3 只发生在状态
-        // 没有第 12、13 维的时候，是维度不够时的退化写法，不是车体的真实几何。
+        // 只当先验，不是结论。板高在状态里，跑起来以后由观测自己收敛，
+        // 不要求上车拿尺子量。四块板可以各不相等，四个数互相独立。
         //
-        // 默认全零表示四块共面，且不会报错：观测模型的高度是常量，
-        // 填错只会把高差算进 pz 的偏置里，滤波看上去一切正常。
-        // 上车的必做项之一就是把它量出来。
-        //
-        // 前哨站是三块不共面，用前三个槽位，例如 {0, -0.102, 0.102}
-        // （来源 armor/include/Planner.hpp:53-55 的 outpost_z_offset_0/1/2）。
-        //
-        // 表里这四个数是 2026-10-24 之前那台前哨站的实测，2026-10-24 换了我方相机的
-        // 镜头，目标车没换，四个数不动。换目标车才要重量。
-        std::array<double, 4> plate_height_m{-0.0168, 0.0033, 0.0103, 0.0033};
+        // 默认全零表示四块共面起步。填一组数也不会更准：哪个槽位对应哪块
+        // 物理板取决于建滤波器那一刻第一块通过的板，相位本身随机，硬填一个
+        // 相位在全片上的期望收益是零。要改就先验，不改也无所谓。
+        std::array<double, 4> initial_plate_height_m{0.0, 0.0, 0.0, 0.0};
+        // 初始高度差的标准差 (m)。取 3 cm，与四块板真实极差 2.7 cm 同量级：
+        // 先验不把收敛拖住，也不放开到让高度与 pz 互相吞。
+        double initial_plate_height_std_m{0.03};
+        // 高度随机游走强度 (m/sqrt(s))。板高是刚体几何，只有换车或换镜头
+        // 重新标定才变，给得很小，只留一点让它跟得上真实变化。
+        double plate_height_drift_m{0.005};
+        // 每帧高度过程噪声的方差下限，(0.1 mm)^2。与半径那组同理：收敛后
+        // 不让滤波器把高度彻底冻死。
+        double plate_height_variance_floor_m2{1.0e-8};
 
         // 装甲板在车体周向上的块数，以及相邻两块之间的夹角。
         // 默认 4 块 90 度，即标准步兵；前哨站是 3 块 120 度。
@@ -295,16 +310,18 @@ public:
     static BallisticInputs ballisticInputsFromMuzzle(const Eigen::Vector3d& p_gimbal,
                                                      double muzzle_offset_m);
 
+    // 槽位 armor_index 的板心相对 pz 的高度差 (m)。0 号槽位恒为 0，其余读状态。
+    // 观测模型与 platePositionWorld 都走这一个函数，两处不会各写一份。
+    static double plateHeightOffset(const StateVector& x, int armor_index);
+
     // 观测模型与雅可比，纯函数。测试用有限差分逐元素核对解析雅可比。
     // armor_index 必须已在 [0, plate_count) 内，调用方负责折算。
     static Eigen::Vector3d observationModel(const StateVector& x, int armor_index,
                                             double gimbal_yaw,
-                                            const std::array<double, 4>& plate_height_m,
                                             double plate_spacing_rad,
                                             double gimbal_pitch = 0.0);
     static ObservationJacobian observationJacobian(const StateVector& x, int armor_index,
                                                    double gimbal_yaw,
-                                                   const std::array<double, 4>& plate_height_m,
                                                    double plate_spacing_rad,
                                                    double gimbal_pitch = 0.0);
 
@@ -315,6 +332,8 @@ private:
     // 装甲板编号折算到 [0, plate_count)，以及它对应的半径状态下标。
     static int normalizeIndex(int armor_index, int plate_count);
     static int radiusIndex(int armor_index);
+    // 槽位对应的板高状态下标，0 号槽位没有独立状态，返回 -1。
+    static int plateHeightIndex(int armor_index);
 
     bool tryInitialize(const ArmorPose& observation, double gimbal_yaw,
                        double gimbal_pitch);
@@ -339,7 +358,7 @@ private:
     void clampRadii(int observed_index);
 
     void propagate(StateVector& x, double dt) const;
-    void fillTransition(double dt, Eigen::Matrix<double, 10, 10>& F) const;
+    void fillTransition(double dt, Eigen::Matrix<double, 13, 13>& F) const;
     void fillProcessNoise(double dt, Covariance& Q) const;
     Eigen::Matrix3d observationNoise(const Eigen::Vector3d& z) const;
 

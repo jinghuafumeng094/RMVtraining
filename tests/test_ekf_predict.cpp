@@ -30,11 +30,15 @@ struct Truth {
     // 落在 Config 的物理范围内，否则 clamp 会先把真值吃掉。
     double radius1{0.30};
     double radius2{0.285};
+    // 四块板板心相对 0 号槽位的高度差，单位 m。0 号槽位恒为 0，滤波器的规范
+    // 就钉在这里：pz 记它的绝对高度，其余三块进状态学差值。
+    std::array<double, 4> heights{0.0, 0.0, 0.0, 0.0};
 };
 
-// 板高一律取 0，走共面这一支，让断言避开"板环整体挪两格"的等价关系。
-// 这不是在声明实车共面：四块板可以各不相等，真实高差要另外量。取 0 也不用
-// 担心和 config 的出厂默认一致，夹具里用的是 testHeights() 自己的表。
+// 初始表。板高是状态量以后，这张表只在建滤波器时当先验，之后由观测改。
+// 主用例仍取全零，走共面这一支，让断言避开"板环整体挪两格"的等价关系。
+// 这不是在声明实车共面：四块板可以各不相等，专门有一条用例喂真实高差，
+// 检查三个高度状态收敛到真值。
 // 以前这里给 2 号板 0.15 m 的抬高，目的是打破同一层的等价关系，好让 theta_c
 // 的断言有唯一解。实测这个抬高在真实可见性下会把收敛拖慢到几千帧、还随起始
 // 朝向时好时坏，而它想解决的"板环等价"本来就该在断言里避开，不该靠改物理
@@ -51,8 +55,7 @@ Eigen::Vector3d truePlateWorld(const Truth& truth, int index,
     return Eigen::Vector3d(
         truth.center.x() + radius * std::cos(psi),
         truth.center.y() + radius * std::sin(psi),
-        truth.center.z() +
-            config.plate_height_m[static_cast<std::size_t>(index)]);
+        truth.center.z() + truth.heights[static_cast<std::size_t>(index)]);
 }
 
 void trueStep(Truth& truth, double dt) {
@@ -72,6 +75,10 @@ ArmorEkf::StateVector truthVector(const Truth& truth) {
     x[ArmorEkf::YawRate] = truth.yaw_rate;
     x[ArmorEkf::Radius1] = truth.radius1;
     x[ArmorEkf::Radius2] = truth.radius2;
+    for (int slot = 1; slot < 4; ++slot) {
+        x[ArmorEkf::H1 + (slot - 1)] =
+            truth.heights[static_cast<std::size_t>(slot)] - truth.heights[0];
+    }
     return x;
 }
 
@@ -99,7 +106,8 @@ Eigen::Vector3d modelPlateWorld(const ArmorEkf::StateVector& x, int index,
     return Eigen::Vector3d(
         x[ArmorEkf::Px] + radius * std::cos(psi),
         x[ArmorEkf::Py] + radius * std::sin(psi),
-        x[ArmorEkf::Pz] + config.plate_height_m[static_cast<std::size_t>(index)]);
+        x[ArmorEkf::Pz] +
+            (index <= 0 ? 0.0 : x[ArmorEkf::H1 + (index - 1)]));
 }
 
 // 板位按集合比，不按槽位比。逐块板找最近的真值板，返回最差的那一对距离。
@@ -218,7 +226,7 @@ GimbalState makeGimbal(double yaw, double pitch, double bias = 0.0) {
 
 ArmorEkf::Config testConfig() {
     ArmorEkf::Config config;
-    config.plate_height_m = testHeights();
+    config.initial_plate_height_m = testHeights();
     return config;
 }
 
@@ -475,8 +483,7 @@ void testPlateAzimuthConvention() {
     // observationModel 返回的是 G 系里的预测值 h = M^T * u。
     // 再左乘 M 换回 W 系，才拿到板在 W 系里的位置。
     const Eigen::Vector3d plate_gimbal =
-        ArmorEkf::observationModel(x, 0, 0.0, config.plate_height_m,
-                                   config.plate_spacing_rad);
+        ArmorEkf::observationModel(x, 0, 0.0, config.plate_spacing_rad);
     const Eigen::Vector3d plate = ArmorEkf::gimbalToWorld(0.0) * plate_gimbal;
     // 0 号板在 W 系里的方位角就是 theta_c，且取正值时落在 +y 一侧（左）。
     const Eigen::Vector3d relative = plate - Eigen::Vector3d(4.0, 0.0, 0.0);
@@ -510,7 +517,7 @@ void testAnalyticJacobian() {
 
     for (int index = 0; index < config.plate_count; ++index) {
         const ArmorEkf::ObservationJacobian analytic = ArmorEkf::observationJacobian(
-            x, index, gimbal_yaw, config.plate_height_m, config.plate_spacing_rad);
+            x, index, gimbal_yaw, config.plate_spacing_rad);
         for (int column = 0; column < ArmorEkf::Dimension; ++column) {
             const double step = 1e-6 * std::max(1.0, std::fabs(x[column]));
             ArmorEkf::StateVector forward = x;
@@ -519,10 +526,8 @@ void testAnalyticJacobian() {
             backward[column] -= step;
             const Eigen::Vector3d numeric =
                 (ArmorEkf::observationModel(forward, index, gimbal_yaw,
-                                            config.plate_height_m,
                                             config.plate_spacing_rad) -
                  ArmorEkf::observationModel(backward, index, gimbal_yaw,
-                                            config.plate_height_m,
                                             config.plate_spacing_rad)) /
                 (2.0 * step);
             for (int row = 0; row < 3; ++row) {
@@ -592,6 +597,55 @@ void testNoiselessConvergence() {
     assert(plate_error < 1e-6);
     std::printf("[ekf] 无噪自洽收敛 通过\n");
 }
+// 四块板不等高：板高是状态量，靠一块一块换板学出来。
+//
+// 起始几何取单板初始化那套（车心 (4, 0, 0.4)、朝向 pi），这样第一块被看见的
+// 一定是槽位 0，滤波器的槽位编号与真值的编号对得上，后面换板学到的差值才能
+// 直接比。车以 2 rad/s 转，四块板轮流进入 80 度锥角，每块板的 z 观测是
+// pz + h_i，四个槽位都见过以后四个未知量唯一。
+//
+// 两条判据：三个高度状态收敛到真差值；车心 z 收敛到真值。第二条是这次改动的
+// 目的所在：旧版高度是常数表，pz 只能吸收当前那块板的高度，换板就跳。
+void testUnequalPlateHeightsAreLearned() {
+    const ArmorEkf::Config config = testConfig();
+    ArmorEkf filter(config);
+
+    Truth truth;
+    truth.center = Eigen::Vector3d(4.0, 0.0, 0.4);
+    truth.yaw = kPi;
+    truth.yaw_rate = 2.0;
+    // 半径钉成与先验相同，让这条用例只盯高度，不掺半径沿视线的自由度。
+    truth.radius1 = config.initial_radius_m;
+    truth.radius2 = config.initial_radius_m;
+    truth.heights = {0.0, 0.02, -0.015, 0.03};
+
+    const double dt = 1.0 / 165.0;
+    for (int frame = 0; frame < 6000; ++frame) {
+        trueStep(truth, dt);
+        filter.predict(dt);
+        feedFrame(filter, config, truth, 0.0);
+        filter.advanceStateMachine(static_cast<double>(frame + 1) * dt);
+    }
+
+    const ArmorEkf::StateVector x = filter.state();
+    const std::array<double, 3> learned{
+        x[ArmorEkf::H1], x[ArmorEkf::H2], x[ArmorEkf::H3]};
+    const std::array<double, 3> expected{
+        truth.heights[1] - truth.heights[0],
+        truth.heights[2] - truth.heights[0],
+        truth.heights[3] - truth.heights[0]};
+    std::printf("[ekf] 不等高板 学到的差 (%.5f,%.5f,%.5f) 真值 (%.5f,%.5f,%.5f) "
+                "车心 z %.5f\n",
+                learned[0], learned[1], learned[2], expected[0], expected[1],
+                expected[2], x[ArmorEkf::Pz]);
+    for (int slot = 0; slot < 3; ++slot) {
+        assert(std::fabs(learned[static_cast<std::size_t>(slot)] -
+                         expected[static_cast<std::size_t>(slot)]) < 1e-3);
+    }
+    assert(std::fabs(x[ArmorEkf::Pz] - truth.center.z()) < 1e-3);
+    std::printf("[ekf] 不等高板 高度可辨识 通过\n");
+}
+
 // 两块板的车：板间夹角是 pi，一块在车头一块在车尾。
 //
 // 关键事实：对置的两块板法向相反，80 度可见锥角下两者的可见区间不相交，
@@ -1690,6 +1744,7 @@ int main() {
     testPlateAzimuthConvention();
     testAnalyticJacobian();
     testNoiselessConvergence();
+    testUnequalPlateHeightsAreLearned();
     testTwoPlateVehicleObservesRadiusTwo();
     testSinglePlateInitializationIsOnTheFarSide();
     testArmorYawObservationPinsBodyYaw();

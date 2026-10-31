@@ -187,9 +187,23 @@ int ArmorEkf::radiusIndex(int armor_index) {
     return (armor_index % 2 == 0) ? Radius1 : Radius2;
 }
 
+int ArmorEkf::plateHeightIndex(int armor_index) {
+    // 0 号槽位的高度差钉成 0，没有状态分量，pz 就是它的绝对高度。
+    // 把它也放进状态会多出一条零空间：pz 加 delta、四个 h 同时减 delta，
+    // 每条观测的残差都不变，滤波器可以沿这条方向漂到任意远。
+    if (armor_index <= 0) {
+        return -1;
+    }
+    return H1 + (armor_index - 1);
+}
+
+double ArmorEkf::plateHeightOffset(const StateVector& x, int armor_index) {
+    const int index = plateHeightIndex(armor_index);
+    return index < 0 ? 0.0 : x[index];
+}
+
 Eigen::Vector3d ArmorEkf::observationModel(const StateVector& x, int armor_index,
                                            double gimbal_yaw,
-                                           const std::array<double, 4>& plate_height_m,
                                            double plate_spacing_rad,
                                            double gimbal_pitch) {
     const int i = armor_index;
@@ -198,15 +212,13 @@ Eigen::Vector3d ArmorEkf::observationModel(const StateVector& x, int armor_index
     Eigen::Vector3d u;
     u << x[Px] + radius * std::cos(psi),
          x[Py] + radius * std::sin(psi),
-         x[Pz] + plate_height_m[static_cast<std::size_t>(i)];
+         x[Pz] + plateHeightOffset(x, i);
     return worldToGimbal(gimbal_yaw, gimbal_pitch) * u;
 }
 
 ArmorEkf::ObservationJacobian ArmorEkf::observationJacobian(
     const StateVector& x, int armor_index, double gimbal_yaw,
-    const std::array<double, 4>& plate_height_m, double plate_spacing_rad,
-    double gimbal_pitch) {
-    (void)plate_height_m;  // 高度是常量，不进状态，因此不产生列
+    double plate_spacing_rad, double gimbal_pitch) {
     const int i = armor_index;
     const double psi = x[Yaw] + static_cast<double>(i) * plate_spacing_rad;
     const double radius = x[radiusIndex(i)];
@@ -220,6 +232,12 @@ ArmorEkf::ObservationJacobian ArmorEkf::observationJacobian(
     H.col(Px) = to_gimbal * Eigen::Vector3d(1.0, 0.0, 0.0);
     H.col(Py) = to_gimbal * Eigen::Vector3d(0.0, 1.0, 0.0);
     H.col(Pz) = to_gimbal * Eigen::Vector3d(0.0, 0.0, 1.0);
+    // 板高那条：u 的 z 分量是 pz + h_i，对 h_i 的偏导也是坐标轴。
+    // 0 号槽位没有 h 状态，这一列保持全零，信息全由 pz 那一列承载。
+    const int height_index = plateHeightIndex(i);
+    if (height_index >= 0) {
+        H.col(height_index) = to_gimbal * Eigen::Vector3d(0.0, 0.0, 1.0);
+    }
     // yaw 与半径各自在 W 系里有一个方向，再统一换到云台系。两个方向差 90 度，
     // 别图省事共用同一个向量：
     //   u 对 theta_c 的偏导 = r * (-sin psi, cos psi, 0)   方位角转，切向
@@ -238,7 +256,7 @@ Eigen::Vector3d ArmorEkf::platePositionWorld(const StateVector& x, int armor_ind
     const double radius = x[radiusIndex(i)];
     return Eigen::Vector3d(x[Px] + radius * std::cos(psi),
                            x[Py] + radius * std::sin(psi),
-                           x[Pz] + config_.plate_height_m[static_cast<std::size_t>(i)]);
+                           x[Pz] + plateHeightOffset(x, i));
 }
 
 // 半径不是普通的连续状态：它是车体几何，物理上落在一个窄区间里。估计跑出
@@ -267,7 +285,7 @@ void ArmorEkf::propagate(StateVector& x, double dt) const {
     x[Yaw] = wrapToPi(x[Yaw] + x[YawRate] * dt);
 }
 
-void ArmorEkf::fillTransition(double dt, Eigen::Matrix<double, 10, 10>& F) const {
+void ArmorEkf::fillTransition(double dt, Eigen::Matrix<double, 13, 13>& F) const {
     F.setIdentity();
     F(Px, Vx) = dt;
     F(Py, Vy) = dt;
@@ -304,6 +322,15 @@ void ArmorEkf::fillProcessNoise(double dt, Covariance& Q) const {
                  config_.radius_variance_floor_m2);
     Q(Radius1, Radius1) = radius_variance;
     Q(Radius2, Radius2) = radius_variance;
+
+    // 板高同样几乎恒定，随机游走只给一点自由度。不给 vz 那一套随机加速度：
+    // 车体上下颠簸不是板高在变，混进来会让高度跟着 pz 一起晃。
+    const double height_variance =
+        std::max(config_.plate_height_drift_m * config_.plate_height_drift_m * dt2,
+                 config_.plate_height_variance_floor_m2);
+    for (int index = H1; index <= H3; ++index) {
+        Q(index, index) = height_variance;
+    }
 }
 
 Eigen::Matrix3d ArmorEkf::observationNoise(const Eigen::Vector3d& z) const {
@@ -335,6 +362,13 @@ ArmorEkf::Covariance ArmorEkf::initialCovariance() const {
     const double radius_variance = config_.initial_radius_std_m * config_.initial_radius_std_m;
     P(Radius1, Radius1) = radius_variance;
     P(Radius2, Radius2) = radius_variance;
+    // 板高先验。pz 的初始方差是 1 m^2，比高度差大三个量级，头几帧观测会
+    // 先用来收缩 pz；收缩到厘米级以后高度差才开始从残差里分出来。
+    const double height_variance =
+        config_.initial_plate_height_std_m * config_.initial_plate_height_std_m;
+    for (int index = H1; index <= H3; ++index) {
+        P(index, index) = height_variance;
+    }
     return P;
 }
 
@@ -376,7 +410,7 @@ void ArmorEkf::predict(double dt) {
     }
 
     propagate(x_, dt);
-    Eigen::Matrix<double, 10, 10> F;
+    Eigen::Matrix<double, 13, 13> F;
     fillTransition(dt, F);
     Covariance Q;
     fillProcessNoise(dt, Q);
@@ -469,7 +503,15 @@ void ArmorEkf::startTracking(const Eigen::Vector3d& plate_world, std::uint8_t ta
     x_[Radius2] = initial_radius;
     x_[Px] = plate_world.x() - initial_radius * std::cos(x_[Yaw]);
     x_[Py] = plate_world.y() - initial_radius * std::sin(x_[Yaw]);
-    x_[Pz] = plate_world.z() - config_.plate_height_m[0];
+    // 第一块通过的板就是 0 号槽位，它的高度直接当基准，相对高度为 0。
+    x_[Pz] = plate_world.z() - config_.initial_plate_height_m[0];
+    for (int slot = 1; slot < config_.plate_count && slot < 4; ++slot) {
+        const int index = plateHeightIndex(slot);
+        if (index >= 0) {
+            x_[index] = config_.initial_plate_height_m[static_cast<std::size_t>(slot)] -
+                        config_.initial_plate_height_m[0];
+        }
+    }
     P_ = initialCovariance();
 
     status_ = TrackingState::Unstable;
@@ -543,15 +585,13 @@ bool ArmorEkf::associateAndUpdate(const ArmorPose& observation, double gimbal_ya
             continue;  // 一帧内一块板只配一条观测
         }
         const Eigen::Vector3d h = observationModel(
-            x_, i, gimbal_yaw, config_.plate_height_m, config_.plate_spacing_rad,
-            gimbal_pitch);
+            x_, i, gimbal_yaw, config_.plate_spacing_rad, gimbal_pitch);
         const Eigen::Vector3d residual = z - h;
         if (residual.norm() > config_.jump_gate_m) {
             continue;  // 物理跳变闸：6 ms 内 0.6 m 相当于 100 m/s，不可能是真目标
         }
         const ObservationJacobian H = observationJacobian(
-            x_, i, gimbal_yaw, config_.plate_height_m, config_.plate_spacing_rad,
-            gimbal_pitch);
+            x_, i, gimbal_yaw, config_.plate_spacing_rad, gimbal_pitch);
         const Eigen::Matrix3d S = H * P_ * H.transpose() + R;
         const double nis = residual.transpose() * S.inverse() * residual;
         if (!std::isfinite(nis)) {
@@ -599,7 +639,8 @@ bool ArmorEkf::associateAndUpdate(const ArmorPose& observation, double gimbal_ya
 
     const Eigen::Vector3d residual = z - best_h;
     const Eigen::Matrix3d S = best_H * P_ * best_H.transpose() + R;
-    const Eigen::Matrix<double, 10, 3> K = P_ * best_H.transpose() * S.inverse();
+    const Eigen::Matrix<double, Dimension, 3> K =
+        P_ * best_H.transpose() * S.inverse();
     x_ += K * residual;
     // Joseph 形式。比 (I - K H) P 多一次乘法，但数值上不会失去正定性，
     // 长时间跑下来更稳。
@@ -644,8 +685,9 @@ void ArmorEkf::updateYaw(const ArmorPose& observation, int armor_index,
     if (std::fabs(yaw_residual) > config_.armor_yaw_gate_rad || yaw_variance <= 0.0) {
         return;
     }
-    const Eigen::Matrix<double, 10, 1> yaw_gain = -P_.col(Yaw) / yaw_variance;
-    Eigen::Matrix<double, 1, 10> yaw_row = Eigen::Matrix<double, 1, 10>::Zero();
+    const Eigen::Matrix<double, Dimension, 1> yaw_gain = -P_.col(Yaw) / yaw_variance;
+    Eigen::Matrix<double, 1, Dimension> yaw_row =
+        Eigen::Matrix<double, 1, Dimension>::Zero();
     yaw_row[Yaw] = -1.0;
     const Covariance yaw_identity_minus_kh =
         Covariance::Identity() - yaw_gain * yaw_row;
@@ -937,8 +979,9 @@ PredictionResult ArmorEkf::buildPrediction(const GimbalState& gimbal, double lat
         index_target_id_[static_cast<std::size_t>(aim_index)];
     result.target_id = aim_target_id != 0 ? aim_target_id : target_id_;
     result.aim_index = aim_index;
-    result.aim_plate_height_m = static_cast<float>(
-        config_.plate_height_m[static_cast<std::size_t>(aim_index)]);
+    // 瞄的那块板的高度差，相对车心。pz 记 0 号槽位的绝对高度，其余槽位是学到的
+    // 相对差；这里要的是相对量，用来算板心相对车心的仰角。
+    result.aim_plate_height_m = static_cast<float>(plateHeightOffset(x_, aim_index));
     result.hit_streak = hit_streak_;
     result.miss_count = miss_count_;
     result.rejected_count = rejected_count_;

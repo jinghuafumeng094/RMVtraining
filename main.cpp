@@ -232,7 +232,7 @@ void logPrediction(const PredictionResult& result) {
     // 这一条必须用 aim_index，跟第一条正好相反：不跟着瞄点走，它就退化成一条常数线。
     // 段内是斜坡而不是平台，说明车心高度在漂，斜率对应 ekf_vz_m_s 的误差。
     // 取带符号的差，板心低于云台原点时值为负，四级台阶的先后顺序因此也看得出来。
-    // 板高从 result 里取，出处仍是 ArmorEkfConfig::plate_height_m，不在本文件另抄一份。
+    // 板高从 result 里取，出处是 EKF 状态里的 h1/h2/h3，不在本文件另抄一份。
     if (result.aim_index >= 0) {
         const double plate_radius =
             result.aim_index % 2 == 0 ? result.radius_1_m : result.radius_2_m;
